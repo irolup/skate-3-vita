@@ -140,6 +140,10 @@ To build it yourself you need Linux, [VitaSDK](https://vitasdk.org) with `VITASD
 
 Run `scripts/install-hooks.sh` once after cloning: it installs a check that stops any commit containing game data.
 
+## AI usage
+
+AI coding tools were used to build this port. The knowledge of how Skate 3 works comes from [skate-3-rust-engine](https://github.com/SK8-ENGINE/skate-3-rust-engine) and the reverse-engineering work behind it.
+
 ## License
 
 This project is under the [GNU General Public License v3.0](LICENSE) (GPL-3.0-only), like [skate-3-rust-engine](https://github.com/SK8-ENGINE/skate-3-rust-engine), which most of its game logic is ported from. [PROVENANCE.md](PROVENANCE.md) lists what was taken from it and from the other projects this one builds on.

@@ -1,0 +1,16 @@
+// skate vita traffic car body (L1c): the retail paint rule of `vehicle_defaultPS` (upstream PR #52
+// `living_world/vehicles.rs`): lin = diffuse^2; a texel with G^2 < 0.001225 becomes
+// R^2 x i_colorize_red + B^2 x i_colorize_blue (red = the secondary colour, blue = the chassis
+// colour), any other keeps lin; sqrt at the end. Then the skin lighting.
+uniform sampler2D tex;
+uniform float4 tint;
+uniform float4 red;
+uniform float4 blue;
+
+float4 main(float2 vTexcoord : TEXCOORD0, float4 vColor : COLOR) : COLOR {
+	float4 c = tex2D(tex, vTexcoord) * tint;
+	float3 lin = c.rgb * c.rgb;
+	if (lin.g < 0.001225)
+		lin = lin.r * red.rgb + lin.b * blue.rgb;
+	return float4(sqrt(lin) * vColor.rgb, 1.0f);
+}

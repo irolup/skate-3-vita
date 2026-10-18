@@ -1,0 +1,11 @@
+# Committed build settings only. The device IP (VITA_IP) goes in .envrc or the
+# shell environment, never here.
+#
+# No rustflags here: cargo-vita sets RUSTFLAGS in the environment, which overrides
+# config rustflags. The Vita target spec already uses cpu = cortex-a9 with NEON/VFPv3.
+
+[alias]
+# Full VPK (install once, or after changing metadata or static/).
+vpk = "vita build vpk -- --release"
+# Replace eboot.bin of the installed VPK and relaunch it (needs VITA_IP).
+deploy = "vita build eboot --update --run -- --release"

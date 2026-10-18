@@ -1,0 +1,25 @@
+// skate vita pedestrian (L1e): every ped material in one program. The body (`paint` 1) takes the
+// retail ped shader rule (`skate_core::living_world::peds::colorize`, the same as the cars'): lin =
+// diffuse^2; a texel with G^2 < 0.001225 becomes R^2 x red (tint A) + B^2 x blue (tint B), sqrt at
+// the end. Masked materials (hair) keep their cutoff; `fade` is the draw / spawn fade opacity.
+uniform sampler2D tex;
+uniform float4 tint;
+uniform float4 red;
+uniform float4 blue;
+uniform float paint;
+uniform float cutoff;
+uniform float fade;
+
+float4 main(float2 vTexcoord : TEXCOORD0, float4 vColor : COLOR) : COLOR {
+	float4 c = tex2D(tex, vTexcoord) * tint;
+	if (c.a < cutoff)
+		discard;
+	float3 rgb = c.rgb;
+	if (paint > 0.5) {
+		float3 lin = rgb * rgb;
+		if (lin.g < 0.001225)
+			lin = lin.r * red.rgb + lin.b * blue.rgb;
+		rgb = sqrt(lin);
+	}
+	return float4(rgb * vColor.rgb, fade);
+}

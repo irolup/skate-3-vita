@@ -1,0 +1,30 @@
+[package]
+name = "audio-bench"
+description = "skate-audio render cost on the Vita (retail-audio stage S0): the reference's fma_paths scene, timed per block"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# no-fma: the Vita arithmetic (the Cortex-A9 has no fused multiply-add).
+skate-audio = { path = "../../crates/skate-audio", features = ["no-fma"] }
+
+[features]
+# Time per render stage (skate-audio src/prof.rs): `AUDIO STAGES` lines.
+profile = ["skate-audio/profile"]
+
+[target.'cfg(target_os = "vita")'.dependencies]
+vitasdk-sys = { version = "0.3.3", features = ["ScePower_stub", "SceLibKernel_stub", "SceKernelThreadMgr_stub", "SceCtrl_stub", "SceProcessmgr_stub"] }
+vita-newlib-shims = "0.3.1"
+
+# Runs as eboot.bin of the installed test app (scripts/vita-audio-bench.py). build_std must
+# match the other crates (cargo-vita).
+[package.metadata.vita]
+title_id = "SKTV00004"
+title_name = "skate audio bench"
+build_std = "std,panic_abort,panic_unwind"
+
+[package.metadata.vita.profile.release]
+strip_symbols = false

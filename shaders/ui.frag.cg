@@ -1,0 +1,6 @@
+// skate vita 2D UI: vertex colour times the atlas (font glyphs; cell 0 is solid white).
+uniform sampler2D atlas;
+
+float4 main(float2 vTexcoord : TEXCOORD0, float4 vColor : COLOR) : COLOR {
+	return vColor * tex2D(atlas, vTexcoord);
+}

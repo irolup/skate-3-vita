@@ -1,0 +1,67 @@
+# NPC skater natural stance per character record (doc 26, "NPC skater natural stance").
+# Our own measurement table, not a game file: retail keeps the stance in the character records
+# (class 91BCA6693EFC9AA7, byte +120: 1 = regular, 0 = goofy; GetCACSettings 82590B50), which the
+# setup does not export yet. Values were read from the recomp at NPC construction (ten idle runs,
+# 426 spawns, 0 conflicts; runs cas_pcu1, cas_mp1, cas_ind1, cas_dt2, cas_un2, cas_in2, cas_un3,
+# cas_dt3, cas_in3, cas_dt4). The byte's
+# meaning is user-confirmed (2026-10-08): the player's created
+# skater (CAC_female) reads +120 = 0 and rides goofy in game.
+# Columns (tab separated): record name, record id (hex, - = not seen), stance, evidence.
+# stance: regular | goofy | unknown (unknown = engine default, goofy like the stock rig).
+# evidence: measured (read at construction) | inferred (slot refill without a new read: the
+# previous occupant's value) | unseen (did not spawn in the runs).
+# [trace] first runs (cas_pcu1, cas_mp1, cas_ind1); john_cardiel / john_rattray measured later (cas_dt2, cas_in2, cas_un2).
+attiba_jefferson	88D72DF443D56751	regular	measured
+chris_cole	5379A165402B1C2B	regular	measured
+dan_drehobl	BB96A5CF50D64537	regular	measured
+john_rattray	01E75E70D00E5847	regular	measured
+terry_kennedy	8D6B398702D8AE82	regular	measured
+teammate_01	29382B2EBA8620BF	regular	measured
+teammate_04	1BB8E3C516E33951	regular	measured
+cuz	8C0D2AE0C53B259C	goofy	measured
+joey_brezinski	206C25DC52E59C65	goofy	measured
+john_cardiel	90490770FEEF7862	goofy	measured
+josh_kalis	CD56C7FE01EBE665	goofy	measured
+pat_duffy	23A1E4264D66C159	goofy	measured
+ryan_gallant	B5F3E4070EB007FA	goofy	measured
+teammate_03	09A17D4BB5F3D5CB	goofy	measured
+deerman_of_darkwoods	2BEFEA65066275D5	goofy	measured
+# [trace] cas_dt2 (Downtown: Rosalita Skate Park, Carverton Memorial Park, Midtown Promenade, Tresoutta Plaza).
+teammate_02	2F483583FB1712F9	regular	measured
+z_kook_1	563D149DB1F9B887	regular	measured
+benny_fairfax	4CCD17BAEE6FF80B	goofy	measured
+chris_haslam	5B87C6981CA2AE86	goofy	measured
+mark_appleyard	4D425063E234A73E	goofy	measured
+mike_carroll	146D3B7D88385267	goofy	measured
+lizard_king	EAEA9BC0FE331235	goofy	inferred
+# [trace] cas_un2 (University: Hartley Stadium, The Carvatron, Chan Center, The Observatory).
+danny_way	42545B0938E341C9	regular	measured
+seb	2F83EFFF711E44F0	regular	measured
+rob_dyrdek	BE3309CE9BA41097	goofy	measured
+# [trace] cas_in2 (Industrial: Miracle Bowl, The Old Factory, Carverton Quarry, Haystings Park).
+brayden_szafranski	442D23E0B276DC1F	regular	measured
+jason_dill	0DED833242F2F857	regular	measured
+pj_ladd	1733A97B7064D4C2	regular	measured
+dennis_busenitz	3D9D24722E7AA607	goofy	measured
+eric_koston	8ACD851E7D863A5A	goofy	measured
+jerry_hsu	1D939610FEA090EE	goofy	measured
+# [trace] cas_un3 (University: Campus Entrance, Clock Tower, Daly Estates, Peterson Pavilion), cas_dt3 (Downtown:
+# Kube Tower, Plaza of Solitude, Uptown Promenade, Park'n'Play), cas_in3 (Industrial: Drydocks, Factory Roofs, Loading
+# Docks, Pipe Works, The Tanker); jerry_hsu measured in cas_in3. cas_dt4 (Aletown, All Mart, Crystal Towers, Hotel
+# District, Rippon Towers) added no record.
+andrew_reynolds	EBE6BF5D8216F3FD	regular	measured
+darren_navarette	2011502778B9F985	regular	measured
+ryan_smith	1E94340BF4A1655D	regular	measured
+ray_barbee	8484CA1453C02FCD	goofy	measured
+slappy	A06B2864028EB6EE	goofy	measured
+# Free-roam pool records that did not spawn in the runs (stance unknown, engine default).
+# community_skater_01..05 need online play (vault gate "offline"; the choice skips community ids unless
+# allowed), so offline runs cannot spawn them; their look and stance came from uploaded profiles.
+colin_mckay	-	unknown	unseen
+community_skater_01	-	unknown	unseen
+community_skater_02	-	unknown	unseen
+community_skater_03	-	unknown	unseen
+community_skater_04	-	unknown	unseen
+community_skater_05	-	unknown	unseen
+lucas_puig	-	unknown	unseen
+michael_burnette	-	unknown	unseen

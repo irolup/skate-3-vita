@@ -1,0 +1,27 @@
+[package]
+name = "game-audio"
+description = "The reference's game audio host (skate-game game_audio, b3c9679) without Bevy: the library, the native runtime host, the player components and the rolling bed (retail-audio S1)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+skate-audio = { path = "../skate-audio" }
+skate-data = { path = "../skate-data" }
+# The skater's audio publication (`skate_sim::AudioRiding`).
+skate-sim = { path = "../skate-sim" }
+skate-core = { path = "../skate-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = { version = "0.1.44", default-features = false, features = ["std"] }
+glam = "0.30.10"
+
+[dev-dependencies]
+vita-pack = { path = "../vita-pack" }
+
+[features]
+# Render stage times (skate_audio::prof), for the Vita profile.
+profile = ["skate-audio/profile"]
+no-fma = ["skate-audio/no-fma", "skate-sim/no-fma", "skate-core/no-fma"]

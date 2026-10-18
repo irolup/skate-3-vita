@@ -1,0 +1,48 @@
+[package]
+name = "sim-bench"
+description = "Headless Vita simulation benchmark and on-device parity oracle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# no-fma: the Vita arithmetic (M3 decision, docs/milestones/M3.md); oracle: the harness.
+skate-sim = { path = "../../crates/skate-sim", features = ["oracle", "no-fma", "stage-profile"] }
+# Only for the kernel-bench diagnostic (same crate as skate-sim's, features unify).
+skate-core = { path = "../../crates/skate-core", optional = true }
+# The `packs` feature: load from the baked sim.pak + anim.pak (M6).
+vita-pack = { path = "../../crates/vita-pack", optional = true }
+skate-data = { path = "../../crates/skate-data", optional = true }
+# Stage profile: collects skate-sim's stage spans (src/profile.rs).
+tracing = { version = "0.1.44", default-features = false, features = ["std"] }
+
+[features]
+# Diagnostic only: count heap allocations per tick (never in timing builds).
+alloc-count = []
+# Diagnostic: write each tick's stage profile to `{scenario}.stages` (CSV, µs).
+tick-stages = []
+# Diagnostic: capture narrowphase inputs from tick 1600 on, then time its phases
+# on them (`BENCH MICRO` lines). Never in timing builds.
+kernel-bench = ["dep:skate-core", "skate-core/kernel-bench"]
+# Load from ux0:data/SKATEVITA/sim.pak + anim.pak instead of the unpacked assets (M6).
+packs = ["dep:vita-pack", "dep:skate-data"]
+# The game's "Fast" physics: 25 solver iterations instead of retail's 50 (ORACLE_ITERATIONS).
+fast-physics = []
+# Diagnostic: count __aeabi_mem* calls and bytes (tools/vita-libc/aeabi_mem.c).
+mem-count = []
+
+[target.'cfg(target_os = "vita")'.dependencies]
+vitasdk-sys = { version = "0.3.3", features = ["ScePower_stub", "SceLibKernel_stub", "SceKernelThreadMgr_stub", "SceCtrl_stub", "SceProcessmgr_stub"] }
+vita-newlib-shims = "0.3.1"
+
+# Runs as eboot.bin of the installed test app (scripts/vita-bench.py); this title is
+# only used if a VPK is built. build_std must match the other crates (cargo-vita).
+[package.metadata.vita]
+title_id = "SKTV00003"
+title_name = "skate sim bench"
+build_std = "std,panic_abort,panic_unwind"
+
+[package.metadata.vita.profile.release]
+strip_symbols = false

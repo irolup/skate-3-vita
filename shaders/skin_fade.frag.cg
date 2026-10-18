@@ -1,0 +1,14 @@
+// skate vita NPC skater fading in or out (L1d; upstream draws a blended copy of each material at
+// the NPC's opacity): base colour texture x factor x lighting, alpha = the fade; masked materials
+// keep their cutoff.
+uniform sampler2D tex;
+uniform float4 tint;
+uniform float cutoff;
+uniform float fade;
+
+float4 main(float2 vTexcoord : TEXCOORD0, float4 vColor : COLOR) : COLOR {
+	float4 c = tex2D(tex, vTexcoord) * tint;
+	if (c.a < cutoff)
+		discard;
+	return float4(c.rgb * vColor.rgb, fade);
+}

@@ -1,0 +1,574 @@
+use super::anim::{ClipWindow, Intent, RemapClip, TestPath, IDENTITY};
+use super::choice::{entity_index, tints, unit_f32};
+use super::*;
+use crate::animation::output::Sqt;
+use std::collections::BTreeMap;
+
+fn s(names: &[&str]) -> Vec<String> {
+    names.iter().map(|n| n.to_string()).collect()
+}
+
+fn model(parent: Option<&str>, recipe: &str, tints_a: usize) -> PedModel {
+    PedModel {
+        parent: parent.map(Into::into),
+        recipe: recipe.into(),
+        voice: Some(50),
+        tints_a: (0..tints_a).map(|i| [i as f32, 0.0, 0.0, 1.0]).collect(),
+        tints_b: vec![[0.0, 0.0, 1.0, 1.0], [0.0, 1.0, 0.0, 1.0]],
+        ..Default::default()
+    }
+}
+
+fn catalog() -> PedCatalog {
+    let mut c = PedCatalog::default();
+    c.categories.insert("aletown".into(), s(&["jock02", "skater_female03", "bum02"]));
+    c.categories.insert("empty".into(), vec![]);
+    let e = |m: &str, a: &str| PedEntity { model: Some(m.into()), anim_set: Some(a.into()) };
+    c.entities.insert("jock02".into(), e("jock02", "jock"));
+    c.entities.insert("skater_female03".into(), e("skater_female", "female"));
+    c.entities.insert("bum02".into(), e("bum02", "bum"));
+    c.models.insert("jock02".into(), model(Some("jock"), "male_jock_2", 1));
+    c.models.insert("bum02".into(), model(Some("bum"), "male_bum_2", 3));
+    c.models.insert("skater_female".into(), model(Some("census_spawned"), "", 1));
+    for i in 1..=3 {
+        c.models.insert(format!("skater_female0{i}"), model(Some("skater_female"), &format!("female_skater_{i}"), 5));
+    }
+    c
+}
+
+#[test]
+fn entity_index_is_the_retail_formula() {
+    // sub_826BB058: u32 x 2^-32 as f32; sub_826B8B88: trunc(x 100) % count.
+    assert_eq!(unit_f32(0), 0.0);
+    assert_eq!(unit_f32(u32::MAX), 1.0); // rounds up in f32, as on the console
+    assert_eq!(entity_index(0, 3), Some(0));
+    assert_eq!(entity_index(1 << 31, 3), Some(50 % 3));
+    assert_eq!(entity_index(u32::MAX, 3), Some(100 % 3));
+    // u32::MAX / 4 rounds up to 2^30 in f32: exactly 0.25 -> 25.
+    assert_eq!(entity_index(u32::MAX / 4, 7), Some(25 % 7));
+    assert_eq!(entity_index(12345, 0), None);
+    // The x100 truncation biases lists that do not divide 100: index 0 of 3 wins 34 of 100.
+    let mut counts = [0u32; 3];
+    for k in 0..100u32 {
+        counts[entity_index(((k as u64 * (1u64 << 32)) / 100 + 4096) as u32, 3).unwrap()] += 1;
+    }
+    assert_eq!(counts, [34, 33, 33]);
+}
+
+#[test]
+fn tints_share_one_rand() {
+    let m = model(None, "x", 5);
+    let (a, b) = tints(&m, 7);
+    assert_eq!(a, [2.0, 0.0, 0.0, 1.0]); // 7 % 5
+    assert_eq!(b, [0.0, 1.0, 0.0, 1.0]); // 7 % 2
+    let none = PedModel::default();
+    assert_eq!(tints(&none, 3), (choice::DEFAULT_TINT, choice::DEFAULT_TINT));
+}
+
+#[test]
+fn a_mod_palette_replaces_the_model_tints_with_the_same_rule() {
+    let c = catalog();
+    let mut o = PedOverrides::default();
+    let base = c.choose("aletown", 42, &o).unwrap();
+    o.model_tints.insert(base.model.clone(), (vec![[0.9, 0.1, 0.1, 1.0]], vec![[0.1, 0.1, 0.9, 1.0]]));
+    let modded = c.choose("aletown", 42, &o).unwrap();
+    assert_eq!((modded.entity.as_str(), modded.model.as_str()), (base.entity.as_str(), base.model.as_str()));
+    assert_eq!((modded.tint_a, modded.tint_b), ([0.9, 0.1, 0.1, 1.0], [0.1, 0.1, 0.9, 1.0]));
+    // restoring the defaults (mod disabled) gives the retail look again
+    assert_eq!(c.choose("aletown", 42, &PedOverrides::default()).unwrap(), base);
+}
+
+#[test]
+fn the_look_follows_from_category_and_seed() {
+    let c = catalog();
+    let o = PedOverrides::default();
+    let a = c.choose("aletown", 42, &o).unwrap();
+    assert_eq!(a, c.choose("aletown", 42, &o).unwrap());
+    let mut seen = BTreeMap::new();
+    for seed in 0..600u64 {
+        let l = c.choose("aletown", seed, &o).unwrap();
+        assert!(!l.recipe.is_empty());
+        *seen.entry(l.recipe.clone()).or_insert(0) += 1;
+        if l.entity == "skater_female03" {
+            assert!(l.model.starts_with("skater_female0"), "group record resolves to a child: {}", l.model);
+            assert_eq!(l.anim_set, "female");
+        }
+    }
+    // Every entity and every group child appears.
+    for r in ["male_jock_2", "male_bum_2", "female_skater_1", "female_skater_2", "female_skater_3"] {
+        assert!(seen.contains_key(r), "{r} never chosen: {seen:?}");
+    }
+    assert!(c.choose("empty", 1, &o).is_none());
+    assert!(c.choose("nope", 1, &o).is_none());
+}
+
+#[test]
+fn overrides_replace_lists_models_and_sets() {
+    let c = catalog();
+    let mut o = PedOverrides::default();
+    o.category_entities.insert("aletown".into(), s(&["bum02"]));
+    o.entity_model.insert("bum02".into(), "jock02".into());
+    o.entity_anim_set.insert("bum02".into(), "zombie".into());
+    for seed in 0..20 {
+        let l = c.choose("aletown", seed, &o).unwrap();
+        assert_eq!((l.entity.as_str(), l.recipe.as_str(), l.anim_set.as_str()), ("bum02", "male_jock_2", "zombie"));
+    }
+}
+
+#[test]
+fn bones_match_by_name() {
+    let (map, unused) = match_bones(&s(&["Hips", "LeftFoot", "Tail"]), &s(&["TRAJECTORY", "HIPS", "LEFTFOOT"]));
+    assert_eq!(map, vec![Some(1), Some(2), None]);
+    assert_eq!(unused, s(&["TRAJECTORY"]));
+}
+
+// ---------------------------------------------------------------- animation player
+
+const FPS: f32 = 30.0;
+
+fn sqt(t: [f32; 3], yaw: f32) -> Sqt {
+    Sqt { scale: [1.0; 4], rotation: [0.0, (yaw * 0.5).sin(), 0.0, (yaw * 0.5).cos()], translation: [t[0], t[1], t[2], 1.0] }
+}
+
+/// A 3-bone clip: trajectory moving at `speed` m/s (z) and turning to `turn` rad by the end,
+/// hips bent by `bend` so poses differ.
+fn clip(name: &str, frames: usize, speed: f32, turn: f32, looping: bool, bend: f32, windows: Vec<ClipWindow>) -> PedClip {
+    let len = (frames - 1) as f32 / FPS;
+    PedClip { channel_weights: None,
+        name: name.into(),
+        fps: FPS,
+        frames: (0..frames)
+            .map(|f| {
+                let t = f as f32 / FPS;
+                vec![sqt([0.0, 0.0, speed * t], turn * t / len.max(1e-6)), sqt([0.0, 0.0, 0.0], bend), IDENTITY]
+            })
+            .collect(),
+        looping,
+        loop_rotation: [0.0, 0.0, 0.0, 1.0],
+        loop_translation: [0.0, 0.0, speed * len],
+        windows,
+    }
+}
+
+fn w(channel: &str, begin: f32, end: f32) -> ClipWindow {
+    ClipWindow { channel: channel.into(), begin, end, value: 1.0 }
+}
+
+fn fixture() -> (PedRig, PedAnimSet, BTreeMap<String, PedClip>) {
+    let rig = PedRig {
+        names: s(&["TRAJECTORY", "HIPS", "HEADEND"]),
+        parents: vec![-1, 0, 1],
+        mirrors: vec![0, 1, -1],
+        reference: vec![IDENTITY, sqt([0.0, 0.92, 0.0], 0.0), sqt([0.0, 0.5, 0.0], 0.0)],
+        animated: vec![true, true, false],
+    };
+    let mut clips = BTreeMap::new();
+    let walk_windows = vec![w("LEFTTOEDOWN", 0.25, 0.75), w("RIGHTTOEDOWN", 0.0, 0.3), w("RIGHTTOEDOWN", 0.76, 1.0)];
+    for c in [
+        clip("IDLE_A", 31, 0.0, 0.0, true, 0.1, vec![w("LEFTTOEDOWN", 0.0, 1.0), w("RIGHTTOEDOWN", 0.0, 1.0)]),
+        clip("IDLE_B", 31, 0.0, 0.0, true, 0.2, vec![]),
+        clip("WALK", 34, 1.3, 0.0, true, 0.3, walk_windows),
+        clip("START", 28, 0.8, 0.0, false, 0.25, vec![]),
+        clip("STOP", 30, 0.5, 0.0, false, 0.15, vec![]),
+        clip("TURN", 43, 0.0, -std::f32::consts::PI, false, 0.05, vec![]),
+    ] {
+        clips.insert(c.name.clone(), c);
+    }
+    let r = |c: &str, windows: Vec<(f32, f32, i32)>| RemapClip { clip: c.into(), windows };
+    let mut set = PedAnimSet::default();
+    set.entries.insert(anim::names::IDLE.into(), vec![r("IDLE_A", vec![]), r("IDLE_B", vec![])]);
+    set.entries.insert(anim::names::WALK.into(), vec![r("WALK", vec![(0.0, 0.051, 1), (0.4166, 0.584, -1), (1.0, 1.1, 1)])]);
+    set.entries.insert(anim::names::START.into(), vec![r("START", vec![])]);
+    set.entries.insert(anim::names::STOP.into(), vec![r("STOP", vec![])]);
+    set.entries.insert(anim::names::TURN_180.into(), vec![r("TURN", vec![])]);
+    (rig, set, clips)
+}
+
+/// Runs a player with an intent schedule at `hz`, returns (states entered, distance, yaw, feet log).
+fn run(seed: u64, hz: f32, seconds: f32, schedule: &dyn Fn(f32) -> Intent) -> (Vec<Locomotion>, f32, f32, Vec<[bool; 2]>, PedAnimPlayer) {
+    let (_, set, clips) = fixture();
+    let mut p = PedAnimPlayer::new(&set, seed).unwrap();
+    let (mut states, mut dist, mut yaw, mut feet) = (vec![p.state], 0.0, 0.0, Vec::new());
+    let dt = 1.0 / hz;
+    let mut t = 0.0;
+    while t < seconds {
+        p.intent = schedule(t);
+        let o = p.step(dt, &set, &clips);
+        dist += o.root.translation[2];
+        yaw += o.root.yaw;
+        if let Some(e) = o.entered {
+            if states.last() != Some(&e) {
+                states.push(e);
+            }
+        }
+        feet.push(o.feet_down);
+        t += dt;
+    }
+    (states, dist, yaw, feet, p)
+}
+
+#[test]
+fn idle_start_walk_stop_follow_the_motion_graph() {
+    let schedule = |t: f32| if (1.0..5.0).contains(&t) { Intent::Walk } else { Intent::Idle };
+    let (states, dist, _, feet, p) = run(7, 30.0, 8.0, &schedule);
+    assert_eq!(&states[..5], &[Locomotion::Idle, Locomotion::Start, Locomotion::Walk, Locomotion::Stop, Locomotion::Idle], "{states:?}");
+    assert_eq!(p.state, Locomotion::Idle);
+    // Root motion: about 0.9 s start at 0.8 m/s + about 3 s walk at 1.3 m/s + stop.
+    assert!((4.0..6.5).contains(&dist), "distance {dist}");
+    // Walk foot plants alternate (both feet down at times, each foot up at times).
+    assert!(feet.iter().any(|f| *f == [true, false]) && feet.iter().any(|f| *f == [false, true]));
+}
+
+#[test]
+fn walk_speed_is_the_clip_trajectory_at_any_step() {
+    for hz in [30.0, 60.0, 144.0] {
+        let (_, set, clips) = fixture();
+        let mut p = PedAnimPlayer::new(&set, 1).unwrap();
+        p.intent = Intent::Walk;
+        let dt = 1.0 / hz;
+        let mut t = 0.0;
+        while p.state != Locomotion::Walk || p.blend_weight() < 1.0 {
+            p.step(dt, &set, &clips);
+            t += dt;
+            assert!(t < 3.0);
+        }
+        let mut dist = 0.0;
+        let steps = (3.0 * hz) as usize;
+        for _ in 0..steps {
+            dist += p.step(dt, &set, &clips).root.translation[2];
+        }
+        let speed = dist / (steps as f32 * dt);
+        assert!((speed - 1.3).abs() < 0.02, "{hz} Hz: {speed} m/s (loop transform carries the wraps)");
+    }
+}
+
+#[test]
+fn turns_rotate_the_root_and_the_left_turn_is_mirrored() {
+    let right = |t: f32| if t < 0.05 { Intent::TurnRight } else { Intent::Idle };
+    let left = |t: f32| if t < 0.05 { Intent::TurnLeft } else { Intent::Idle };
+    let (sr, _, yr, ..) = run(3, 30.0, 3.0, &right);
+    let (sl, _, yl, ..) = run(3, 30.0, 3.0, &left);
+    assert!(sr.contains(&Locomotion::TurnRight) && sl.contains(&Locomotion::TurnLeft));
+    // About 180 degrees (the exit 0.1 s before the end and the blend take a little off).
+    assert!((yr + std::f32::consts::PI).abs() < 0.5, "right turn yaw {yr}");
+    assert!((yl - std::f32::consts::PI).abs() < 0.5, "left turn yaw {yl}");
+}
+
+#[test]
+fn same_seed_same_animation_and_pose_has_reference_added() {
+    let schedule = |t: f32| if (0.5..3.0).contains(&t) { Intent::Walk } else { Intent::Idle };
+    let a = run(11, 30.0, 6.0, &schedule);
+    let b = run(11, 30.0, 6.0, &schedule);
+    assert_eq!(a.4, b.4);
+    assert_eq!((a.1, a.2), (b.1, b.2));
+    let (rig, _, clips) = fixture();
+    let pose = a.4.pose(&rig, &clips, 0.0).unwrap();
+    assert_eq!(pose[0], IDENTITY, "trajectory goes to the entity transform");
+    assert!((pose[1].translation[1] - 0.92).abs() < 1e-5, "hips get the reference offset");
+    assert_eq!(pose[2], rig.reference[2], "bones without clip data keep the reference");
+    let g = PedEvaluator::globals(&rig, &pose);
+    assert!((g[2][3][1] - 1.42).abs() < 0.05, "child global = local x parent: {:?}", g[2][3]);
+}
+
+#[test]
+fn idle_cycles_swap_between_list_clips() {
+    let (_, _, _, _, _) = run(5, 30.0, 0.1, &|_| Intent::Idle);
+    let (_, set, clips) = fixture();
+    let mut p = PedAnimPlayer::new(&set, 5).unwrap();
+    let mut seen = std::collections::BTreeSet::new();
+    for _ in 0..(60 * 30) {
+        p.step(1.0 / 30.0, &set, &clips);
+        seen.insert(p.current_clip().to_string());
+    }
+    assert_eq!(seen.len(), 2, "both idle clips play over a minute: {seen:?}");
+}
+
+#[test]
+fn test_path_walks_turns_and_repeats() {
+    let (_, set, clips) = fixture();
+    let mut p = PedAnimPlayer::new(&set, 9).unwrap();
+    let mut path = TestPath::new(9);
+    let mut states = std::collections::BTreeSet::new();
+    for _ in 0..(40 * 30) {
+        p.intent = path.intent(1.0 / 30.0, p.state);
+        p.step(1.0 / 30.0, &set, &clips);
+        states.insert(p.state);
+    }
+    for s in [Locomotion::Idle, Locomotion::Start, Locomotion::Walk, Locomotion::Stop, Locomotion::TurnRight, Locomotion::TurnLeft] {
+        assert!(states.contains(&s), "{s:?} never reached");
+    }
+}
+
+/// A rig like the export's: the hips reference carries the 180 degree literal that trajectory
+/// mode 1 mirroring multiplies in, so the reference is symmetric only as a FULL pose.
+fn mirror_fixture() -> (PedRig, PedAnimSet, BTreeMap<String, PedClip>) {
+    let leg = |z: f32| Sqt { scale: [1.0; 4], rotation: [0.0, 0.0, 0.0, 1.0], translation: [0.0, -0.4, z, 1.0] };
+    let rig = PedRig {
+        names: s(&["TRAJECTORY", "HIPS", "LEFTUPLEG", "RIGHTUPLEG"]),
+        parents: vec![-1, 0, 1, 1],
+        mirrors: vec![0, 1, 3, 2],
+        reference: vec![IDENTITY, Sqt { scale: [1.0; 4], rotation: [0.5, 0.5, -0.5, -0.5], translation: [0.0, 0.92, 0.0, 1.0] }, leg(0.1), leg(-0.1)],
+        animated: vec![true, true, true, true],
+    };
+    let bend = |a: f32| Sqt { scale: [1.0; 4], rotation: [(a * 0.5).sin(), 0.0, 0.0, (a * 0.5).cos()], translation: [0.0, 0.0, 0.0, 1.0] };
+    let still = |name: &str, frames: usize, turn: f32, looping: bool| PedClip { channel_weights: None,
+        name: name.into(),
+        fps: FPS,
+        frames: (0..frames)
+            .map(|f| {
+                let t = f as f32 / (frames - 1) as f32;
+                // Hips delta zero; only the left leg moves (an asymmetric clip).
+                vec![sqt([0.0, 0.0, 0.0], turn * t), IDENTITY, bend(0.6 * t), IDENTITY]
+            })
+            .collect(),
+        looping,
+        loop_rotation: [0.0, 0.0, 0.0, 1.0],
+        loop_translation: [0.0; 3],
+        windows: vec![],
+    };
+    let mut clips = BTreeMap::new();
+    clips.insert("IDLE".into(), still("IDLE", 31, 0.0, true));
+    clips.insert("TURN".into(), still("TURN", 43, -std::f32::consts::PI, false));
+    let r = |c: &str| vec![RemapClip { clip: c.into(), windows: vec![] }];
+    let mut set = PedAnimSet::default();
+    set.entries.insert(anim::names::IDLE.into(), r("IDLE"));
+    set.entries.insert(anim::names::TURN_180.into(), r("TURN"));
+    (rig, set, clips)
+}
+
+fn angle(a: [f32; 4], b: [f32; 4]) -> f32 {
+    let d: f32 = (0..4).map(|k| a[k] * b[k]).sum();
+    2.0 * d.abs().min(1.0).acos()
+}
+
+#[test]
+fn the_mirrored_turn_mirrors_the_full_pose_and_never_flips_the_hips() {
+    let (rig, set, clips) = mirror_fixture();
+    // Precondition: the reference is symmetric under the full-pose mirror.
+    let mut m = rig.reference.clone();
+    crate::animation::pose_mirror::mirror(&mut m, &rig.parents, &rig.mirrors, 1).unwrap();
+    for (a, b) in m.iter().zip(&rig.reference).skip(1) {
+        assert!(angle(a.rotation, b.rotation) < 1e-4);
+    }
+    let dt = 1.0 / 60.0;
+    let poses = |intent: Intent| {
+        let mut p = PedAnimPlayer::new(&set, 1).unwrap();
+        p.intent = intent;
+        let mut out = Vec::new();
+        for _ in 0..40 {
+            p.step(dt, &set, &clips);
+            p.intent = Intent::Idle;
+            out.push((p.blend_weight(), p.pose(&rig, &clips, 0.0).unwrap()));
+        }
+        out
+    };
+    let right = poses(Intent::TurnRight);
+    let left = poses(Intent::TurnLeft);
+    for (k, ((wl, l), (wr, r))) in left.iter().zip(&right).enumerate() {
+        assert_eq!(wl, wr);
+        // The hips delta is zero in every clip: mid-blend or not, the hips stay at the reference
+        // (the old delta mirror turned them 180 degrees: the ped stood on its head).
+        assert!(angle(l[1].rotation, rig.reference[1].rotation) < 1e-3, "tick {k} weight {wl}: hips {:?}", l[1].rotation);
+        // Out of the blend, the left turn is the right turn's full pose mirrored (in the blend the
+        // outgoing idle layer is not mirrored).
+        if *wl < 1.0 {
+            continue;
+        }
+        let mut mr = r.clone();
+        crate::animation::pose_mirror::mirror(&mut mr, &rig.parents, &rig.mirrors, 1).unwrap();
+        for b in 1..4 {
+            assert!(angle(l[b].rotation, mr[b].rotation) < 1e-3, "tick {k} bone {b}: {:?} vs {:?}", l[b].rotation, mr[b].rotation);
+            assert!((0..3).all(|i| (l[b].translation[i] - mr[b].translation[i]).abs() < 1e-5), "tick {k} bone {b} translation");
+        }
+    }
+    // And the clip really is asymmetric: the left leg moves in the right turn, the right leg in the left.
+    let (_, r) = &right[39];
+    let (_, l) = &left[39];
+    assert!(angle(r[2].rotation, rig.reference[2].rotation) > 0.1 && angle(r[3].rotation, rig.reference[3].rotation) < 1e-4);
+    assert!(angle(l[3].rotation, rig.reference[3].rotation) > 0.1 && angle(l[2].rotation, rig.reference[2].rotation) < 1e-4);
+}
+
+#[test]
+fn a_knock_down_falls_lies_for_the_ground_time_gets_up_and_walks_on() {
+    use super::skater_contact::{reaction_steps, ReactionDirection, ReactionKind};
+    let (_, mut set, mut clips) = fixture();
+    let r = |c: &str| vec![RemapClip { clip: c.into(), windows: vec![] }];
+    for (name, frames, looping) in [("FALL", 31, false), ("GROUND", 21, true), ("GETUP", 31, false)] {
+        clips.insert(name.into(), clip(name, frames, 0.0, 0.0, looping, 0.0, vec![]));
+    }
+    set.entries.insert("WipeoutBackFall".into(), r("FALL"));
+    set.entries.insert("WipeoutBackGroundCyc".into(), r("GROUND"));
+    set.entries.insert("WipeoutBackGetUp".into(), r("GETUP"));
+    let mut p = PedAnimPlayer::new(&set, 3).unwrap();
+    assert!(p.react(&set, reaction_steps(ReactionKind::Knockdown, ReactionDirection::FromFront), 1.5));
+    assert!(!p.react(&set, reaction_steps(ReactionKind::Standing, ReactionDirection::FromFront), 1.5), "no second reaction while one runs");
+    let mut log = Vec::new();
+    let dt = 1.0 / 60.0;
+    for _ in 0..(6.0 / dt) as usize {
+        p.intent = Intent::Walk;
+        p.step(dt, &set, &clips);
+        log.push((p.state, p.current_clip().to_owned()));
+    }
+    let first = |c: &str| log.iter().position(|(_, x)| x == c).unwrap_or_else(|| panic!("{c} never played"));
+    let (fall, ground, getup) = (first("FALL"), first("GROUND"), first("GETUP"));
+    assert!(fall < ground && ground < getup);
+    // The fall clip is 1 s; the ground cycle lasts the set's ground time (1.5 s at 60 Hz).
+    let ground_frames = getup - ground;
+    assert!((89..=91).contains(&ground_frames), "{ground_frames} frames on the ground");
+    assert!(log[..getup].iter().all(|(s, _)| *s == Locomotion::Reaction), "no walking while reacting");
+    assert!(log.iter().skip(getup).any(|(s, _)| *s != Locomotion::Reaction), "back to locomotion after the get-up");
+    assert_eq!(p.reaction_anim(), None);
+}
+
+/// The sit plugin state (`motiongraph_sit.xml` via `plugin_motion`): Stand2Sit, then SitIdleCyc held for as long as the
+/// packet stays on its first stage, then (released on StandUp) Sit2Stand and back to locomotion.
+#[test]
+fn a_sitting_ped_holds_the_idle_until_released_then_stands_up() {
+    use super::plugin_motion::{motion_for, BLEND};
+    use super::skater_contact::ReactionStep;
+    let (_, mut set, mut clips) = fixture();
+    let r = |c: &str| vec![RemapClip { clip: c.into(), windows: vec![] }];
+    for (name, frames, looping) in [("SITDOWN", 31, false), ("SITIDLE", 21, true), ("STANDUP", 31, false)] {
+        clips.insert(name.into(), clip(name, frames, 0.0, 0.0, looping, 0.0, vec![]));
+    }
+    set.entries.insert("Stand2Sit".into(), r("SITDOWN"));
+    set.entries.insert("SitIdleCyc".into(), r("SITIDLE"));
+    set.entries.insert("Sit2Stand".into(), r("STANDUP"));
+    let m = motion_for("Sit").unwrap();
+    let steps = m.steps.iter().map(|s| ReactionStep { anim: s.anim, mirror: false, blend: BLEND, cycle: s.hold_until.is_some() }).collect();
+    let mut p = PedAnimPlayer::new(&set, 3).unwrap();
+    assert!(p.react(&set, steps, f32::INFINITY));
+    let dt = 1.0 / 60.0;
+    for _ in 0..600 {
+        p.step(dt, &set, &clips);
+    }
+    assert_eq!(p.current_clip(), "SITIDLE", "still seated after 10 s");
+    p.release_hold();
+    let mut log = Vec::new();
+    for _ in 0..120 {
+        p.step(dt, &set, &clips);
+        log.push(p.current_clip().to_owned());
+    }
+    assert!(log.iter().any(|c| c == "STANDUP"));
+    assert!(!p.reacting(), "the run ended after the stand-up");
+}
+
+/// The Sit intent ends while the ped is still in Stand2Sit (its seat was carried away). Retail's sit state is
+/// non-interruptable: Stand2Sit plays out, SittingCyc leaves on "not HasIntent Sit" to Sit2Stand. A single release
+/// during Stand2Sit is lost (the ped sat forever, session 2026-10-13 11:23); the game keeps releasing until the cycle.
+#[test]
+fn a_sit_ended_during_stand2sit_stands_up_once_seated() {
+    use super::plugin_motion::{motion_for, BLEND};
+    use super::skater_contact::ReactionStep;
+    let (_, mut set, mut clips) = fixture();
+    let r = |c: &str| vec![RemapClip { clip: c.into(), windows: vec![] }];
+    for (name, frames, looping) in [("SITDOWN", 31, false), ("SITIDLE", 21, true), ("STANDUP", 31, false)] {
+        clips.insert(name.into(), clip(name, frames, 0.0, 0.0, looping, 0.0, vec![]));
+    }
+    set.entries.insert("Stand2Sit".into(), r("SITDOWN"));
+    set.entries.insert("SitIdleCyc".into(), r("SITIDLE"));
+    set.entries.insert("Sit2Stand".into(), r("STANDUP"));
+    let m = motion_for("Sit").unwrap();
+    let steps: Vec<ReactionStep> = m.steps.iter().map(|s| ReactionStep { anim: s.anim, mirror: false, blend: BLEND, cycle: s.hold_until.is_some() }).collect();
+    let dt = 1.0 / 60.0;
+    for keep_releasing in [false, true] {
+        let mut p = PedAnimPlayer::new(&set, 3).unwrap();
+        assert!(p.react(&set, steps.clone(), f32::INFINITY));
+        p.step(dt, &set, &clips);
+        assert_eq!(p.reaction_anim(), Some("Stand2Sit"));
+        p.release_hold();
+        let mut log = Vec::new();
+        for _ in 0..600 {
+            if keep_releasing {
+                p.release_hold();
+            }
+            p.step(dt, &set, &clips);
+            log.push(p.current_clip().to_owned());
+        }
+        if keep_releasing {
+            assert!(log.iter().any(|c| c == "STANDUP") && !p.reacting(), "sat down, stood up, run ended");
+        } else {
+            assert_eq!(p.current_clip(), "SITIDLE", "one early release is lost: still seated");
+        }
+    }
+}
+
+/// The ped channel (b99, `82E32878` / `82E3A5A0`): a carry clip fades in over 0.2 s and takes over only the bones its
+/// channel weights pick (here the hips), the rest keeps locomotion; a stop fades it out and frees the slot.
+#[test]
+fn the_channel_overrides_only_its_weighted_bones_and_fades() {
+    let (rig, mut set, mut clips) = fixture();
+    let mut carry = clip("CARRY", 3, 0.0, 0.0, true, 1.0, vec![]);
+    carry.channel_weights = Some(vec![0.0, 1.0, 0.0]);
+    clips.insert("CARRY".into(), carry);
+    set.entries.insert("CarrySmallRHChannel".into(), vec![RemapClip { clip: "CARRY".into(), windows: vec![] }]);
+    let mut p = PedAnimPlayer::new(&set, 1).unwrap();
+    let base = p.pose(&rig, &clips, 0.0).unwrap();
+    assert!(p.channel_idle());
+    assert!(p.channel_request(&set, "CarrySmallRHChannel", 0.2, 0.2));
+    assert!(!p.channel_request(&set, "NoSuchChannel", 0.2, 0.2) && p.channel_clip() == Some("CARRY"), "unknown name: nothing replaced");
+    p.step(0.1, &set, &clips);
+    let half = p.pose(&rig, &clips, 0.0).unwrap();
+    for _ in 0..3 {
+        p.step(0.1, &set, &clips);
+    }
+    let full = p.pose(&rig, &clips, 0.0).unwrap();
+    let yaw = |q: [f32; 4]| 2.0 * q[1].atan2(q[3]);
+    assert!((yaw(full[1].rotation) - 1.0).abs() < 1e-3, "hips take the carry pose: {:?}", full[1].rotation);
+    let h = yaw(half[1].rotation);
+    assert!(h > yaw(base[1].rotation) + 0.1 && h < 0.95, "half way through the fade: {h}");
+    assert_eq!(full[2], base[2], "a zero-weight bone keeps locomotion");
+    assert_eq!(full[1].translation[3], 1.0, "the weight lane does not leak into the pose");
+    p.channel_stop(0.2);
+    for _ in 0..3 {
+        p.step(0.1, &set, &clips);
+    }
+    assert!(p.channel_idle(), "the stop fade freed the slot");
+}
+
+/// Turn buckets (`82E2A500`, b167): a standing ped plays the bucket's stand turn, a walking ped the bucket's walk turn
+/// in its branch window and then walks on (`blendedturn`); left turns are the mirrored right clip.
+#[test]
+fn turn_buckets_pick_the_stand_and_walk_turn_clips() {
+    let (_, mut set, mut clips) = fixture();
+    let r = |c: &str| vec![RemapClip { clip: c.into(), windows: vec![] }];
+    for c in [clip("TURN90", 30, 0.0, -std::f32::consts::FRAC_PI_2, false, 0.05, vec![]), clip("WTURN45", 30, 1.3, -std::f32::consts::FRAC_PI_4, false, 0.05, vec![])] {
+        clips.insert(c.name.clone(), c);
+    }
+    set.entries.insert("StandTurnR90".into(), r("TURN90"));
+    set.entries.insert("WalkTurnR45".into(), r("WTURN45"));
+    let dt = 1.0 / 30.0;
+    // Standing, 90 degrees right.
+    let mut p = PedAnimPlayer::new(&set, 3).unwrap();
+    p.turn_degrees = 90;
+    p.intent = Intent::TurnRight;
+    let mut yaw = 0.0;
+    p.step(dt, &set, &clips);
+    assert_eq!((p.state, p.current_clip()), (Locomotion::TurnRight, "TURN90"));
+    p.intent = Intent::Idle;
+    for _ in 0..60 {
+        yaw += p.step(dt, &set, &clips).root.yaw;
+    }
+    assert_eq!(p.state, Locomotion::Idle);
+    assert!((yaw + std::f32::consts::FRAC_PI_2).abs() < 0.3, "right 90 yaw {yaw}");
+    // Walking, 45 degrees left: the mirrored walk turn, then the walk cycle again.
+    let mut p = PedAnimPlayer::new(&set, 3).unwrap();
+    p.intent = Intent::Walk;
+    for _ in 0..90 {
+        p.step(dt, &set, &clips);
+    }
+    assert_eq!(p.state, Locomotion::Walk);
+    p.turn_degrees = 45;
+    p.intent = Intent::TurnLeft;
+    let mut entered = false;
+    for _ in 0..60 {
+        p.step(dt, &set, &clips);
+        if p.state == Locomotion::WalkTurnLeft {
+            entered = true;
+            assert!(p.mirrored() && p.current_clip() == "WTURN45");
+            p.intent = Intent::Walk;
+        }
+    }
+    assert!(entered, "the walk turn played in the branch window");
+    assert_eq!(p.state, Locomotion::Walk, "back on the walk cycle");
+}

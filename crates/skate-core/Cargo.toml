@@ -1,0 +1,29 @@
+[package]
+name = "skate-core"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# skate_vita addition (not in the reference): see src/madd.rs.
+[features]
+no-fma = []
+# Stage timers for the profile (src/profile.rs); off by default.
+stage-profile = []
+# Diagnostic only: count madd calls (src/madd.rs); never in timing builds.
+madd-count = []
+# Correctly rounded software FMA (the Vita build; src/madd.rs).
+soft-fma = []
+# Diagnostic only: bisect fused-arithmetic needs (src/madd.rs).
+madd-audit = []
+# Diagnostic only: newlib-style double-precision fmaf (src/madd.rs).
+fma-f64 = []
+# Diagnostic only: capture narrowphase inputs and time its phases on them
+# (src/physics/world_contact/kernel_bench.rs); never in timing builds.
+kernel-bench = []
+
+# skate_vita addition (not in the reference): on-device test VPK.
+# build_std must match crates/skate-vita (cargo-vita reads it from the first package).
+[package.metadata.vita]
+title_id = "SKTV00002"
+title_name = "skate-core tests"
+build_std = "std,panic_abort,panic_unwind"

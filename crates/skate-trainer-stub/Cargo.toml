@@ -1,0 +1,8 @@
+[package]
+name = "skate-trainer-stub"
+description = "Stand-in for skate_mods::TrainerTuning: same struct, defaults mean no trainer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true

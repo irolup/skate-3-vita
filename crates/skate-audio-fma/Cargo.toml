@@ -1,0 +1,10 @@
+[package]
+name = "skate-audio-fma"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "skate-audio's fused-multiply-add DSP loops, compiled twice (plain and hardware FMA) with a runtime CPU check"
+
+[features]
+# skate_vita: separate multiply and add instead of f32::mul_add (src/madd.rs), the Vita arithmetic.
+no-fma = []

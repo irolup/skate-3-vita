@@ -1,0 +1,18 @@
+[package]
+name = "vita-render"
+description = "skate vita renderer on vitaGL"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# vitaGL and its system libraries are linked by the binary (crates/skate-vita/build.rs):
+# the AEABI shim archive must come before vitaGL and libc on the link line.
+[dependencies]
+# The same glam as skate-sim (its presentation snapshots are glam types).
+glam = { version = "=0.30.10", default-features = false, features = ["std"] }
+vita-pack = { path = "../vita-pack" }
+skate-ui = { path = "../skate-ui" }
+# Public-domain 8x8 bitmap font (MIT crate) for the debug UI and HUD.
+font8x8 = { version = "0.3", default-features = false }

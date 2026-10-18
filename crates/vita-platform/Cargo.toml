@@ -1,0 +1,15 @@
+[package]
+name = "vita-platform"
+description = "skate vita platform layer: controls mapping, clocks, threads and power"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# XboxState: the controls mapping produces the reference's native pad record.
+skate-core = { path = "../skate-core" }
+
+[target.'cfg(target_os = "vita")'.dependencies]
+vitasdk-sys = { version = "0.3.3", features = ["SceCtrl_stub", "SceTouch_stub", "ScePower_stub", "SceLibKernel_stub", "SceKernelThreadMgr_stub", "SceProcessmgr_stub", "SceAudio_stub"] }

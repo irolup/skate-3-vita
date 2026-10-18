@@ -1,0 +1,22 @@
+[package]
+name = "vita-bake"
+description = "Desktop bake: converted private assets -> skate vita packs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+gltf = { version = "1", features = ["extras"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+vita-pack = { path = "../../crates/vita-pack" }
+skate-data = { path = "../../crates/skate-data" }
+# Spawn validation runs the real simulation; xbox state type from skate-core.
+skate-sim = { path = "../../crates/skate-sim" }
+skate-core = { path = "../../crates/skate-core" }
+# sound.pak: the ADPCM encoder and .ima format (retail-audio S1).
+skate-audio = { path = "../../crates/skate-audio" }
+serde_json = "1"
+texpresso = "2"
+meshopt = "0.6"

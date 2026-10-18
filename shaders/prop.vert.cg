@@ -1,0 +1,22 @@
+// skate vita movable props (L1b): the park shader's inputs placed by a model matrix (the prop's
+// pose), fogged by the world position.
+uniform float4x4 viewproj;
+uniform float4x4 model;
+uniform float3 eye;
+uniform float2 fog; // start, end distance in metres
+
+void main(
+	float3 aPosition,
+	float2 aUv,
+	float2 aLightmapUv,
+	float2 out vUv : TEXCOORD0,
+	float2 out vLightmapUv : TEXCOORD1,
+	float out vFog : TEXCOORD2,
+	float4 out gl_Position : POSITION
+) {
+	float4 world = mul(float4(aPosition, 1.0f), model);
+	gl_Position = mul(world, viewproj);
+	vUv = aUv;
+	vLightmapUv = aLightmapUv;
+	vFog = saturate((fog.y - distance(world.xyz, eye)) / (fog.y - fog.x));
+}

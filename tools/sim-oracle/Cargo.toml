@@ -1,0 +1,31 @@
+[package]
+name = "sim-oracle"
+description = "Desktop parity oracle for skate-sim against the reference skate-game"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+# Build the candidate without fused multiply-add (the Vita arithmetic).
+no-fma = ["skate-sim/no-fma", "game-audio/no-fma"]
+soft-fma = ["skate-sim/soft-fma"]
+madd-audit = ["skate-sim/madd-audit"]
+fma-f64 = ["skate-sim/fma-f64"]
+# L1e memory hunt: a counting allocator with sampled call sites (src/heap_probe.rs).
+heap-probe = []
+
+[dependencies]
+# run-live --packs: the baked sim.pak/anim.pak mounted in the loaders' virtual file system.
+vita-pack = { path = "../../crates/vita-pack" }
+skate-sim = { path = "../../crates/skate-sim", features = ["oracle"] }
+skate-core = { path = "../../crates/skate-core" }
+skate-data = { path = "../../crates/skate-data" }
+skate-ui = { path = "../../crates/skate-ui" }
+# audio-render: the reference's audio host (retail-audio S1).
+game-audio = { path = "../../crates/game-audio" }
+glam = "0.30.10"
+serde_json.workspace = true
+# Writes the desktop renders of the front-end screens (ui-render).
+png = "0.17"

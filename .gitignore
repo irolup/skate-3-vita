@@ -1,0 +1,40 @@
+# Build output
+/target/
+**/target/
+*.vpk
+*.velf
+*.self
+eboot.bin
+param.sfo
+
+# Retail-derived data must never be committed or shipped (PLAN.md §0.5, §11 rule 5)
+/game_data/
+/SKATEVITA/
+/assets/
+/oracle/
+*.pak
+*.iso
+*.xex
+*.big
+*.abin
+*.stategraph
+*.pat
+*.skate
+*.rwcm
+*.rwcmset
+*.irradiance
+input.cfg
+skater-collections.json
+physics-skeletons.json
+skater.glb
+
+# Local environment
+.envrc
+.env
+.vscode/
+.idea/
+*.swp
+
+# Python bytecode
+__pycache__/
+*.pyc

@@ -1,0 +1,9 @@
+// skate vita traffic car glass (L1c): alpha-blended without depth write, as retail draws it
+// (`sub_82CF0B90`); base colour texture x factor x the skin lighting.
+uniform sampler2D tex;
+uniform float4 tint;
+
+float4 main(float2 vTexcoord : TEXCOORD0, float4 vColor : COLOR) : COLOR {
+	float4 c = tex2D(tex, vTexcoord) * tint;
+	return float4(c.rgb * vColor.rgb, c.a);
+}

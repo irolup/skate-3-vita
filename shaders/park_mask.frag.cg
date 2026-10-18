@@ -1,0 +1,19 @@
+// skate vita retail park, alpha-tested materials (fences, foliage, decals).
+uniform sampler2D albedo;
+uniform sampler2D lightmap;
+uniform float4 tint;
+uniform float scale;
+uniform float3 horizon;
+uniform float cutoff;
+
+float4 main(float2 vUv : TEXCOORD0, float2 vLightmapUv : TEXCOORD1, float vFog : TEXCOORD2) : COLOR {
+	float4 a = tex2D(albedo, vUv) * tint;
+	if (a.a < cutoff)
+		discard;
+	float3 lm = tex2D(lightmap, vLightmapUv).rgb;
+	float3 x = lm * lm * a.rgb * a.rgb * scale;
+	float3 t = saturate(1.0f - x);
+	float3 tm = max(x * 0.25f + 0.75f, 1.0f) - t * t;
+	float3 c = saturate(sqrt(max(tm * 0.5f, 0.0f)) * 1.41f);
+	return float4(lerp(horizon, c, vFog), 1.0f);
+}

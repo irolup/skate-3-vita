@@ -1,0 +1,6 @@
+// skate vita world: vertex colour faded into the sky colour by fog.
+uniform float3 fogColor;
+
+float4 main(float4 vColor : COLOR, float vFog : TEXCOORD0) : COLOR {
+	return float4(lerp(fogColor, vColor.rgb, vFog), 1.0f);
+}

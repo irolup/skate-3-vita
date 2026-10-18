@@ -1,0 +1,31 @@
+[workspace]
+members = ["crates/*", "tools/sim-oracle", "tools/sim-bench", "tools/vita-bake", "tools/audio-bench"]
+# cargo-vita reads build_std from the alphabetically first *default* member, so the
+# desktop tools (sim-oracle sorts before skate-core) are not default members: build and
+# test them with -p. Every crate with [package.metadata.vita] uses the same build_std.
+default-members = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/irolup/skate-3-vita"
+
+[workspace.dependencies]
+# Same pins as the reference workspace (skate-3-rust-engine/Cargo.toml).
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[profile.release]
+lto = true
+opt-level = 3
+codegen-units = 1
+panic = "abort"
+
+# On-device test builds (`--profile vita-test --tests`). The test harness needs
+# unwinding, and build-std compiles std with the profile's panic strategy.
+[profile.vita-test]
+inherits = "release"
+panic = "unwind"

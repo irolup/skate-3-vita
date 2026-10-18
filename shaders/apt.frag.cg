@@ -1,0 +1,13 @@
+// skate vita retail HUD (APT movie): clamp(texture * multiply + add, 0, 1), as the
+// reference's hud_render.wgsl, with the colour maths in linear light: the HUD textures
+// are sRGB (the reference samples them as Rgba8UnormSrgb into an sRGB target).
+uniform sampler2D atlas;
+uniform float4 colorMultiply;
+uniform float4 colorAdd;
+
+float4 main(float2 vTexcoord : TEXCOORD0) : COLOR {
+	float4 t = tex2D(atlas, vTexcoord);
+	float4 linear = float4(pow(t.rgb, float3(2.2f, 2.2f, 2.2f)), t.a);
+	float4 c = clamp(linear * colorMultiply + colorAdd, 0.0f, 1.0f);
+	return float4(pow(c.rgb, float3(0.45454545f, 0.45454545f, 0.45454545f)), c.a);
+}

@@ -1,0 +1,14 @@
+[package]
+name = "vita-pack"
+description = "skate vita baked asset packs, shared by vita-bake and the game"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Map packs carry the sim part of a converted .skate map (skate_data::skate_map types).
+skate-data = { path = "../skate-data" }
+# Pure Rust (no C/assembly), so the same code builds for the Vita.
+blake3 = { version = "1", default-features = false, features = ["pure"] }

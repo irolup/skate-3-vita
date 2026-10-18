@@ -1,0 +1,65 @@
+[package]
+name = "skate-vita"
+description = "skate vita: the PS Vita game binary"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# The Vita arithmetic (no fused multiply-add).
+skate-sim = { path = "../skate-sim", features = ["no-fma"] }
+skate-core = { path = "../skate-core" }
+vita-platform = { path = "../vita-platform" }
+vita-render = { path = "../vita-render" }
+vita-pack = { path = "../vita-pack" }
+# The loaders' virtual file system (the packs are mounted into it).
+skate-data = { path = "../skate-data" }
+# The retail board audio with the Vita arithmetic.
+game-audio = { path = "../game-audio", features = ["no-fma"] }
+skate-audio = { path = "../skate-audio", features = ["no-fma"] }
+# The original HUD movie.
+skate-ui = { path = "../skate-ui" }
+serde_json.workspace = true
+serde.workspace = true
+# The same glam as skate-sim (presentation snapshots are glam types).
+glam = { version = "=0.30.10", default-features = false, features = ["std"] }
+# The span profiler of feature `stage-profile` (a tracing subscriber).
+tracing = { version = "0.1.44", default-features = false, features = ["std"], optional = true }
+
+[features]
+# Render-active benchmark: play ux0:data/SKATEVITA/autoplay/*.input with
+# rendering and write tick times and oracle dumps (src/autoplay.rs).
+replay = ["skate-sim/oracle"]
+# Unattended soak: the real game loop on scripted input for 30 minutes,
+# with park changes, respawns and pauses (src/soak.rs; scripts/vita-soak.py).
+soak = ["skate-sim/oracle"]
+# Retail audio render stage times in the AUDIO log line.
+audio-profile = ["game-audio/profile"]
+# The real heap use (mallinfo, a hitch every 10 s) and vitaGL's free pools in a MEM log line.
+mem-log = []
+# Logs every physical state change of the skater (app side only).
+state-log = []
+# skate-core stage timers (the prop paths) and the sim's tracing spans: ms per tick in STAGES and
+# SPANS log lines every 600 ticks.
+stage-profile = ["skate-sim/stage-profile", "dep:tracing"]
+
+[target.'cfg(target_os = "vita")'.dependencies]
+vitasdk-sys = { version = "0.3.3", features = ["SceCtrl_stub", "SceLibKernel_stub", "SceProcessmgr_stub"] }
+vita-newlib-shims = "0.3.1"
+
+[package.metadata.vita]
+title_id = "SKTV00001"
+title_name = "skate vita"
+assets = "../../static"
+# Both runtimes: the game uses panic_abort (release), the on-device test builds use
+# panic_unwind (profile vita-test). cargo-vita takes build_std from the alphabetically
+# first workspace package, not the one being built, so every crate with vita metadata
+# must use this same value.
+build_std = "std,panic_abort,panic_unwind"
+
+# cargo-vita's `strip --strip-unneeded` runs before vita-elf-create and deletes the
+# sceUserMainThreadStackSize / sceLibcHeapSize symbols it looks up by name, so the
+# stack and sceLibc heap sizes would be ignored. Keep the symbol table instead.
+[package.metadata.vita.profile.release]
+strip_symbols = false

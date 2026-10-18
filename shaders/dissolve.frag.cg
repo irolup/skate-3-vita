@@ -1,0 +1,14 @@
+// skate vita session-marker return dissolve: the noise contribution of the reference's
+// effect.wgsl (postfx_basictex_fisheye_noisePS). rgb = value, alpha = the hold progress.
+uniform sampler2D noise;
+uniform float4 scroll;
+uniform float4 firstWeights;
+uniform float4 secondWeights;
+uniform float fade;
+
+float4 main(float2 vTexcoord : TEXCOORD0) : COLOR {
+	float4 a = tex2D(noise, vTexcoord * float2(10.0f, 5.625f) + scroll.xy);
+	float4 b = tex2D(noise, vTexcoord * float2(11.0f, 6.625f) + scroll.zw);
+	float v = clamp(2.0f * (dot(a, firstWeights) + dot(b, secondWeights)) - 2.0f, 0.0f, 1.0f);
+	return float4(v, v, v, fade);
+}

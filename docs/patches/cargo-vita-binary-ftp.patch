@@ -1,0 +1,27 @@
+diff --git a/src/ftp.rs b/src/ftp.rs
+index 954a707..3a22e4c 100644
+--- a/src/ftp.rs
++++ b/src/ftp.rs
+@@ -1,7 +1,7 @@
+ use anyhow::Context;
+ use colored::Colorize;
+ use log::info;
+-use suppaftp::FtpStream;
++use suppaftp::{types::FileType, FtpStream};
+ 
+ use crate::commands::ConnectionArgs;
+ 
+@@ -11,7 +11,12 @@ pub fn connect(conn: &ConnectionArgs) -> anyhow::Result<FtpStream> {
+ 
+     info!("{} {ip}:{port}", "Connecting to Vita FTP server".blue());
+ 
+-    let ftp = FtpStream::connect((ip, port)).context("Unable to connect to Vita FTP server")?;
++    let mut ftp =
++        FtpStream::connect((ip, port)).context("Unable to connect to Vita FTP server")?;
++    // Without TYPE I, vitacompanion's FTPVita transfers in ASCII mode and rewrites
++    // CR LF -> LF and CR NUL -> CR, corrupting every eboot.bin/vpk upload.
++    ftp.transfer_type(FileType::Binary)
++        .context("Unable to switch Vita FTP to binary mode")?;
+ 
+     Ok(ftp)
+ }

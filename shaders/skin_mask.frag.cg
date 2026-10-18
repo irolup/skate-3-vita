@@ -1,0 +1,11 @@
+// skate vita skater, alpha-masked materials (hair): alpha test against the cutoff.
+uniform sampler2D tex;
+uniform float4 tint;
+uniform float cutoff;
+
+float4 main(float2 vTexcoord : TEXCOORD0, float4 vColor : COLOR) : COLOR {
+	float4 c = tex2D(tex, vTexcoord) * tint;
+	if (c.a < cutoff)
+		discard;
+	return float4(c.rgb * vColor.rgb, 1.0f);
+}

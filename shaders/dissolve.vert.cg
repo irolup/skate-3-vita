@@ -1,0 +1,10 @@
+// skate vita session-marker return dissolve: a full-screen quad, uv 0..1.
+void main(
+	float2 aPosition,
+	float2 aTexcoord,
+	float2 out vTexcoord : TEXCOORD0,
+	float4 out gl_Position : POSITION
+) {
+	gl_Position = float4(aPosition, 0.0f, 1.0f);
+	vTexcoord = aTexcoord;
+}

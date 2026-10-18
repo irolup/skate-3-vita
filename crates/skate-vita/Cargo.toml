@@ -50,7 +50,7 @@ vita-newlib-shims = "0.3.1"
 
 [package.metadata.vita]
 title_id = "SKTV00001"
-title_name = "skate vita"
+title_name = "Skate Vita"
 assets = "../../static"
 # Both runtimes: the game uses panic_abort (release), the on-device test builds use
 # panic_unwind (profile vita-test). cargo-vita takes build_std from the alphabetically

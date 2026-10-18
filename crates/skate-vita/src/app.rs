@@ -1351,7 +1351,7 @@ fn build_menu(screen: Screen, s: &Shared, settings: &Settings, world: usize) -> 
         choices[REPLAY_CHOICE.load(std::sync::atomic::Ordering::Relaxed).min(choices.len() - 1)].clone()
     };
     let (slot, title, rows) = match screen {
-        Screen::Main => (0, "skate vita", vec![
+        Screen::Main => (0, "Skate Vita", vec![
             (Row::action("Skate"), Action::Skate),
             (Row::choice("Park", park()), Action::Park),
             (Row::choice("Difficulty", settings.difficulty.label()), Action::Difficulty),

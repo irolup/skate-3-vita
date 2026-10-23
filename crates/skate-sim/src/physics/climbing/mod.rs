@@ -115,7 +115,7 @@ impl Runtime {
         camera: &mut crate::camera::CameraRuntime,
     ) -> Result<bool, String> {
         let dt = physics.settings.step.simulation.time_step;
-        if skater.player_input.pending_teleport().is_some() {
+        if skater.teleport_pending() {
             self.active = None;
             self.approach = None;
             self.cooldown = 0.3;

@@ -89,7 +89,7 @@ fn length(v: [f32; 3]) -> f32 {
 pub(crate) fn right_of(d: [f32; 3]) -> [f32; 3] {
     let l = d[0].hypot(d[2]);
     if l > 1e-6 {
-        [d[2] / l, 0.0, -d[0] / l]
+        [-d[2] / l, 0.0, d[0] / l]
     } else {
         [1.0, 0.0, 0.0]
     }

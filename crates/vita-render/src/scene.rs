@@ -35,6 +35,8 @@ const PARK_FRAG: &CStr = cstr(concat!(include_str!("../../../shaders/park.frag.c
 const PARK_MASK_FRAG: &CStr = cstr(concat!(include_str!("../../../shaders/park_mask.frag.cg"), "\0"));
 const PROP_VERT: &CStr = cstr(concat!(include_str!("../../../shaders/prop.vert.cg"), "\0"));
 const CAR_FRAG: &CStr = cstr(concat!(include_str!("../../../shaders/car.frag.cg"), "\0"));
+const ICON_VERT: &CStr = cstr(concat!(include_str!("../../../shaders/icon.vert.cg"), "\0"));
+const ICON_FRAG: &CStr = cstr(concat!(include_str!("../../../shaders/icon.frag.cg"), "\0"));
 const CAR_GLASS_FRAG: &CStr = cstr(concat!(include_str!("../../../shaders/car_glass.frag.cg"), "\0"));
 /// Retail `kd` without a normal map (retail_world.wgsl).
 const KD: f32 = 0.93429;
@@ -216,6 +218,34 @@ pub struct Scene {
     /// The colour grade the programs have (uploaded again when it changes).
     grade: Grade,
     grade_dirty: bool,
+    /// The teleporter icons' mesh and textures (`load_icons`).
+    icons: Option<IconsGpu>,
+}
+
+/// The teleporter icon's ribbon mesh (position, uv; `IconsGpu::STRIDE`) and its two pass textures, with its program.
+struct IconsGpu {
+    program: Program,
+    viewproj: GLint,
+    model: GLint,
+    scale: GLint,
+    vbo: GLuint,
+    ibo: GLuint,
+    index_count: GLsizei,
+    front: GLuint,
+    background: GLuint,
+}
+
+impl IconsGpu {
+    const STRIDE: usize = 20;
+}
+
+/// One teleporter icon to draw: its model matrix and the pass factors (retail's `i_intensity` x the fade).
+#[derive(Clone, Copy, Debug)]
+pub struct IconInstance {
+    pub model: Mat4,
+    /// Front pass rgb factor (I.x x fade) and background pass rgb factor (I.y) and alpha factor (sqrt(I.y x fade)).
+    pub front: f32,
+    pub background: [f32; 2],
 }
 
 /// The colour grade (retail post FX colour matrix, `skate_core::colour_matrix::build`; research b100 / b101): near and
@@ -341,6 +371,8 @@ pub struct Frame<'a> {
     pub peds: &'a [PedInstance<'a>],
     /// The hand props (held or released), each a one-matrix palette.
     pub hand_props: &'a [PedInstance<'a>],
+    /// The teleporter icons in view (drawn last, blended).
+    pub icons: &'a [IconInstance],
 }
 
 impl Scene {
@@ -405,6 +437,7 @@ impl Scene {
                 ped_fade,
                 grade: Grade::IDENTITY,
                 grade_dirty: true,
+                icons: None,
             }
         }
     }
@@ -754,6 +787,74 @@ impl Scene {
         }
     }
 
+    /// The teleporter icons' ribbon mesh (x, y, z, u, v per vertex; triangle indices) and its front and background
+    /// textures (RGBA8), replacing any loaded ones.
+    pub fn load_icons(&mut self, vertices: &[[f32; 5]], indices: &[u16], front: &Texture, background: &Texture) {
+        self.unload_icons();
+        let program = Program::new("icon", ICON_VERT, ICON_FRAG, &[c"aPosition", c"aUv"]);
+        let bytes: Vec<u8> = vertices.iter().flatten().flat_map(|f| f.to_le_bytes()).collect();
+        let index_bytes: Vec<u8> = indices.iter().flat_map(|i| i.to_le_bytes()).collect();
+        unsafe {
+            glUseProgram(program.id);
+            glUniform1i(program.uniform(c"tex"), 0);
+            self.icons = Some(IconsGpu {
+                viewproj: program.uniform(c"viewproj"),
+                model: program.uniform(c"model"),
+                scale: program.uniform(c"scale"),
+                program,
+                vbo: buffer(GL_ARRAY_BUFFER, &bytes),
+                ibo: buffer(GL_ELEMENT_ARRAY_BUFFER, &index_bytes),
+                index_count: indices.len() as GLsizei,
+                front: upload_texture(front),
+                background: upload_texture(background),
+            });
+        }
+    }
+
+    pub fn unload_icons(&mut self) {
+        if let Some(i) = self.icons.take() {
+            unsafe {
+                glDeleteBuffers(1, &i.vbo);
+                glDeleteBuffers(1, &i.ibo);
+                glDeleteTextures(1, &i.front);
+                glDeleteTextures(1, &i.background);
+            }
+        }
+    }
+
+    /// Retail's two passes per icon (b535 `827AFC80`, b536 `82CE9080`): the background alpha blended, then the front
+    /// added; depth tested, no depth write, both faces.
+    fn draw_icons(&self, icons: &[IconInstance], vp: &[f32; 16]) {
+        let Some(gpu) = self.icons.as_ref().filter(|_| !icons.is_empty()) else { return };
+        unsafe {
+            glUseProgram(gpu.program.id);
+            glUniformMatrix4fv(gpu.viewproj, 1, GL_FALSE, vp.as_ptr());
+            glBindBuffer(GL_ARRAY_BUFFER, gpu.vbo);
+            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, gpu.ibo);
+            attributes(&[(3, GL_FLOAT, GL_FALSE, 0), (2, GL_FLOAT, GL_FALSE, 12)], IconsGpu::STRIDE);
+            glDisable(GL_CULL_FACE);
+            glDepthMask(GL_FALSE);
+            glEnable(GL_BLEND);
+            glActiveTexture(GL_TEXTURE0);
+            for icon in icons {
+                let model = icon.model.to_cols_array();
+                glUniformMatrix4fv(gpu.model, 1, GL_FALSE, model.as_ptr());
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                glBindTexture(GL_TEXTURE_2D, gpu.background);
+                let [b, a] = icon.background;
+                glUniform4f(gpu.scale, b, b, b, a);
+                glDrawElements(GL_TRIANGLES, gpu.index_count, GL_UNSIGNED_SHORT, std::ptr::null());
+                glBlendFunc(GL_ONE, GL_ONE);
+                glBindTexture(GL_TEXTURE_2D, gpu.front);
+                glUniform4f(gpu.scale, icon.front, icon.front, icon.front, 1.0);
+                glDrawElements(GL_TRIANGLES, gpu.index_count, GL_UNSIGNED_SHORT, std::ptr::null());
+            }
+            glDisable(GL_BLEND);
+            glDepthMask(GL_TRUE);
+            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+        }
+    }
+
     /// The colour grade from now on (`Grade::IDENTITY`: none).
     pub fn set_grade(&mut self, grade: Grade) {
         if grade != self.grade {
@@ -878,6 +979,8 @@ impl Scene {
                 }
             }
             self.draw_cars(frame, &vp, true);
+            // The teleporter icons, blended over everything.
+            self.draw_icons(frame.icons, &vp);
         }
     }
 

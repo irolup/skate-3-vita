@@ -275,6 +275,9 @@ pub(crate) struct PropSolverSettings {
     /// `82C56BA0`; spawns `82C4E940` -> `82E0E338` give the same pair, trace .local/research/prop-types). The on-foot
     /// walker's queries reject types 13 and 14, so only the heavier props are ground for it.
     pub walkable_mass: f32,
+    /// Retail's ground contact reduction (`82779EB0`): coplanar contacts of a prop against the world keep at most four
+    /// points (upstream `b110bab`..`74c124a`).
+    pub ground_reduction: skate_core::physics::contact_reduction::ReductionRules,
 }
 
 impl Default for PropSolverSettings {
@@ -292,6 +295,7 @@ impl Default for PropSolverSettings {
             bail_heavy_mass: 200.0,
             bail_blend: 0.5,
             walkable_mass: 5.5,
+            ground_reduction: Default::default(),
         }
     }
 }
@@ -2712,7 +2716,9 @@ impl PropDynamics {
         // `stuck_release_ticks`; from then on slow drift (solver jitter of a
         // parked board) does not push either, only a real hit does.
         let stuck = self.bodies[index].stuck_ticks >= tuning.stuck_release_ticks;
-        let nudge = if stuck { 0.0 } else { tuning.penetration_push_speed };
+        // Upstream (`74c124a`): a contact on the prop's mesh gets no overlap nudge (riding up a ramp prop does not
+        // shove it); the skater volumes here always test the mesh.
+        let nudge = 0.0;
         let hit_floor = if stuck { tuning.penetration_push_speed } else { 0.0 };
         // The manifold normal points from the prop (B) toward the skater (A).
         let push = scale(manifold.normal, -1.0);
@@ -2856,28 +2862,39 @@ impl PropDynamics {
         for &index in awake {
             self.bodies[index].contacts = 0;
         }
+        let push_point = |rows: &mut Vec<RetailContactJacobian>,
+                              on_a: Vector3,
+                              on_b: Vector3,
+                              normal: Vector3,
+                              material: RetailContactMaterial,
+                              a: RetailContactBodyState,
+                              b: RetailContactBodyState| {
+            let contact = generate_contact(
+                RetailContactInput {
+                    position_on_a: on_a,
+                    position_on_b: on_b,
+                    normal,
+                    restitution: material.restitution,
+                    static_friction: material.static_friction,
+                    dynamic_friction: material.dynamic_friction,
+                    tag: 0,
+                },
+                a,
+                b,
+            );
+            rows.push(build_contact_jacobian(contact, dt));
+        };
         let push_rows = |rows: &mut Vec<RetailContactJacobian>,
                              manifold: &PrimitiveContactManifold,
                              material: RetailContactMaterial,
                              a: RetailContactBodyState,
                              b: RetailContactBodyState| {
             for pair in &manifold.points[..manifold.count] {
-                let contact = generate_contact(
-                    RetailContactInput {
-                        position_on_a: pair.a,
-                        position_on_b: pair.b,
-                        normal: manifold.normal,
-                        restitution: material.restitution,
-                        static_friction: material.static_friction,
-                        dynamic_friction: material.dynamic_friction,
-                        tag: 0,
-                    },
-                    a,
-                    b,
-                );
-                rows.push(build_contact_jacobian(contact, dt));
+                push_point(rows, pair.a, pair.b, manifold.normal, material, a, b);
             }
         };
+        let reduction = self.tuning.solver.ground_reduction;
+        let mut ground: Vec<(skate_core::physics::contact_reduction::ContactRecord, RetailContactMaterial)> = Vec::new();
         for &index in awake {
             let tuning = self.bodies[index].tuning;
             let box_primitive = self.bodies[index].box_primitive();
@@ -2886,6 +2903,8 @@ impl PropDynamics {
             let bounds = self.bodies[index].bounds().expanded(tuning.contact_padding + 0.05);
             let a = self.row_body(index);
             let support = self.row_support(world_reaction, Vector3::ZERO);
+            // The world contacts go through retail's reduction (at most four coplanar points per group).
+            ground.clear();
             for index_in_world in near_triangles(world, bounds) {
                 let triangle = &world.triangles()[index_in_world];
                 let Some(manifold) = primitive_triangle_world_contacts(
@@ -2898,7 +2917,14 @@ impl PropDynamics {
                 };
                 self.bodies[index].contacts += 1;
                 let material = self.contact_material(index, triangle.material);
-                push_rows(&mut rows, &manifold, material, a, support);
+                ground.extend(manifold.points[..manifold.count].iter().map(|pair| {
+                    (skate_core::physics::contact_reduction::ContactRecord { p0: pair.a, p1: pair.b, normal: manifold.normal }, material)
+                }));
+            }
+            let records: Vec<_> = ground.iter().map(|g| g.0).collect();
+            for k in skate_core::physics::contact_reduction::reduce(&records, &reduction) {
+                let (r, material) = ground[k];
+                push_point(&mut rows, r.p0, r.p1, r.normal, material, a, support);
             }
             for other in 0..count {
                 let other_awake = !self.bodies[other].asleep;

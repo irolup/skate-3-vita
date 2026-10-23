@@ -84,10 +84,7 @@ pub(super) fn advance(
     if resetting {
         skater.offboard_air_selector.reset();
         super::offboard::board_manager::runtime::reset_for_teleport(physics, skater);
-        // ResetSystems82DB92D0 (b297): TrajectorySelector82D67228 (keeps the in-flight request; clears the
-        // grind-locked-to-middle bit 9653 before this tick's grind gate reads it), OffBoardFeetIK82D77168 (b298),
-        // LandingOnDeck82D78B28 and the grind manager82D8A638 (previous state, engagement counter, cooldown; its
-        // child objects stay).
+        // ResetSystems82DB92D0 (b297 / b298): trajectory selector, feet IK, landing on deck, grind manager.
         skater.trajectory.selector.reset();
         skater.offboard_feet.reset();
         skater.landing_deck.reset();
@@ -135,6 +132,10 @@ pub(super) fn advance(
         skip: props.and_then(|d| d.held()),
         rules: Default::default(),
     };
+    let arrival = super::player_input::ArrivalSolids {
+        props: physics.prop_layer.as_ref().map(crate::skate_world::PropCollisionLayer::world),
+        proxies: &physics.network_proxies.solids,
+    };
     let continuation = skater.player_input.process_stage(
         &mut physics.board,
         &mut skater.ground_runtime,
@@ -145,6 +146,7 @@ pub(super) fn advance(
         super::player_input::InputStage::ThroughTeleport,
         &physics.world,
         rails,
+        arrival,
     )?;
     if let Some(continuation) = continuation {
         skater.player_input.process_stage(
@@ -157,6 +159,7 @@ pub(super) fn advance(
             super::player_input::InputStage::AfterTeleport(continuation),
             &physics.world,
             rails,
+            arrival,
         )?;
     }
     let teleported = callbacks.teleported;

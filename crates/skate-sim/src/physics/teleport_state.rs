@@ -33,6 +33,8 @@ impl Runtime {
         self.manual_on_board = Some(on_board);
     }
     pub fn take_manual_on_board(&mut self) -> Option<bool> { self.manual_on_board.take() }
+    /// A reply waits for the next input publication (b471: part of "a teleport is in flight").
+    pub fn has_pending_reply(&self) -> bool { self.pending_reply.is_some() }
     pub fn new(#[cfg(test)] checkpoint: Checkpoint) -> Self {
         Self {
             state: TeleportState::default(),

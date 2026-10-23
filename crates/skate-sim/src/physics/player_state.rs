@@ -138,10 +138,11 @@ pub(crate) fn enter_after_teleport(
     physics: &mut GamePhysics,
     skater: &mut SkaterRuntime,
 ) -> Result<(), String> {
-    let target = if skater.teleport_state.take_manual_on_board() == Some(false) {
-        PhysicalStateId::BipedGround
-    } else { PhysicalStateId::PhysicsGround };
-    transition::set(physics, skater, target)
+    // 82DB8E40 always enters state 100 after the reset; an on-foot arrival reaches BipedGround through the reply's
+    // byte 64 and the ordinary selection, as a bail checkpoint does. Entering BipedGround directly here (ours, since
+    // the session marker) flung the skater once fdab6dd7 made the reply the only reset (laptop 2026-10-21 21:38).
+    skater.teleport_state.take_manual_on_board();
+    transition::set(physics, skater, PhysicalStateId::PhysicsGround)
 }
 
 ///Original82DB6050 prefix; coordinator calls the selected state pre-update next.

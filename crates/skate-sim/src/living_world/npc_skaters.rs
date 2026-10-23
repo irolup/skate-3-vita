@@ -632,7 +632,7 @@ impl NpcStanceTrack {
 /// playback ([`skate_core::living_world::stance::attribute_in_window`] per part: parts play back
 /// to back, a part entered in the window plays from its start, the last part holds at its end).
 /// `clip_data(part)` = the part's length (s) and its attributes (name, begin, end; normalised).
-pub(crate) fn sequence_attributes(clip: &str, previous_time: f32, time: f32, clip_data: impl Fn(&str) -> Option<(f32, Vec<(String, f32, f32)>)>) -> Vec<String> {
+pub(crate) fn sequence_attributes<N: AsRef<str>>(clip: &str, previous_time: f32, time: f32, clip_data: impl Fn(&str) -> Option<(f32, Vec<(N, f32, f32)>)>) -> Vec<String> {
     let mut out = Vec::new();
     let mut offset = 0.0f32;
     let mut parts = clip.split('+').peekable();
@@ -645,7 +645,7 @@ pub(crate) fn sequence_attributes(clip: &str, previous_time: f32, time: f32, cli
         if reached && !left {
             let p = (previous_time - offset).clamp(0.0, length);
             let t = (time - offset).clamp(0.0, length);
-            out.extend(attributes.iter().filter(|(_, b, e)| skate_core::living_world::stance::attribute_in_window(*b, *e, length, p, t)).map(|(n, ..)| n.clone()));
+            out.extend(attributes.iter().filter(|(_, b, e)| skate_core::living_world::stance::attribute_in_window(*b, *e, length, p, t)).map(|(n, ..)| n.as_ref().to_owned()));
         }
         if !reached {
             break;

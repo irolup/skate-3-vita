@@ -281,10 +281,7 @@ fn avoidance_keeps_the_agent_radius() {
     assert!(!separation_ok([0.3, 0.0, 0.0], [0.2, 0.0, 0.0], 1, &others, r));
 }
 
-/// fix 17: two NavPower tiles stop short of their shared border (a 0.28 m gap, linked by setup)
-/// and a wall-top island 3 m above the second tile. A ped walking across the seam must get over
-/// the gap (the old step rule snapped it back to the edge it left: walking in place), and no
-/// step may put it on the island (an unconnected layer).
+/// fix 17: a ped crosses a 0.28 m tile seam gap and never steps onto the unconnected wall-top island.
 #[test]
 fn steps_cross_tile_seams_and_never_jump_layers() {
     let sq = |x0: f32, z0: f32, x1: f32, z1: f32, y: f32| vec![[x0, y, z0], [x1, y, z0], [x1, y, z1], [x0, y, z1]];
@@ -499,4 +496,32 @@ fn walk_back_start_snaps_from_an_obstacle_cut() {
     assert!(ControllerB::activate(&s, &m, goal, [1.0, 0.0, 0.0], &input).is_some());
     let old = ControllerBSettings { start_locate_radius: 0.5, ..s };
     assert!(ControllerB::activate(&old, &m, goal, [1.0, 0.0, 0.0], &input).is_none());
+}
+
+/// b515 / b516: an approach goal with no path (another component) leaves the ped standing, asking again each update
+/// (retail bot mode 0), while a mod's plain route still walks straight at it (ours, unchanged).
+#[test]
+fn an_approach_goal_with_no_path_leaves_the_ped_standing() {
+    // Two strips, x 0..5 and x 6..10 (a hole at 5..6).
+    let m = mesh(&grid(10, 1, 1.0, |i, _| (i != 5).then_some(AREA_DEFAULT)));
+    let lamp = Lamp(std::cell::Cell::new(Light::Green));
+    let goal = [8.0, 0.0, 0.5];
+    let mut approach = PedNav::default();
+    approach.set_approach_route(goal);
+    let mut plain = PedNav::default();
+    plain.set_route(Some(PedRoute { points: vec![goal], looped: false }));
+    let start = [1.0, 0.0, 0.5];
+    let mut bodies = vec![
+        Body { id: 1, pos: start, heading: 0.0, nav: approach, state: Locomotion::Idle },
+        Body { id: 2, pos: [start[0], 0.0, 0.5 + 0.0001], heading: 0.0, nav: plain, state: Locomotion::Idle },
+    ];
+    let mut planned = 0;
+    run(&m, &mut bodies[..1], 120, CrosswalkRule::Off, &lamp, |_, bs| planned = bs[0].nav.targets_chosen);
+    assert!((bodies[0].pos[0] - start[0]).hypot(bodies[0].pos[2] - start[2]) < 1e-3, "stood: {:?}", bodies[0].pos);
+    assert!(planned >= 100, "asked again each update: {planned}");
+    run(&m, &mut bodies[1..], 120, CrosswalkRule::Off, &lamp, |_, _| {});
+    assert!(bodies[1].pos[0] > 2.0, "a plain route walks straight at it: {:?}", bodies[1].pos);
+    // A new plain route clears the approach flag.
+    bodies[0].nav.set_route(Some(PedRoute { points: vec![goal], looped: false }));
+    assert!(!bodies[0].nav.hold_on_fail);
 }

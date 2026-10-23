@@ -294,47 +294,88 @@ pub struct Input {
     pub fast: bool,
 }
 
+/// The key edit's rates as retail's editor has them (upstream `replay/camera_key.rs` `CameraRules` at `74c124a`,
+/// research b402 / b549), per console frame at `CONSOLE_HZ`: orbits turn at stick x 2.5 degrees capped at 3, pitch
+/// stops at 85 degrees; distance and free moves are the stick clamped to 0.2 m (full speed from 20 % stick); the free
+/// camera turns at stick x 5 degrees capped at 1.6 and moves level along its heading; its height eases; the look
+/// height steps 0.01 m within 1 m of the default aim; the lens steps 0.5 mm within 24-75 mm.
+const CONSOLE_HZ: f32 = 30.0;
+const ORBIT_DEG_PER_UNIT: f32 = 2.5;
+const ORBIT_DEG_CAP: f32 = 3.0;
+const PITCH_LIMIT: f32 = 85.0 * std::f32::consts::PI / 180.0;
+const DISTANCE_STEP: f32 = 0.2;
+const LOOK_STEP: f32 = 0.01;
+const LOOK_RANGE: f32 = 1.0;
+const FREE_DEG_PER_UNIT: f32 = 5.0;
+const FREE_DEG_CAP: f32 = 1.6;
+const FREE_MOVE: f32 = 0.2;
+const FREE_HEIGHT_STEP: f32 = 0.015;
+const FREE_HEIGHT_CAP: f32 = 0.2;
+const FREE_HEIGHT_DECAY: f32 = 0.6;
+const FREE_HEIGHT_RANGE: f32 = 10.0;
+const LENS_STEP: f32 = 0.5;
+const LENS_RANGE: (f32, f32) = (24.0, 75.0);
+
+/// The free camera's eased height during one edit (retail S+0x7C): its velocity and the offset added since the
+/// edit began.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct FreeHeight {
+    velocity: f32,
+    offset: f32,
+}
+
 /// One frame of editing a setting with the sticks and the D-pad (the retail editor's icons: right
 /// stick rotates, left stick moves in and out, the D-pad up and down moves up and down, left and
 /// right zoom). `anchor` is the skater's aim point where the edit started (the Tripod orbits it).
-pub fn edit(kind: Kind, cam: &mut Cam, dt: f32, i: &Input, anchor: Vec3) -> bool {
+/// Ours: the stick dead zone, LB moving three times as far, the Follow and Tripod distance ranges (the 40 m leash).
+pub fn edit(kind: Kind, cam: &mut Cam, dt: f32, i: &Input, anchor: Vec3, height: &mut FreeHeight) -> bool {
     let dead = |v: f32| if v.abs() > 0.15 { v } else { 0.0 };
     let (lx, ly, rx, ry) = (dead(i.left[0]), dead(i.left[1]), dead(i.right[0]), dead(i.right[1]));
     let vertical = f32::from(i.up) - f32::from(i.down);
     let zoom = f32::from(i.zoom_out) - f32::from(i.zoom_in);
     let fast = if i.fast { 3.0 } else { 1.0 };
+    let frames = dt * CONSOLE_HZ;
+    let cap = |v: f32, c: f32| v.clamp(-c, c);
+    let orbit = |stick: f32| cap(stick * ORBIT_DEG_PER_UNIT, ORBIT_DEG_CAP).to_radians() * frames;
+    let step = |stick: f32| cap(stick, DISTANCE_STEP) * fast * frames;
+    let look = |aim: f32| (aim + vertical * LOOK_STEP * frames).clamp(AIM - LOOK_RANGE, AIM + LOOK_RANGE);
     let before = *cam;
-    cam.fov = (cam.fov + zoom * 0.5 * dt).clamp(0.2, 1.8);
+    // The lens in millimetres on a 35 mm frame (24 mm tall), as `zoom_text` shows it.
+    let lens = (12.0 / (cam.fov * 0.5).tan() - zoom * LENS_STEP * frames).clamp(LENS_RANGE.0, LENS_RANGE.1);
+    cam.fov = 2.0 * (12.0 / lens).atan();
     match kind {
         Kind::Game => {}
         Kind::Free => {
-            let rotation = Quat::from_euler(EulerRot::YXZ, cam.yaw, cam.pitch, 0.0);
-            let forward = rotation * Vec3::NEG_Z;
-            let right = rotation * Vec3::X;
-            cam.position += (right * lx + forward * ly) * 6.0 * fast * dt;
-            cam.position.y += vertical * 4.0 * fast * dt;
-            cam.yaw -= rx * 1.6 * dt;
-            cam.pitch = (cam.pitch + ry * 1.2 * dt).clamp(-1.4, 1.4);
+            cam.yaw -= cap(rx * FREE_DEG_PER_UNIT, FREE_DEG_CAP).to_radians() * frames;
+            cam.pitch = (cam.pitch + cap(ry * FREE_DEG_PER_UNIT, FREE_DEG_CAP).to_radians() * frames).clamp(-PITCH_LIMIT, PITCH_LIMIT);
+            let heading = Quat::from_rotation_y(cam.yaw);
+            cam.position += heading * Vec3::new(cap(lx, FREE_MOVE), 0.0, -cap(ly, FREE_MOVE)) * fast * frames;
+            // The height eases: the velocity gains a step, is applied, then decays (per console frame).
+            height.velocity = cap(height.velocity + vertical * FREE_HEIGHT_STEP * frames, FREE_HEIGHT_CAP);
+            let offset = (height.offset + height.velocity * frames).clamp(-FREE_HEIGHT_RANGE, FREE_HEIGHT_RANGE);
+            cam.position.y += offset - height.offset;
+            height.offset = offset;
+            height.velocity *= FREE_HEIGHT_DECAY.powf(frames);
         }
         Kind::Follow => {
-            cam.yaw = wrap(cam.yaw - rx * 1.6 * dt);
-            cam.pitch = (cam.pitch - ry * 1.2 * dt).clamp(-1.2, 1.4);
-            cam.distance = (cam.distance - ly * 6.0 * fast * dt).clamp(1.0, 30.0);
-            cam.aim = (cam.aim + vertical * 1.0 * dt).clamp(-0.5, 2.5);
+            cam.yaw = wrap(cam.yaw - orbit(rx));
+            cam.pitch = (cam.pitch - orbit(ry)).clamp(-PITCH_LIMIT, PITCH_LIMIT);
+            cam.distance = (cam.distance - step(ly)).clamp(1.0, 30.0);
+            cam.aim = look(cam.aim);
         }
         Kind::Tripod => {
-            // Orbit the spot around the skater where the edit started; in and out along the line.
+            // Orbit the spot around the skater where the edit started; in and out along the line. The lift moves the
+            // look point only (retail `82C80EA0`).
             let target = anchor + Vec3::Y * (cam.aim - AIM);
             let offset = cam.position - target;
             let mut r = offset.length().max(0.5);
             let mut yaw = offset.x.atan2(offset.z);
             let mut pitch = (offset.y / r).clamp(-1.0, 1.0).asin();
-            yaw -= rx * 1.6 * dt;
-            pitch = (pitch - ry * 1.2 * dt).clamp(-1.2, 1.4);
-            r = (r - ly * 6.0 * fast * dt).clamp(1.0, TRIPOD_RANGE - 1.0);
+            yaw -= orbit(rx);
+            pitch = (pitch - orbit(ry)).clamp(-PITCH_LIMIT, PITCH_LIMIT);
+            r = (r - step(ly)).clamp(1.0, TRIPOD_RANGE - 1.0);
             cam.position = target + Vec3::new(yaw.sin() * pitch.cos(), pitch.sin(), yaw.cos() * pitch.cos()) * r;
-            cam.aim = (cam.aim + vertical * 1.0 * dt).clamp(-0.5, 2.5);
-            cam.position.y += vertical * 1.0 * dt;
+            cam.aim = look(cam.aim);
         }
     }
     *cam != before
@@ -352,6 +393,27 @@ mod tests {
 
     fn cam(yaw: f32) -> Cam {
         Cam { position: Vec3::ZERO, yaw, pitch: 0.0, distance: 4.0, aim: 1.0, fov: 0.9 }
+    }
+
+    /// Retail's rates (b549): the free camera turns at the 1.6 degree cap from 32 % stick, moves at most 0.2 m per
+    /// axis per frame, its height eases to 0.0375 m a frame; the lens steps 0.5 mm a frame and stops at 75 mm.
+    #[test]
+    fn the_key_edit_takes_retail_rates() {
+        let mut c = cam(0.0);
+        let mut height = FreeHeight::default();
+        let input = Input { left: [0.2, 0.5], right: [0.32, 0.0], up: true, down: false, zoom_in: true, zoom_out: false, fast: false };
+        for _ in 0..60 {
+            edit(Kind::Free, &mut c, 1.0 / 30.0, &input, Vec3::ZERO, &mut height);
+        }
+        assert!((c.yaw + 96f32.to_radians()).abs() < 1e-4, "{}", c.yaw.to_degrees());
+        assert!((height.velocity / FREE_HEIGHT_DECAY - 0.0375).abs() < 1e-4, "{height:?}");
+        assert!(c.position.y > 0.0 && c.position.y < 60.0 * 0.0375 + 1e-3);
+        assert!(glam::Vec2::new(c.position.x, c.position.z).length() <= 60.0 * 0.2 * 2f32.sqrt() + 1e-3);
+        assert_eq!(zoom_text(c.fov), "Zoom 55 mm", "0.5 mm a frame from 24.6 mm");
+        for _ in 0..60 {
+            edit(Kind::Free, &mut c, 1.0 / 30.0, &input, Vec3::ZERO, &mut height);
+        }
+        assert_eq!(zoom_text(c.fov), "Zoom 75 mm", "the lens stops at 75 mm");
     }
 
     #[test]

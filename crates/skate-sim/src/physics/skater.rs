@@ -48,6 +48,8 @@ impl Takedown {
 pub(crate) const TAKEDOWN_LATCH_SECONDS: f32 = 2.0;
 
 pub(crate) struct SkaterRuntime {
+    /// Teleport arrival fit-up values (retail defaults, b475); a mod or data can replace them.
+    pub(crate) ground_fit: skate_core::physics::teleport_ground_fit::GroundFit,
     /// The AI controller's physics record (an NPC skater; `None` for the local player). Retail:
     /// AIPhysicsInput `*(skater+1840)`, written by the PathController, with the actor's "input
     /// fresh" bit (`1904` bit 27) and the controller pointer (`1828`).
@@ -217,9 +219,34 @@ impl SkaterRuntime {
         velocity: Option<[f32; 3]>,
         on_board: bool,
     ) -> Result<(), String> {
-        self.player_input.request_teleport_ex(transform, velocity)?;
+        let fit = self.ground_fit;
+        self.travel_fit(transform, velocity, on_board, fit)
+    }
+
+    /// `travel_ex` with the arrival fit-up chosen by the caller (a mod's `ground_fit = false` places exactly).
+    pub(crate) fn travel_fit(
+        &mut self,
+        transform: [[f32; 4]; 4],
+        velocity: Option<[f32; 3]>,
+        on_board: bool,
+        fit: skate_core::physics::teleport_ground_fit::GroundFit,
+    ) -> Result<(), String> {
+        // One move, retail's actor reply (825926F8 -> 82DB8998, b471); the host teleport it used to add on top was a
+        // second reset a tick earlier. A request while one is in flight is refused so two cannot stack.
+        if self.teleport_pending() {
+            return Err("A pending teleport must complete before replacement".into());
+        }
+        self.player_input.set_arrival_velocity(velocity)?;
+        self.player_input.set_arrival_ground_fit(Some(fit));
         self.teleport_state.request_manual(transform, on_board);
         Ok(())
+    }
+
+    /// A teleport is in flight: a host request, a reply not yet published, or a 702 reset not yet applied (b471).
+    pub(crate) fn teleport_pending(&self) -> bool {
+        self.player_input.pending_teleport().is_some()
+            || self.teleport_state.has_pending_reply()
+            || self.player_input.physical.state.flag_61 != 0
     }
 
     /// An AI skater's respawn destination for the next wipeout-end teleport (instead of the checkpoint history).
@@ -363,6 +390,7 @@ impl SkaterRuntime {
             initial_targets.following_com,
         ];
         Ok(Self {
+            ground_fit: Default::default(),
             ai_physics: None,
             takedown: None,
             vehicle_hits: Vec::new(),

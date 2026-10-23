@@ -1,46 +1,5 @@
-//! Pedestrian wandering (doc 26, peds milestone M3): retail's `NoRoadWander` goal on the navmesh,
-//! a mod-only crosswalk rule, ped-to-ped avoidance and the walk / turn intents for the animation
-//! player.
-//!
-//! What retail does [code, TU3; addresses are evidence only]:
-//! - **The ped graph never takes the road branch.** `Pedestrian.xml`'s `Wander` state picks
-//!   `WanderMode.Road` (FollowRoad + `UseCrossWalk`) while `HasRoadWanderTarget`, and goes to
-//!   `WanderOnRoad` on `IsOnRoad`; in `StateGraph::TheConditionFactory` (`sub_826C1730`) both
-//!   names are registered with the generic factory `sub_82BC3F68` (`sub_82F7A698`,
-//!   `sub_82F79698`), whose evaluate slot (vtable `0x8231ED5C` + 48) is `sub_8274CA90` = return
-//!   0. So every ped runs `WanderMode.NoRoad`: `CheckForRoadTarget` (all slots no-ops) and
-//!   `NoRoadWander` (`sub_826A2FB8`). The crosswalk states and `WalkSignSaysGo` (`sub_826AC190`)
-//!   are unreachable from the ambient ped graph. (The real `IsOnRoad` / `IsNearCrossWalk`,
-//!   `sub_826C48F0` / `sub_826C4878`, live in `BehaviourGraph::TheTransferConditionFactory` for
-//!   plugin entry rules such as `usetrashbin.xml`.)
-//! - `NoRoadWander` (and `Wander`) switch the ped to its NavPower mover (`sub_82E360F0(1)`:
-//!   `ped+2224`) in mode 6 (`sub_82E35E80`): the mover's goal becomes the wander goal at
-//!   `ped+5632` (vtable `0x8232C9C8`), its value `+12` = 2.0 (`0x82060C50`).
-//! - **Target choice** (`sub_82E30F58`): direction = the ped's forward vector (owner vfunc 20),
-//!   or, after event 4, the unit vector from the old target to the ped. Unless an event 1-3 came
-//!   in, probe 5 extra directions within 90 degrees at 40 m (`0x821EB794`, `0x82256FD8`); if none
-//!   fits, 9 within 270 degrees at 10 m (`0x821963E4`, `0x82063B20`); if none fits either, the
-//!   target is `position + direction x max(3, 1.1 x value)` (`0x82063B08`, `0x82099148`).
-//! - **The probe** (`sub_82E311A8`): straight ahead first, then probe `i = 1..=n` at angle
-//!   `ceil(i / 2) x (spread / 2) / (n / 2)` (n / 2 rounded down), negative for odd `i`
-//!   (`0x8216DEE0` = -1); a direction fits when its end point is on the navmesh and reachable
-//!   from the ped's polygon (`sub_82C464F0`). The fitting end point becomes the target.
-//! - **Re-targeting** (`sub_82E2CB08`, mover vfunc 44): when the NavPower bot reports state 1
-//!   the goal picks a new target from the ped's position and NavPower is sent there.
-//! - Speed: `SuggestVelocity linear=3.0` in `Wander` [data]; the walk itself is root motion
-//!   (walk clip 1.325 m/s, recomp walking median 1.30 [trace]).
-//!
-//! Ours (stated): NavPower's path following and local avoidance are not decoded. A ped follows
-//! the funnel corners of [`NavMesh::find_path`], steers toward the next corner at
-//! [`WanderParams::steer_rate`] (measured 255 deg/s) below the first turn edge and posts retail's turn buckets past it
-//! (`82E2A500`: 45 / 90 / 135 / 180, standing or walking, the clip turns the ped; the angle is
-//! to the next corner, retail's against NavPower's steering velocity `82E2ABF8` / `82E2AAA0`, b169), re-targets on arrival (the bot's state 1) and,
-//! when a path cannot be found, as after an event 1-3 (short fan next). Avoidance: a ped yields
-//! (stands) while a ped with a lower id is inside its personal space ahead of it, side-steps a
-//! ped with a higher id standing in its way, steers away from close peds, and never takes a
-//! step that brings it within twice the agent radius of another ped ([`separation_ok`]). The skater is not avoided by navigation
-//! (retail peds walk into a standing skater, PEDCOLL; the motion graph's `Avoid` reactions come
-//! with the behaviour milestones).
+//! Pedestrian wandering: retail `NoRoadWander` on the navmesh, mod-only crosswalks, ped avoidance, walk / turn intents.
+//! Retail mechanism and our stand-ins: docs/hails-additions/26f-living-world-peds.md#ped-wandering
 
 use crate::living_world::Vec3;
 use crate::living_world::traffic::signals::Light;
@@ -74,16 +33,9 @@ pub struct WanderParams {
     /// Turn rate while walking, radians per second. Default from `livingworld_entities_locomotion`
     /// `Hash_AD1EA18F819BF397` = 45 read as degrees per second (meaning unverified).
     pub turn_rate: f32,
-    /// The walking steer rate, radians per second: 255 deg/s [trace, recomp 2026-10-16, PEDFACE at PCU Library and
-    /// Aletown: 30 peds, 9136 walking samples, the facing follows NavPower's steering direction with no lag and its
-    /// corrections outside turn clips peak at 257 deg/s, p99 149]. Code candidate (b158, meaning unverified): the bot
-    /// value +0x80 = clamp(255 x max(1, s), 90, 720) of the truncated speed (`82E2D260`), 255 at s = 1; the 510 it gives
-    /// at the wander speed 2.0 is never seen in the trace.
+    /// Walking steer rate, rad/s: 255 deg/s measured in the recomp (b158 code candidate): docs/hails-additions/26f-living-world-peds.md#ped-steer-rate
     pub steer_rate: f32,
-    /// The turn bucket edges, degrees of heading error (`82E2A500`: 25 / 70 / 115 / 160, constants `0x8209994C` /
-    /// `0x8218155C` / `0x822F929C` / `0x82099154` and their negatives; research b167) [code, values read by the
-    /// research agent]: from the first edge up a standing or walking ped posts the 45 / 90 / 135 / 180 turn of that
-    /// side; below it the ped steers.
+    /// Turn bucket edges, degrees of heading error (82E2A500: 25 / 70 / 115 / 160, b167).
     pub turn_edges: [f32; 4],
     /// Heading error above which a running ped, or a walking ped the avoidance stand-in steers, stops to pivot, and
     /// below which such a standing ped starts walking (ours, until the run turns and NavPower's avoidance are ported).
@@ -92,10 +44,7 @@ pub struct WanderParams {
     /// Seconds a walking ped may stay inside the corner radius without getting closer before it moves on to the next
     /// corner (ours).
     pub stall_seconds: f32,
-    /// A walking ped that stays within `stuck_distance` (0.13 m) for `stuck_seconds` (0.5 s) re-paths to the SAME
-    /// target, once per still spell. The values are the bot's still timer (`82E97118`, b313 / b314), but retail runs
-    /// that timer only in bot mode 4, not for walking peds (b336): on walking peds this re-path is OURS. The outcome
-    /// matches retail, which never gives a walking ped's target up for lack of progress (b190, b332).
+    /// Still re-path to the SAME target (0.13 m / 0.5 s, bot timer 82E97118; ours on walking peds): docs/hails-additions/26f-living-world-peds.md#ped-still-re-path
     pub stuck_distance: f32,
     pub stuck_seconds: f32,
     /// NOT RETAIL (ours, a safety net): still pinned after this many seconds, the ped gives up its target and plans
@@ -104,10 +53,7 @@ pub struct WanderParams {
     /// Personal space for yielding, metres ahead (ours: the navigation record's 2.0,
     /// `Hash_7C8E344CDEC7510B`, meaning unverified).
     pub yield_distance: f32,
-    /// NOT RETAIL (ours): seconds a yielding ped waits before it re-paths to the same target. Keeping the target is
-    /// retail's outcome; the 2.0 s is borrowed from the bot's mode-0 (no path) controller `82EA4408`, which walking path
-    /// peds never run (b335). Retail's walking path step `82EA0808` has no neighbour handling at all (b336): our yield,
-    /// sidestep and push are ours; what keeps retail walking peds apart is not read yet.
+    /// NOT RETAIL: seconds a yielding ped waits before re-pathing to the same target: docs/hails-additions/26f-living-world-peds.md#ped-yield-patience
     pub yield_patience: f32,
 }
 
@@ -215,6 +161,10 @@ pub struct PedNav {
     pub next: usize,
     /// Retail flag `+32` (events 1-3): skip the long fan on the next target.
     pub skip_long: bool,
+    /// The route is an approach goal ([`PedNav::set_approach_route`]): no path = stand, not walk straight.
+    pub hold_on_fail: bool,
+    /// The last plan found no path to the approach goal: the ped stands until a plan succeeds.
+    pub holding: bool,
     pub waiting: NavWait,
     pub waited: f32,
     pub targets_chosen: u32,
@@ -322,6 +272,15 @@ impl PedNav {
         self.route_index = 0;
         self.target = None;
         self.corners.clear();
+        self.hold_on_fail = false;
+        self.holding = false;
+    }
+
+    /// ApproachWantTarget's goal: with no path to it the ped stands, asking again each update:
+    /// docs/hails-additions/26g-living-world-ped-interactions.md#approach-with-no-path
+    pub fn set_approach_route(&mut self, point: Vec3) {
+        self.set_route(Some(PedRoute { points: vec![point], looped: false }));
+        self.hold_on_fail = true;
     }
 
     fn plan(&mut self, mesh: &NavMesh, params: &WanderParams, here: NavPoint, heading: f32, obstacles: Option<&NavObstacles>) {
@@ -362,8 +321,13 @@ impl PedNav {
         self.target = Some(target);
         self.next = 0;
         self.stall = None;
+        self.holding = false;
         self.corners = match located.and_then(|to| mesh.find_path(here, to)) {
             Some(c) => c,
+            None if self.hold_on_fail && self.route.is_some() => {
+                self.holding = true;
+                vec![here.position]
+            }
             None => {
                 // No path (retail: a NavPower failure event 1-3 sets `+32`): go straight and
                 // take the short fan next time.
@@ -491,6 +455,10 @@ impl PedNav {
             self.corners.dedup_by(|x, y| dist_xz(*x, *y) < 1e-3);
             self.next = 0;
             self.obstacle_version = o.version;
+        }
+        if self.holding {
+            self.waiting = NavWait::None;
+            return NavOutput { intent: Intent::Idle, turn: 0.0, waiting: NavWait::None, turn_degrees: 0, steer: 0.0 };
         }
         // A corner counts as passed within the corner radius once the next one is in straight
         // reach over the surface; before that the ped keeps walking to the corner (the corners
@@ -627,10 +595,7 @@ impl PedNav {
     }
 }
 
-/// Keep a move on walkable ground: the step from `from` to `to` moves over the polygons linked
-/// to the one under `from` ([`NavMesh::move_along`]: across tile seams, sliding along boundary
-/// edges, never onto an unconnected layer); the position comes back on the surface. A body off
-/// the mesh stays.
+/// Keep a move on walkable ground over linked polygons ([`NavMesh::move_along`]); off-mesh bodies stay.
 pub fn constrain_step(mesh: &NavMesh, from: Vec3, to: Vec3) -> (Vec3, bool) {
     let (p, _, ok) = constrain_move(mesh, None, from, to);
     (p, ok)
@@ -650,10 +615,7 @@ pub fn constrain_move(mesh: &NavMesh, poly: Option<u32>, from: Vec3, to: Vec3) -
     }
 }
 
-/// Whether a ped may step from `from` to `to`: afterwards no other ped is closer than twice the
-/// agent radius (ours: the NavPower agent radius 0.35 [data]), or the step at least does not
-/// close in on one that already is (peds that spawn overlapping can still separate). A step
-/// that fails is not taken.
+/// Whether a ped may step: no other ped closer than twice the agent radius (0.35), or not closing in.
 pub fn separation_ok(from: Vec3, to: Vec3, me: u64, others: &[Neighbour], radius: f32) -> bool {
     separation_blocker(from, to, me, others, radius).is_none()
 }

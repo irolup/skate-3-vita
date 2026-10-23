@@ -274,6 +274,8 @@ struct CameraEdit {
     before: ClipCamera,
     anchor: glam::Vec3,
     dirty: bool,
+    /// The free camera's eased height (`replay_camera::FreeHeight`).
+    height: replay_camera::FreeHeight,
 }
 
 pub struct Playback {
@@ -645,7 +647,7 @@ impl Playback {
         self.pos = tick;
         self.paused = true;
         let anchor = glam::Vec3::Y * cam.aim + self.skater_near(tick);
-        self.editing = Some(CameraEdit { cam, before: camera.clone(), anchor, dirty: false });
+        self.editing = Some(CameraEdit { cam, before: camera.clone(), anchor, dirty: false, height: Default::default() });
         self.mode = Mode::Camera(camera.kind, true);
     }
 
@@ -684,7 +686,7 @@ impl Playback {
             // Keys are set where the playhead stands: hold still to set the first one.
             self.paused = true;
         }
-        self.editing = Some(CameraEdit { cam, before, anchor: skater + glam::Vec3::Y * cam.aim, dirty: false });
+        self.editing = Some(CameraEdit { cam, before, anchor: skater + glam::Vec3::Y * cam.aim, dirty: false, height: Default::default() });
         self.mode = Mode::Camera(kind, advanced);
     }
 
@@ -855,7 +857,7 @@ impl Playback {
                 };
                 let pos = self.pos;
                 let edit = self.editing.as_mut().expect("a camera edit");
-                if replay_camera::edit(kind, &mut edit.cam, dt, &input, edit.anchor) {
+                if replay_camera::edit(kind, &mut edit.cam, dt, &input, edit.anchor, &mut edit.height) {
                     edit.dirty = true;
                 }
                 if advanced {

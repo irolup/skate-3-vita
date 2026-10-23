@@ -243,6 +243,11 @@ pub fn run() -> ! {
     // Retail teleporters (ui.pak), and the game's buttons last frame (D-pad Up asks).
     let mut teleporters = crate::teleporters::Teleporters::default();
     let mut teleporters_loaded = false;
+    // Their floating icons (teleporter_icons.rs): loaded with them, uploaded to the scene once; this frame's anchors and
+    // icons.
+    let mut teleporter_icons: Option<crate::teleporter_icons::Icons> = None;
+    let (mut icon_anchors, mut icons, mut icon_instances) = (Vec::new(), Vec::new(), Vec::<vita_render::scene::IconInstance>::new());
+    let mut icon_world: Option<usize> = None;
     // The zombie cheat's colour grade (colour_grade.rs), loaded the first time the cheat is on.
     let mut zombie_grade: Option<Option<vita_render::scene::Grade>> = None;
     let mut teleporter_buttons: u16 = 0;
@@ -542,9 +547,18 @@ pub fn run() -> ! {
             // session marker's) asks to confirm, Yes moves the skater (here, or once its world has loaded).
             if !teleporters_loaded && crate::packs::UI.load(std::sync::atomic::Ordering::Relaxed) {
                 teleporters_loaded = true;
-                teleporters = crate::teleporters::Teleporters::load(&|p: &str| {
-                    skate_data::vfs::read(&std::path::Path::new(crate::packs::ROOT).join(p)).map_err(|e| e.to_string())
-                });
+                let read = |p: &str| skate_data::vfs::read(&std::path::Path::new(crate::packs::ROOT).join(p)).map_err(|e| e.to_string());
+                teleporters = crate::teleporters::Teleporters::load(&read);
+                teleporter_icons = teleporters.icon_key().and_then(|key| crate::teleporter_icons::Icons::load(&read, key));
+                if let Some(i) = &teleporter_icons {
+                    let texture = |(w, h, rgba): &(u32, u32, Vec<u8>)| vita_pack::texture::Texture {
+                        width: *w as u16,
+                        height: *h as u16,
+                        format: vita_pack::texture::Format::Rgba8,
+                        mips: vec![rgba.clone()],
+                    };
+                    scene.load_icons(&i.vertices, &i.indices, &texture(&i.front), &texture(&i.background));
+                }
             }
             {
                 let input = fe_input.get_or_insert_with(vita::Input::new);
@@ -556,6 +570,7 @@ pub fn run() -> ! {
                 teleporter_buttons = x.buttons;
                 let playing = screen == Screen::Playing && !AUTOPLAY;
                 let world = (playing && !s.loading && !s.reload).then(|| WORLDS[s.world_loaded]);
+                icon_world = (!s.loading && !s.reload).then_some(s.world_loaded);
                 if let Some(e) = s.frames.back() {
                     teleporters.track(world, e.current.root.translation.to_array());
                 }
@@ -997,15 +1012,24 @@ pub fn run() -> ! {
                 binding.palette(&v.snapshot, &v.snapshot, 1.0, &mut demo_palette);
                 let view_proj = math::projection_far(v.fov.unwrap_or(1.0), 100.0) * math::view(v.camera);
                 let eye = v.camera.w_axis.truncate();
-                scene.draw_demo(&Frame { view_proj, eye, palette: &demo_palette, props: &[], cars: &[], npcs: &[], peds: &[], hand_props: &[] });
+                scene.draw_demo(&Frame { view_proj, eye, palette: &demo_palette, props: &[], cars: &[], npcs: &[], peds: &[], hand_props: &[], icons: &[] });
             } else if frozen {
                 apt.draw_screen(FROZEN_WORLD);
             } else {
             let mut eye = Vec3::ZERO;
             let mut view_proj = math::projection(1.0) * math::view(Mat4::from_translation(Vec3::new(0.0, 4.0, 14.0)));
+            icon_instances.clear();
             if let Some(alpha) = view {
                 let (camera, fov) = skin::camera(&a, &b, alpha);
                 eye = camera.w_axis.truncate();
+                // The teleporter icons of the loaded world, from the player and this camera.
+                if let (Some(i), Some(w)) = (teleporter_icons.as_ref(), icon_world) {
+                    let world = WORLDS[w];
+                    teleporters.icon_anchors(world, &i.key, &mut icon_anchors);
+                    let player = a.root.translation.lerp(b.root.translation, alpha);
+                    i.instances(world, &icon_anchors, player, &camera, &mut icons);
+                    icon_instances.extend(icons.iter().map(|c| vita_render::scene::IconInstance { model: c.model, front: c.front, background: c.background }));
+                }
                 // A district draws to 250 m; its tiles stream in around the camera.
                 let far = if streamer.active() { 260.0 } else { math::FAR };
                 view_proj = math::projection_far(fov, far) * math::view(camera);
@@ -1100,7 +1124,7 @@ pub fn run() -> ! {
                 None
             };
             scene.set_grade(grade.unwrap_or(vita_render::scene::Grade::IDENTITY));
-            scene.draw(&Frame { view_proj, eye, palette: if skinned { &palette } else { &[] }, props: &prop_instances, cars: &car_instances, npcs: &npcs, peds: &peds, hand_props: &hand_instances });
+            scene.draw(&Frame { view_proj, eye, palette: if skinned { &palette } else { &[] }, props: &prop_instances, cars: &car_instances, npcs: &npcs, peds: &peds, hand_props: &hand_instances, icons: &icon_instances });
             if freeze && paused_frames >= FREEZE_AFTER_FRAMES {
                 let started = Instant::now();
                 apt.add_texture(FROZEN_WORLD, math::WIDTH as u32, math::HEIGHT as u32, &vita_render::read_rgba());

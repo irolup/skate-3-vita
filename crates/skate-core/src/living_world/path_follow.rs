@@ -1,23 +1,5 @@
-//! Retail's AI path projection (research `.local/research/npc/b110-ai-path-projection.md`): a physics AI skater's
-//! place on its recorded line follows the skater, not the recording's clock. Per tick (`sub_8246D560`):
-//! 1. the nearest node in a forward window from the search start (`sub_8246D3C0` -> `sub_82455BB0`, start..=start+4,
-//!    squared 3D distance; the start only grows);
-//! 2. the projection onto the two segments around it (`sub_824563D8`), kept or replaced against cursor B with a
-//!    0.5 hysteresis, and clamped forward to A + 0.25 of A->B when it falls back (`sub_8246C930`): cursor A;
-//! 3. distance to A and the recorded lane test (`sub_8246CCC8`, node widths x 1/50);
-//! 4. off path: the rejoin commit within 0.5 m or inside the lane (`sub_8246E2B8`);
-//! 5. cursor B = A + the speed-shape ratio in recorded frames (`sub_8246E3B8` -> `sub_82456628`);
-//! 6. on path is dropped beyond 1.0 m outside the lane (`sub_8246DB50`).
-//!
-//! Positions are (node, t): t in [0, 1] along the segment node -> node + 1. Pure and deterministic (no clock).
-//! 0. "lost" (`sub_8246D3C0` -> `sub_82468DD8`, b115): on a tick the search node did not advance, a skater that was
-//!    off the path, farther than 6 m from the search node and from both lane edge points, and slower than 14 m/s is
-//!    lost; the caller turns it into the reposition request (`ctrl+941`) that hands it to controller B.
-//!
-//! NOT RETAIL YET: the 4.5 m lost test after a line-end re-pick, the node-change handler (`sub_8246BEE0`), the
-//! `G+608` and skater flag `0x04000000` in the lost test; which body point retail
-//! projects (`sub_82467FC8`) is open (ours: the deck), and so is the lane edge axis (`sub_82454648`; ours: the
-//! segment's right).
+//! Retail AI path projection (b110, 8246D560): the skater's place on its line follows the skater.
+//! Steps, lost test (b115) and gaps: docs/hails-additions/26e-living-world-skater-ai.md#ai-path-projection
 
 use super::replay::{ReplayLine, WIDTH_SCALE};
 use super::Vec3;
@@ -46,11 +28,13 @@ pub struct PathTuning {
     pub lost_max_speed: f32,
     /// The progress flag's share of A -> B the raw projection must advance per tick (0.025, b110).
     pub progress_fraction: f32,
+    /// `pc+868` divides by the narrowest same-side width of A and the next this many nodes (`sub_8246CCC8`, b524).
+    pub lane_lookahead: u32,
 }
 
 impl Default for PathTuning {
     fn default() -> Self {
-        Self { window: 4, hysteresis: 0.5, clamp_fraction: 0.25, clamp_horizontal: 1.0, clamp_vertical: 5.0, commit: 0.5, drop: 1.0, start_node: 3, lost_radius: 6.0, lost_max_speed: 14.0, progress_fraction: 0.025 }
+        Self { window: 4, hysteresis: 0.5, clamp_fraction: 0.25, clamp_horizontal: 1.0, clamp_vertical: 5.0, commit: 0.5, drop: 1.0, start_node: 3, lost_radius: 6.0, lost_max_speed: 14.0, progress_fraction: 0.025, lane_lookahead: 4 }
     }
 }
 
@@ -87,10 +71,7 @@ impl PathFollow {
         Self { search_start: node, a: (node, 0.0), b: (node, 0.0), last: (node, 0.0), on_path: true, past_start: node > tuning.start_node, dist: 0.0, inside_lane: true, lateral: 0.0, handled: node, lost: false, progress: true }
     }
 
-    /// One tick at skater position `pos`; `ratio` = shaped speed / recorded speed at A (1.0 unshaped); `speed` = the
-    /// skater's signed speed along its heading (`pc+808`, `sub_8246BCF8`); `airborne` = the skater state byte `+438`
-    /// (an air state 200..299 with no wheel touching, `sub_82DB6EC0`; b119): no on-path drop while airborne
-    /// (`sub_8246DB50`).
+    /// One tick at `pos` (`ratio` shaped / recorded speed, `speed` pc+808, `airborne` +438; b119).
     pub fn tick(&mut self, line: &ReplayLine, pos: Vec3, ratio: f32, speed: f32, airborne: bool, tuning: &PathTuning) {
         self.lost = false;
         self.progress = true;
@@ -139,11 +120,14 @@ impl PathFollow {
         } else {
             let next = line.nodes.get(self.a.0 as usize + 1).unwrap_or(&line.nodes[self.a.0 as usize]);
             let dir = next.step;
-            // Right of the direction (dir x up); width[0] = left, width[1] = right.
-            let right = [dir[2], 0.0, -dir[0]];
+            // Right of the direction (dir x up, `sub_8246CCC8`: below 0 reads +0x25, b526); width[0] = left, width[1] = right.
+            let right = [-dir[2], 0.0, dir[0]];
             let side = usize::from(offset[0] * right[0] + offset[2] * right[2] >= 0.0);
-            let w = f32::from(line.nodes[self.a.0 as usize].width[side]) * WIDTH_SCALE;
-            self.lateral = if w > 0.0 { self.dist / w } else { 999.0 };
+            let a = self.a.0 as usize;
+            let w = f32::from(line.nodes[a].width[side]) * WIDTH_SCALE;
+            let end = (a + 1 + tuning.lane_lookahead as usize).min(line.nodes.len());
+            let narrowest = line.nodes[a..end].iter().map(|n| f32::from(n.width[side]) * WIDTH_SCALE).fold(w, f32::min);
+            self.lateral = if narrowest > 0.0 { self.dist / narrowest } else { 999.0 };
             self.dist < w
         };
         // Off path: rejoin commit.
@@ -195,10 +179,11 @@ pub fn lost(line: &ReplayLine, n: u32, pos: Vec3, r: f32) -> bool {
     if !far(c) {
         return false;
     }
+    // Node n's own step, normalised in 3D (`sub_82454648`, b527); the next node's only when n has none.
     let next = line.nodes.get(n as usize + 1).unwrap_or(node);
-    let dir = if next.step != [0.0; 3] { next.step } else { node.step };
-    let len = dir[0].hypot(dir[2]);
-    if len <= 1e-6 {
+    let dir = if node.step != [0.0; 3] { node.step } else { next.step };
+    let len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
+    if dir[0].hypot(dir[2]) <= 1e-6 {
         return true;
     }
     let right = [dir[2] / len, 0.0, -dir[0] / len];
@@ -325,6 +310,48 @@ mod tests {
         ReplayLine { id: [0; 16], flags: 0, skill: -1, nodes: (0..n).map(node).collect(), jumps: Vec::new(), groups: Vec::new() }
     }
 
+    /// b524 (`sub_8246CCC8`): the lateral ratio divides by the narrowest same-side width of A and the next 4 nodes;
+    /// the lane flag still uses A's width.
+    #[test]
+    fn the_lateral_ratio_uses_the_narrowest_width_ahead() {
+        let run = |narrow: usize| {
+            let mut l = line(40);
+            l.nodes[narrow].width = [10, 10];
+            let t = PathTuning::default();
+            let mut f = PathFollow::start(0, &t);
+            for k in 0..=200 {
+                f.tick(&l, [0.3, 0.0, 0.1 * k as f32], 1.0, 0.0, false, &t);
+            }
+            assert!((19..=20).contains(&f.a.0), "A at {:?}", f.a);
+            f
+        };
+        let near = run(22);
+        assert!(near.inside_lane, "0.3 m inside A's 0.5 m lane");
+        assert!(near.lateral > 1.0, "0.3 m over the 0.2 m two nodes ahead: {}", near.lateral);
+        let far = run(26);
+        assert!(far.lateral < 0.7, "the narrow node is past the window: {}", far.lateral);
+    }
+
+    /// b526 (`sub_8246CCC8`, asm-checked): with the line along +z, a skater at +x is left of it (dir x up = -x is
+    /// right) and is measured against byte +0x25 (width[0], the left width).
+    #[test]
+    fn each_side_of_the_line_uses_its_own_width() {
+        let run = |x: f32| {
+            let mut l = line(40);
+            for n in &mut l.nodes {
+                n.width = [255, 60];
+            }
+            let t = PathTuning::default();
+            let mut f = PathFollow::start(0, &t);
+            for k in 0..=200 {
+                f.tick(&l, [x, 0.0, 0.1 * k as f32], 1.0, 0.0, false, &t);
+            }
+            f
+        };
+        assert!(run(3.0).inside_lane, "3 m to the left, inside the 5.1 m left lane");
+        assert!(!run(-3.0).inside_lane, "3 m to the right, outside the 1.2 m right lane");
+    }
+
     #[test]
     fn b_follows_the_skater_not_a_clock() {
         let l = line(40);
@@ -399,6 +426,17 @@ mod tests {
         assert!(!lost(&l, 4, [7.0, 0.0, 4.0], 6.0));
         assert!(!lost(&l, 4, [-7.0, 0.0, 4.0], 6.0));
         assert!(lost(&l, 4, [8.5, 0.0, 4.0], 6.0));
+    }
+
+    /// b527 (`sub_82468DD8` / `sub_82454648`): the lane edges come from node n's own step, and its +0x25 edge lies on
+    /// d x up (heading +z: at -x), whatever the next node does.
+    #[test]
+    fn the_lost_test_uses_the_nodes_own_direction() {
+        let mut l = line(10);
+        l.nodes[4].width = [100, 0];
+        l.nodes[5].step = [0.1, 0.0, 0.0];
+        assert!(!lost(&l, 4, [-7.5, 0.0, 4.0], 6.0), "within 6 m of the 2 m left edge at -x");
+        assert!(lost(&l, 4, [7.5, 0.0, 4.0], 6.0), "no right width: lost at +x");
     }
 
     #[test]

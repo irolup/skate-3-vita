@@ -2931,7 +2931,7 @@ pub(crate) fn think_peds(
                         }
                     }
                     _ => {
-                        body.nav.set_route(one_point(p));
+                        body.nav.set_approach_route(p);
                         mind.approach_route = true;
                     }
                 }

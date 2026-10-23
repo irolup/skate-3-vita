@@ -43,6 +43,17 @@ struct Record {
     /// A skate.Park layout's teleporter: not armed (the Vita loads no layouts yet).
     #[serde(default)]
     layout: Option<String>,
+    /// Its floating icon (`teleporter_icons`): the `ribbon_indicator` row and the anchor locator's matrix.
+    #[serde(default)]
+    indicator: Option<Placement>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct Placement {
+    pub key: String,
+    #[serde(default)]
+    pub locator: String,
+    pub matrix: [[f32; 4]; 4],
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -59,6 +70,7 @@ pub struct Teleporter {
     pub title: String,
     pub volume: OrientedBox,
     pub exits: Vec<Exit>,
+    pub indicator: Option<Placement>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -94,6 +106,7 @@ impl Teleporters {
                         map: r.map,
                         volume: r.volume?.shape.oriented_box(),
                         exits: r.exits,
+                        indicator: r.indicator,
                     })
                 })
                 .collect(),
@@ -120,6 +133,26 @@ impl Teleporters {
         let up = |h: f32| [feet[0], feet[1] + h, feet[2]];
         let cylinder = QueryShape::default().cylinder(feet, up(HEAD), up(HIPS));
         self.inside = cylinder.and_then(|c| self.list.iter().position(|t| t.map.eq_ignore_ascii_case(world) && overlaps(&c, &t.volume)));
+    }
+
+    /// The icon anchors of the armed teleporters on `world` with indicator row `key`, one per locator (retail keeps
+    /// the first entry per locator, b533).
+    pub fn icon_anchors(&self, world: &str, key: &str, out: &mut Vec<[[f32; 4]; 4]>) {
+        out.clear();
+        let mut seen: Vec<&str> = Vec::new();
+        for t in self.list.iter().filter(|t| t.map.eq_ignore_ascii_case(world)) {
+            let Some(p) = t.indicator.as_ref().filter(|p| p.key == key) else { continue };
+            if !p.locator.is_empty() && seen.contains(&p.locator.as_str()) {
+                continue;
+            }
+            seen.push(&p.locator);
+            out.push(p.matrix);
+        }
+    }
+
+    /// The indicator row the armed teleporters name (the disc's all name `teleport`).
+    pub fn icon_key(&self) -> Option<&str> {
+        self.list.iter().find_map(|t| t.indicator.as_ref().map(|p| p.key.as_str()))
     }
 
     /// The prompt's title while the skater is inside and not asked yet.

@@ -122,7 +122,8 @@ fn ped_in_the_middle_of_the_path_splits_it_and_the_skater_steers() {
     assert!((out.lateral + 0.9).abs() < 1e-4, "{}", out.lateral);
     let p = out.entries[0].path.unwrap();
     let q = steer_point(&p, out.lateral);
-    assert!((q[0] + 0.9).abs() < 1e-4 && (q[2] - 6.0).abs() < 1e-4, "{q:?}");
+    // Heading +z, right of the path = d x up = -x (b527): the left gap lies at +x.
+    assert!((q[0] - 0.9).abs() < 1e-4 && (q[2] - 6.0).abs() < 1e-4, "{q:?}");
     // Already right of the line: the right gap.
     let right = AvoidSelf { lateral: 0.5, ..me(5.0) };
     let out = evaluate(&s, &mut AvoidState::default(), &right, &[ped(5, [0.0, 0.0, 6.0], [0.5, 0.0, 0.0])], &straight);
@@ -136,4 +137,15 @@ fn switch_off_gathers_nothing() {
     assert!(out.entries.is_empty());
     assert_eq!(out.mode, AvoidMode::None);
     assert_eq!(out.shape_speed(4.0, false), 4.0);
+}
+
+/// b527 (`sub_82464E30` -> `sub_82454798`): a negative lateral uses the left width (+0x25) and moves to the left of the
+/// path (heading +z: +x); a positive one uses the right width toward -x.
+#[test]
+fn steer_point_puts_each_width_on_its_own_side() {
+    let p = PathPoint { point: [0.0, 0.0, 6.0], direction: [0.0, 0.0, 1.0], width_left: 1.0, width_right: 2.0, node: 6, t: 0.0 };
+    let left = steer_point(&p, -0.5);
+    let right = steer_point(&p, 0.5);
+    assert!((left[0] - 0.5).abs() < 1e-5 && (left[2] - 6.0).abs() < 1e-5, "{left:?}");
+    assert!((right[0] + 1.0).abs() < 1e-5, "{right:?}");
 }

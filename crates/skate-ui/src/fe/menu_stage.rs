@@ -426,6 +426,7 @@ impl MenuStage {
         data.map_nodes = map.nodes;
         data.map_pictures = map.pictures;
         data.map_markers = map.markers;
+        data.map_debug = map.debug;
         let teleports = map.teleports;
         customize(Customize { data: &mut data, sub_options: &mut sub_options, settings_titles: &mut settings_titles });
         let mut menus = RetailMenus::new(data, loaded);

@@ -4,7 +4,7 @@ These are the reference repositories this project copies from or follows. Pinned
 
 | Reference | URL | Commit |
 |---|---|---|
-| skate-3-rust-engine | https://github.com/SK8-ENGINE/skate-3-rust-engine | `b110bab`, a commit of pull request #52 (copied at `cb79689`, resynced 2026-10-08 to `b3c9679`, 2026-10-13 to `2e16697`, 2026-10-17 to `618e824`, 2026-10-19 to `fad5aae` and 2026-10-21 to `b110bab`: see **Resync to b3c9679**, **Resync to 2e16697**, **L1 resync to PR #52 head `618e824`**, **L1 resync to PR #52 head `fad5aae`** and **Resync to PR #52 head `b110bab`**; the front end and Instant Replay are still at `fad5aae` until step 2) |
+| skate-3-rust-engine | https://github.com/SK8-ENGINE/skate-3-rust-engine | `74c124a`, a commit of pull request #52 (copied at `cb79689`, resynced 2026-10-08 to `b3c9679`, 2026-10-13 to `2e16697`, 2026-10-17 to `618e824`, 2026-10-19 to `fad5aae`, 2026-10-21 to `b110bab` and 2026-10-23 to `74c124a`: see **Resync to b3c9679**, **Resync to 2e16697**, **L1 resync to PR #52 head `618e824`**, **L1 resync to PR #52 head `fad5aae`** **Resync to PR #52 head `b110bab`** and **Resync to PR #52 head `74c124a`**; the replay editor, teleporters and menus are still at `b110bab` until its steps 2 to 4) |
 | cargo-vita | https://github.com/vita-rust/cargo-vita | `c6bbf22` |
 | vitasdk-sys | https://github.com/vita-rust/vitasdk-sys | `cee132f` |
 | examples | https://github.com/vita-rust/examples | `5ef9e08` |
@@ -619,3 +619,46 @@ Vita: checked by the user (the zombie look on and off, the picture and frame rat
 | skate-vita `vita_menus.rs` | ours (user 2026-10-23): the pause SinglePlayer tab lists retail's rows (Challenge Map, Resume Career, Free Play, Call Skater greyed, Skate Profile); Respawn, Parks, Districts, Training and Main menu leave the pause menu (the Challenge Map reaches every world, the session marker stands in for Respawn; the start-up menu keeps its lists); Quit ends Options | ours |
 
 Checks: Skate Profile test on menu set v11 (opens on tab 0, the tab key steps, Back closes); pause draw hash `67632849c692e697`. Vita: checked by the user.
+
+## Resync to PR #52 head `74c124a`, step 1: simulation and living world (2026-10-23)
+
+The PR moved 39 commits after `b110bab` (much of it upstream's comment compaction; skate.Park fusing, the teleporter icon, replay editor and menu changes are later steps or later milestones).
+
+| Part | What | Edits |
+|---|---|---|
+| skate-core `living_world/{ai_controller, avoid, path_follow, population, peds/wander}` and tests, `physics/{mod, contact_reduction, teleport_ground_fit}` | upstream at `74c124a` (our copies were still `b110bab`'s) | verbatim |
+| skate-sim `physics/prop_dynamics.rs` | retail's ground contact reduction (`82779EB0`: at most four coplanar world contacts per prop in the row solver); a skater contact on the prop's mesh gets no overlap nudge (riding up a ramp prop does not shove it) | ours already tested the prop's mesh (skate_vita); upstream's props-only world (skate.Park pieces) and `SKATE_PROP_WATCH` not taken |
+| skate-sim `living_world/{npc_avoid, peds, npc_skaters}.rs` | the NPC avoider's right side as retail; a ped's approach route (`set_approach_route`); `sequence_attributes` generic over the name type | ped stall diagnostics not taken (tracing prints nothing on the Vita) |
+
+Reference: built from `74c124a` with `reference.sh` (it links on Linux now, no stubs): its 20 Course dumps are bit-identical to `oracle/ref`; the port 20/20, no-fma 20/20. Tests: skate-core 1185 passed, skate-sim as before (`embedded_static_rwcm_hits_distinct_actor_query_ids`). DownTown perf bench: `PERF_HASH 77fc1129ae1e3070` (was `61cf3defaaa72803`), 0.78 ms a tick as before; path bench unchanged. Vita: DownTown 59 fps, sim 19.8 ms (as before); checked by the user.
+
+## Resync to PR #52 head `74c124a`, step 2: the replay key edit rates (2026-10-23)
+
+| Part | What | Edits |
+|---|---|---|
+| skate-vita `replay_camera.rs` `edit` | retail's key edit rates (upstream `replay/camera_key.rs` `CameraRules` at `74c124a`, b402 / b549): orbit stick x 2.5 degrees capped at 3 a frame, pitch to 85 degrees; distance and free moves the stick clamped to 0.2 m; free turn stick x 5 capped at 1.6 degrees, level moves along the heading, eased height (0.015 / 0.2 / x0.6, within 10 m); look height 0.01 m within 1 m of the aim, the Tripod lift moving the look point only; lens 0.5 mm within 24-75 mm | ours: the stick dead zone, LB x3, the Follow / Tripod distance ranges (40 m leash) |
+
+Not taken from the other replay commits after `b110bab`: the film pack's Finished menu (the Create pack screen is not taken), the Game key / B / Save to PC rules (ours already behave so, no PC export), the Tripod key orbit (ours already orbits). Vita: checked by the user.
+
+## Resync to PR #52 head `74c124a`, step 3: teleports and the teleporter icons (2026-10-23)
+
+| Part | What | Edits |
+|---|---|---|
+| skate-sim `physics/{skater, player_input/mod, player_input/services, teleport_state, player_state, input_phase, climbing/mod}.rs` | upstream at `74c124a` (`git merge-file` ours / `b110bab` / `74c124a`, all clean): one move per teleport through the actor reply, refused while one is in flight (`teleport_pending`); the arrival fitted onto the ground, props and cars (`teleport_ground_fit`, retail `82598428`); an arrival always enters state 100 (on-foot landings through the ordinary selection) | the cars' fit-up is a parry ray cast on each car collider (upstream sweeps through the mod bridge; no mods on the Vita); `TELEPORT_ARRIVAL` printed; upstream's props-plate test case dropped (skate.Park pieces) |
+| skate-sim `session_marker/mod.rs` | the marker return as one move, refused while a teleport is in flight | — |
+| skate-vita `teleporter_icons.rs`, `teleporters.rs` | skate-game `visual_indicators.rs`: retail's challenge visual indicator over each armed teleporter (b532 to b539): the ribbon from the `teleport` spline and `smallarrow` style, anchor + Offset, billboard about its up, the fade window on view depth (x10 end on park maps), the nearest 22 within 400 m of the player | one ribbon (the disc's teleporters all name `teleport`) |
+| vita-render `scene.rs` `load_icons` / `IconInstance`, shaders `icon.{vert,frag}.cg` | retail's two passes (b535 / b536): background alpha blended (rgb x I.y, alpha x sqrt(I.y x fade)), front added (rgb x I.x x fade); depth test, no depth write, both faces; drawn last | in display space as retail's shaders (no linear conversion) |
+| vita-bake `ui.rs` | `private/visual-indicators.json` slimmed to the rows the teleporters name, with the `default` colour's two textures; teleporters keep their `indicator` | ours |
+
+Data: upstream setup's `teleporters.py` and `visual_indicators.py` at `74c124a` (they write `indicator` per teleporter and `visual-indicators.json` with its textures); without them the bake leaves the icons out. Not taken: exits that load a skate.Park world (no layouts on the Vita). Checks: parity 20/20 + 20/20, DownTown perf hash unchanged. Vita: icons, Challenge Map and teleporter arrivals (fitted), 57.6 fps; checked by the user.
+
+## Resync to PR #52 head `74c124a`, step 4: the Challenge Map rows (2026-10-23)
+
+| Part | What | Edits |
+|---|---|---|
+| skate-core `challenge_map.rs`, `menus.rs`, `menus_tests.rs` | upstream at `74c124a`: a folder row's location count, retail's tab rules (`progression_active` / `progression_completed` hidden in free skate), the debug listings behind `DEBUG_MENUS` | verbatim |
+| skate-data `challenge_map.rs` (merged), `menu_tables.rs` | `debug_listings`; folders pointing at a `map_category` take its label | ours: `Baked::debug` carries the debug listings into ui.pak (older bakes read as none) |
+| skate-ui `fe/challenge_map_host.rs`, `fe/menu_stage.rs` | a folder's label with its count, "Downtown (14)"; the stage's `map_debug` | — |
+| skate-vita `vita_menus.rs` tests | the parks pick moves to the main menu (the pause menu reaches the worlds through the Challenge Map) | ours |
+
+Not taken: menu movie set versions 12 (every DLC pack's text) and 13 (the Credits screen, still greyed upstream): the set stays at 11; the cheat entry's popup style (upstream's on-screen keyboard; ours is the system keyboard). Vita: checked by the user.

@@ -178,6 +178,48 @@ fn teleporters(assets: &Path) -> Result<Option<Vec<u8>>, String> {
     serde_json::to_vec(&json).map(Some).map_err(|e| e.to_string())
 }
 
+/// The teleporters' floating icons (upstream setup `visual_indicators.py` at `74c124a`, research b532 to b539): the
+/// `visual-indicators.json` rows the teleporters name (their `ribbon_indicator` rows, splines and styles, the
+/// `default` colour retail's teleporter requests resolve to) and those colours' textures, as PNGs.
+const INDICATORS: &str = "private/visual-indicators.json";
+
+fn indicators(assets: &Path, teleporters: &[u8]) -> Result<Option<Vec<File>>, String> {
+    let Ok(bytes) = std::fs::read(assets.join(INDICATORS)) else { return Ok(None) };
+    let full: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| format!("{INDICATORS}: {e}"))?;
+    let tele: serde_json::Value = serde_json::from_slice(teleporters).map_err(|e| e.to_string())?;
+    let keys: std::collections::BTreeSet<String> = tele["teleporters"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|t| t["indicator"]["key"].as_str().map(str::to_owned))
+        .collect();
+    let pick = |table: &str, names: &std::collections::BTreeSet<String>| -> serde_json::Map<String, serde_json::Value> {
+        full[table].as_object().into_iter().flatten().filter(|(k, _)| names.contains(*k)).map(|(k, v)| (k.clone(), v.clone())).collect()
+    };
+    let rows = pick("indicators", &keys);
+    let field = |name: &str| rows.values().filter_map(|r| r[name].as_str().map(str::to_owned)).collect::<std::collections::BTreeSet<_>>();
+    let colours = pick("colours", &["default".to_owned()].into());
+    let mut slim = full.clone();
+    slim["indicators"] = rows.clone().into();
+    slim["splines"] = pick("splines", &field("spline")).into();
+    slim["styles"] = pick("styles", &field("style").into_iter().chain(["default".to_owned()]).collect()).into();
+    slim["colours"] = colours.clone().into();
+    let folder = full["textures"].as_str().unwrap_or("visual-indicators").to_owned();
+    let mut files = vec![File { path: INDICATORS.to_owned(), bytes: serde_json::to_vec(&slim).map_err(|e| e.to_string())? }];
+    for colour in colours.values() {
+        for pass in ["front", "background"] {
+            let Some(name) = colour[pass].as_str() else { continue };
+            let path = format!("private/{folder}/{name}.png");
+            match std::fs::read(assets.join(&path)) {
+                Ok(bytes) => files.push(File { path, bytes }),
+                Err(e) => println!("  indicator texture {path}: {e}"),
+            }
+        }
+    }
+    println!("  teleporter icons: {} indicator rows, {} files", rows.len(), files.len());
+    Ok(Some(files))
+}
+
 pub fn bake(assets: &Path, out: &Path, screens_dir: Option<&Path>) -> Result<(), String> {
     let mut list = Vec::new();
     collect(&assets.join(HUD), HUD, &mut list)?;
@@ -186,7 +228,14 @@ pub fn bake(assets: &Path, out: &Path, screens_dir: Option<&Path>) -> Result<(),
     list.retain(|f| !f.path.starts_with(&format!("{HUD}/scene/")));
     collect(&assets.join(MARKER), MARKER, &mut list)?;
     match teleporters(assets) {
-        Ok(Some(bytes)) => list.push(File { path: TELEPORTERS.to_owned(), bytes }),
+        Ok(Some(bytes)) => {
+            match indicators(assets, &bytes) {
+                Ok(Some(files)) => list.extend(files),
+                Ok(None) => println!("  (no visual-indicators.json: the prepared data predates the teleporter icons)"),
+                Err(e) => println!("  (no teleporter icons: {e})"),
+            }
+            list.push(File { path: TELEPORTERS.to_owned(), bytes })
+        }
         Ok(None) => println!("  (no teleporters.json: the prepared data predates them)"),
         Err(e) => println!("  (no teleporters: {e})"),
     }

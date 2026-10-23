@@ -88,7 +88,11 @@ impl ChallengeMapHost {
                     std::array::from_fn(|_| vec![Value::Bool(false)])
                 } else {
                     [
-                        rows.iter().map(|r| text(&r.label)).collect(),
+                        // A folder's row shows its location count, "Downtown (14)" (upstream `74c124a`).
+                        rows.iter().map(|r| match (text(&r.label), r.count) {
+                            (Value::Text(t), Some(n)) => Value::Text(format!("{t} ({n})")),
+                            (v, _) => v,
+                        }).collect(),
                         rows.iter().map(|r| Value::Bool(r.entry.kind == EntryKind::MapCategory)).collect(),
                         rows.iter().map(|_| Value::Text("none".into())).collect(),
                         rows.iter().map(|_| Value::Text("none".into())).collect(),

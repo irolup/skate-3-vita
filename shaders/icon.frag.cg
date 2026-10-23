@@ -1,0 +1,9 @@
+// skate vita teleporter icon pass: the texture times `scale` (retail's two passes, b536: the background
+// `spline_darkenPS` rgb = tex x I.y, alpha = sqrt(tex.a x I.y x fade), the bake storing sqrt(tex.a); the front
+// `spline_defaultPS` rgb = tex x I.x x fade, added).
+uniform sampler2D tex;
+uniform float4 scale;
+
+float4 main(float2 vUv : TEXCOORD0) : COLOR {
+	return tex2D(tex, vUv) * scale;
+}

@@ -41,7 +41,7 @@ fn fixture() -> MenuData {
                 tabs: vec![tab("SinglePlayer", &["ChallengeMap", "SkateWith"]), tab("Create", &["SavePark", "ReplayEditor"])],
             },
         ],
-        map_nodes: Vec::new(), map_pictures: Default::default(), map_markers: Default::default(),
+        map_nodes: Vec::new(), map_pictures: Default::default(), map_markers: Default::default(), map_debug: Default::default(),
     }
 }
 
@@ -60,8 +60,13 @@ fn challenge_map_nodes_have_hooks_and_stay_greyed_until_handled() {
         node(EntryKind::MapListing, "progression_all", Some(root.clone()), 2),
         node(EntryKind::Challenge, "some_challenge", Some(challenges.clone()), 0),
     ];
+    data.map_debug.insert("progression_all".into());
     let mut registry = MenuRegistry::new(data);
-    let ctx = MenuContext::new("Career");
+    // Career (game mode 1): the free-skate tab rules leave every node visible.
+    let ctx = MenuContext::new("Career").with(facts::GAME_MODE, 1.0).with(facts::DEBUG_MENUS, 1.0);
+    // progression_all is retail's debug-only listing: hidden unless Debug Menus is on.
+    let all = EntryRef::map(EntryKind::MapListing, "progression_all");
+    assert!(!registry.visible(&all, &MenuContext::new("Career").with(facts::GAME_MODE, 1.0)));
     let aletown = EntryRef::map(EntryKind::FeLocation, "dist_downtown_aletown");
     let challenge = EntryRef::map(EntryKind::Challenge, "some_challenge");
     // Every node is a real entry with hooks; nothing has a handler yet, so all are greyed, folders too.

@@ -1,28 +1,5 @@
-//! The NPC skater's obstacle avoider (retail `ObstacleAvoider`, AI controller `+80`), doc 26
-//! "NPC skater obstacle avoider". Pure: the game gathers the obstacles near one NPC skater each
-//! tick, this module turns them into retail's speed floor / cap and mode.
-//!
-//! Retail (TU3, evidence only; re-implemented), all called from the PathController advance
-//! `sub_8246D560` once per tick:
-//! - reset: own speed, floor 0, cap FLT_MAX, mode 0; gathering only when the global avoidance
-//!   switch is clear: skaters 64 m (`sub_82464968`, type 3), peds 8 m (`sub_82463C08`, type 2),
-//!   vehicles 20 m (`sub_82464000`, type 4), props 16 m (`sub_82464448`, type 5);
-//! - entry add `sub_82463A40`: kept inside 40 deg of the facing, or inside 88 deg when closer
-//!   than 1.8 m, at most 16;
-//! - entry fill `sub_824636B0`: closing rate and time to contact (`sub_82462D00`), the lateral
-//!   interval the obstacle blocks on the path (`sub_824629A8` circle, `sub_82462448` box for
-//!   vehicles and props), the speed limits for moving obstacles (`sub_82463200`), the close
-//!   blocker test, the skitch candidate (`sub_82462ED0`);
-//! - floor / cap aggregation `sub_82464FA8`, skitch target `sub_824650A0`, steer target and free
-//!   path gaps `sub_82465198` / `sub_82461DC8`, mode `sub_82465578`.
-//! The speed consumer is the record builder's speed shape (`sub_82470830`): mode 1 floors, mode
-//! 2 caps the AI record speed. Modes 3 and 4 move the AI's target sideways (`sub_82465280` gap
-//! choice, `sub_82464E30` offset, [`steer_point`]). Not ported (open): the prop gate
-//! `sub_82464350`, the consumers of modes 6 and 7, and an offset term of the entry add that
-//! reads controller `+128`.
-//!
-//! Multiplayer: a pure function of positions and velocities, so the host runs it and clients
-//! consume its result (the replay tier's lag, see the game side).
+//! The NPC skater's obstacle avoider (retail ObstacleAvoider, AI controller +80), pure.
+//! Retail mechanism (8246D560 and callees): docs/hails-additions/26e-living-world-skater-ai.md#obstacle-avoider
 
 use super::Vec3;
 
@@ -288,9 +265,9 @@ fn dot(a: Vec3, b: Vec3) -> f32 {
 fn len(a: Vec3) -> f32 {
     dot(a, a).sqrt()
 }
-/// Right of a direction (y up): the path's lateral axis.
+/// Right of a direction (y up): the path's lateral axis, d x up (`sub_82454798`, b527: +0x25 on the negative side).
 fn right_of(d: Vec3) -> Vec3 {
-    let r = [d[2], 0.0, -d[0]];
+    let r = [-d[2], 0.0, d[0]];
     let l = len(r);
     if l > 1e-6 {
         scale(r, 1.0 / l)

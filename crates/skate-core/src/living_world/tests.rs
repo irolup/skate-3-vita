@@ -311,6 +311,28 @@ fn vehicles_ring_80_100_cull_110_cap_30_rotation_slot_1() {
     assert_eq!(despawns(&world.step(&inputs), Kind::Vehicle)[0].id, id);
 }
 
+/// b551: in zombie mode Free Play "No" still clears the cars at once, never the peds (`sub_826B7010`).
+#[test]
+fn free_play_zero_in_zombie_mode_clears_cars_not_peds() {
+    let map = map();
+    let obs = [still(0.0, 0.0)];
+    let mut inputs = offline(&obs, &map);
+    inputs.free_play = Some(FreePlay::default());
+    let mut world = LivingWorld::new(config(), 8);
+    for _ in 0..400 {
+        world.step(&inputs);
+    }
+    assert!(world.count(Kind::Vehicle) > 0 && world.count(Kind::Pedestrian) > 0);
+    inputs.zombie = true;
+    inputs.free_play = Some(FreePlay { traffic: 0.0, pedestrians: 0.0, ai_skaters: true });
+    let mut gone = Vec::new();
+    for _ in 0..4 {
+        gone.extend(world.step(&inputs));
+    }
+    assert!(despawns(&gone, Kind::Vehicle).iter().any(|d| d.reason == DespawnReason::FreePlayOff));
+    assert!(despawns(&gone, Kind::Pedestrian).iter().all(|d| d.reason != DespawnReason::FreePlayOff));
+}
+
 #[test]
 fn free_play_scales_caps_and_zero_removes_all_at_once() {
     let map = map();

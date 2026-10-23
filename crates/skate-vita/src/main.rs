@@ -25,6 +25,7 @@ mod replay_camera;
 mod session_replay;
 mod world_replay;
 mod teleporters;
+mod teleporter_icons;
 #[cfg(target_os = "vita")]
 mod colour_grade;
 mod settings;

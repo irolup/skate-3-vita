@@ -25,10 +25,7 @@ pub enum EntryKind {
     Category,
     Item,
     Setting,
-    /// Challenge Map nodes (FE screen 17), named after their vault classes (skatercollections): the tree's tabs and
-    /// folders (`map_listing`, `map_filter`), labels (`map_category`) and leaves. An entry's id is its vault key, so
-    /// the hook ids read `fe_locations:<key>` and so on; every node exists in the data, so each has its hooks and stays
-    /// greyed until a handler is registered (b244, b253).
+    /// Challenge Map nodes (FE 17) by vault class; ids are vault keys, greyed until a handler exists (b244, b253).
     MapListing,
     MapFilter,
     MapCategory,
@@ -128,6 +125,10 @@ pub mod facts {
     pub const PROJECT10_UNLOCKED: &str = "project10_unlocked";
     /// Retail GameMode global (1 single player, 4 / 5 online, 0 / 3 / 4 free skate).
     pub const GAME_MODE: &str = "game_mode";
+    /// 1 when the player turned on Debug Menus (PC overlay Extras, not retail): retail's debug-only menus show.
+    pub const DEBUG_MENUS: &str = "debug_menus";
+    /// Completed challenges (retail `ChallengeStatus.GetNumCompletedChallenges`; ours has none yet).
+    pub const COMPLETED_CHALLENGES: &str = "completed_challenges";
     /// 1 when the skate park being edited has unsaved changes.
     pub const PARK_DIRTY: &str = "park_dirty";
     /// 1 when the park can be saved (retail: a park-state flag and a mode check).
@@ -334,6 +335,8 @@ pub struct MenuData {
     /// The Challenge Map marker per location key (icon, world point, its world's map bounds); data, mods may change
     /// it. A location without one draws no marker.
     pub map_markers: std::collections::BTreeMap<String, MapMarker>,
+    /// Challenge Map listings flagged `IsDebug` in the vault (research b479): hidden unless Debug Menus is on.
+    pub map_debug: std::collections::BTreeSet<String>,
 }
 
 /// One Challenge Map location marker (research b263 / b264 / b265): the icon texture name (`mini_teleport`), the
@@ -761,7 +764,17 @@ impl MenuRegistry {
             (EntryRef::item("SavePark"), None, Some(Rule::fact(PARK_SAVEABLE, Cmp::Ne, 0.0))),
             (EntryRef::item("RatePark"), None, Some(Rule::fact(PARK_COMMUNITY, Cmp::Ne, 0.0))),
             (EntryRef::item("FlagSkatePark"), None, Some(Rule::fact(PARK_COMMUNITY, Cmp::Ne, 0.0))),
+            // Challenge Map tabs: each map_listing's tab Lua (Hash_3E294F92C056A144, skatercollections): Challenges
+            // and All are hidden in free skate, Completed also while nothing is completed; Locations always shows.
+            (EntryRef::map(EntryKind::MapListing, "progression_active"), Some(not_free_skate()), None),
+            (EntryRef::map(EntryKind::MapListing, "progression_completed"),
+                Some(Rule::All(vec![not_free_skate(), Rule::fact(COMPLETED_CHALLENGES, Cmp::Gt, 0.0)])), None),
         ];
+        // Listings flagged IsDebug (82D0C0E0 skips them; b479) show only with Debug Menus (ours, PC overlay Extras).
+        let debug: Vec<EntryRef> = self.data.map_debug.iter().map(|id| EntryRef::map(EntryKind::MapListing, id)).collect();
+        for entry in debug {
+            self.hooks_mut(entry).visible.push((retail.clone(), Condition::Rule(Rule::fact(DEBUG_MENUS, Cmp::Ne, 0.0))));
+        }
         for (entry, visible, enabled) in rules {
             let hooks = self.hooks_mut(entry);
             if let Some(rule) = visible {
@@ -1084,13 +1097,23 @@ impl MenuRegistry {
 /// Retail settings links and Video screen choice (sub_8260D290): Difficulty ->
 /// screen 2, Audio -> 3, Video -> 8 / 7 / 6 / 5 / 4 by front-end state, mode and
 /// session, Controls -> 9, Online -> 10, Skate Feed -> 11.
-pub fn retail_link(setting: &str) -> Option<Link> {
-    use facts::*;
-    let free_skate = Rule::Any(vec![
+/// Retail's free-skate game modes (0 / 3 / 4).
+fn free_skate_rule() -> Rule {
+    use facts::GAME_MODE;
+    Rule::Any(vec![
         Rule::fact(GAME_MODE, Cmp::Eq, 0.0),
         Rule::fact(GAME_MODE, Cmp::Eq, 3.0),
         Rule::fact(GAME_MODE, Cmp::Eq, 4.0),
-    ]);
+    ])
+}
+
+fn not_free_skate() -> Rule {
+    Rule::Not(Box::new(free_skate_rule()))
+}
+
+pub fn retail_link(setting: &str) -> Option<Link> {
+    use facts::*;
+    let free_skate = free_skate_rule();
     let session = Rule::fact(ONLINE_SESSION, Cmp::Ne, 0.0);
     Some(match setting {
         "ID_GAMESETTINGS_DIFFICULTY_SETTINGS" => Link::Screen(2),

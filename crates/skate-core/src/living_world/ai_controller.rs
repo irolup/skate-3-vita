@@ -1,17 +1,5 @@
-//! The NPC skater controller's sub-modes for the obstacle avoider's modes 6 and 7 (retail TU3, evidence only;
-//! re-implemented; `.local/research/npc/b66-npc-modes-6-7.md`, main checked `sub_8246F818` cases 3 / 5):
-//! - mode 6 (a low prop within 1 s): `sub_8246D560` sets controller sub-mode 4 (`ctrl+568`) when below 4; while 4
-//!   the recorded node action is dropped, the speed shape is skipped and no grab / trick is posted;
-//! - mode 7 (blocked by a prop within 1.5 s, cap under 0.1): `sub_8246F938` (not airborne) sets sub-mode 3 and a
-//!   one-shot reposition request (`ctrl+941`) on the first tick; a second tick still in mode 7 sets sub-mode 5,
-//!   remembers the prop's path node (`ctrl+756`) and posts `WipeOutRequest` 1.0 once (key 0x830BECC4); later ticks
-//!   post nothing;
-//! - `sub_8246FE38` at the end of every controller tick: a pending request (offline only) re-places the skater on
-//!   its line, at most once per 60 clock units: in sub-mode 3 at cursor + 5 (or the prop's node when further in
-//!   mode 7), else at the cursor; then + 2; a remembered prop node + 2 within 1..19 nodes ahead wins; clamped to the
-//!   line. A successful move resets the controller (sub-mode 0). The request is cleared either way.
-//!
-//! Multiplayer: [`ControllerState`] is plain per-NPC data; the host runs it.
+//! NPC skater controller sub-modes for the obstacle avoider's modes 6 and 7 (8246D560, 8246F938, 8246FE38).
+//! Retail mechanism: docs/hails-additions/26e-living-world-skater-ai.md#avoider-modes-6-and-7
 
 /// Retail numbers; every field is data a mod can override.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -26,10 +14,7 @@ pub struct ControllerSettings {
     pub reposition_interval: u64,
     /// The `WipeOutRequest` value (1.0, `0x8231A844`).
     pub wipe_out: f32,
-    /// The safe node picker (`sub_82455728`): a node is good when more than `safe_jump_frames` (45) recorded 60 Hz
-    /// frames have passed since a jump marker and more than `safe_flag_frames` (15) since a flag-0x4 node, its step
-    /// slope y^2 / (x^2 + z^2) is under `safe_slope` (1.0, `0x8231A844`; 0 when the horizontal length^2 is at most
-    /// `0x82063A48` 0.001) and its trick class is 0, 4 or 8; the first of `safe_run` (3) good nodes in a row wins.
+    /// Safe node picker (82455728): jump / flag frame gaps, slope, trick class, a run of good nodes: docs/hails-additions/26e-living-world-skater-ai.md#safe-node-picker
     pub safe_jump_frames: u32,
     pub safe_flag_frames: u32,
     pub safe_slope: f32,
@@ -151,10 +136,7 @@ pub fn reposition_node(state: &ControllerState, s: &ControllerSettings, mode_7: 
     node.min(node_count.saturating_sub(1))
 }
 
-/// The off-board toggle the line controller presses (the push-state object `M` at brain `+92` it shares with controller
-/// B; b117, main checked `sub_8246FA30` -> `824712E0`): A's activate clears it (`sub_82468AC8`: mode 0, count 0); each
-/// path tick presses first, then sets the mode for the next tick: 2 = get back on (1 = stay off, when `pc+336`, which
-/// retail never sets for ambient skaters).
+/// Off-board toggle the line controller presses (b117, 8246FA30 -> 824712E0): docs/hails-additions/26e-living-world-skater-ai.md#off-board-toggle
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct OffBoardToggle {
     pub mode: u8,
@@ -180,11 +162,7 @@ impl OffBoardToggle {
     }
 }
 
-/// `sub_8246ED68`: the node a bailed AI skater is placed at again, picked when the bail starts (`sub_8246EE30`,
-/// `pc+880`; main checked 0x8246ED68..0x8246EE24): the projection's search node (`pc+816`) plus
-/// `reposition_past`, a remembered prop's node instead when it lies ahead within `remembered_window`, clamped to
-/// the last node, then the first safe node from there ([`safe_node`]). Not ported: game modes 19 / 20
-/// (`sub_824681D8`) use `sub_824553D8(line, cursor A)` instead.
+/// 8246ED68: node a bailed AI skater is placed at again (picked at bail start, 8246EE30): docs/hails-additions/26e-living-world-skater-ai.md#bail-respawn-node
 pub fn respawn_node(state: &ControllerState, s: &ControllerSettings, search_start: u32, line: &super::replay::ReplayLine) -> u32 {
     let mut node = search_start + s.reposition_past;
     if let Some(r) = state.remembered_node {
@@ -292,10 +270,7 @@ pub fn full_reset(state: &mut ControllerState) {
     *state = ControllerState { last_reposition: state.last_reposition, ..Default::default() };
 }
 
-/// `sub_82468240` for one tick (b111 section 4): `pos` = the skater, `a` / `a_pos` = cursor A and its point,
-/// `progress` = the projection's flag (`PathFollow::progress`), `can_track` = `sub_82468070` (not scripted, not
-/// toggling on / off the board; on board not airborne, off board not mounting / unmounting). The stage climbs on
-/// no-progress ticks only; progress ticks count toward the clear.
+/// 82468240 for one tick (b111 section 4): stuck tracking stages: docs/hails-additions/26e-living-world-skater-ai.md#track-stuck
 pub fn track_stuck(state: &mut ControllerState, s: &ControllerSettings, pos: super::Vec3, a: (u32, f32), a_pos: super::Vec3, progress: bool, can_track: bool) {
     state.gate_ticks = state.gate_ticks.saturating_add(1);
     let gate = state.gate_ticks > s.stuck_gate_ticks;
@@ -383,13 +358,16 @@ pub fn resnap_node(line: &super::replay::ReplayLine, s: &ControllerSettings, sea
         let slope = if h > 0.001 { (b[1] - a[1]) / h } else { 0.0 };
         if slope > s.safe_slope {
             let mut sum = 0u32;
+            // `8246D168` tests the lower node before the budget, and both only past `search + 2` (b524).
             for (j, n) in nodes.iter().enumerate().skip(i + 1) {
                 sum += u32::from(n.frames);
-                if sum > budget {
-                    break;
-                }
-                if j > i + 2 && n.position[1] < a[1] {
-                    return j as u32;
+                if j > i + 2 {
+                    if n.position[1] < a[1] {
+                        return j as u32;
+                    }
+                    if sum > budget {
+                        break;
+                    }
                 }
             }
         }
@@ -400,6 +378,19 @@ pub fn resnap_node(line: &super::replay::ReplayLine, s: &ControllerSettings, sea
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// b524 (`8246D168`): on a steep start the scan tests "lower than the search node" before the 240-frame budget,
+    /// and both only past `search + 2`, so a lower node after a long first segment is still found.
+    #[test]
+    fn the_steep_resnap_finds_a_lower_node_after_a_long_segment() {
+        use crate::living_world::replay::{ReplayLine, ReplayNode};
+        let node = |y: f32, z: f32, frames: u8| ReplayNode { position: [0.0, y, z], step: [0.0, 0.0, 0.1], board: [128; 4], skater: [128; 4], frames, event: 0, flags: 0, jump: None, width: [25, 25] };
+        // Up 10 m over 2 m (slope 5), node 1 alone carries 250 frames, node 3 is below the start.
+        let nodes = vec![node(0.0, 0.0, 0), node(5.0, 1.0, 250), node(10.0, 2.0, 10), node(-1.0, 3.0, 10), node(-2.0, 4.0, 10)];
+        let line = ReplayLine { id: [0; 16], flags: 0, skill: -1, nodes, jumps: Vec::new(), groups: Vec::new() };
+        let s = ControllerSettings::default();
+        assert_eq!(resnap_node(&line, &s, 0, [0.0, 10.0, 2.0]), 3);
+    }
 
     /// A skater that stops on its line and never moves again: the gate waits 120 ticks, then the stages climb at
     /// 30 / 30 / 2 / 180 / 30 no-progress ticks past their limit (b111 counts one tick later: re-snap ~32, walk back ~63, bail ~247,

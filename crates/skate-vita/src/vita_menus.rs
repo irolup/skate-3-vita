@@ -483,14 +483,7 @@ mod retail_tests {
         };
         run(&mut ms, Some(APT_START), 90);
         assert!(ms.open());
-        // SinglePlayer: Respawn, Parks; A opens the column, Down, A picks Mega Park.
-        run(&mut ms, Some(13), 10);
-        run(&mut ms, Some(APT_NEXT), 20);
-        run(&mut ms, Some(13), 10);
-        let out = run(&mut ms, Some(APT_NEXT), 10);
-        let picked: Vec<Option<Choice>> = out.sub_options.iter().map(|(item, sub)| choice(item, Some(*sub), &worlds)).collect();
-        assert_eq!(picked, [Some(Choice::World(2))], "{:?}", out.sub_options);
-        run(&mut ms, Some(APT_PREVIOUS), 10);
+        // (The parks are the main menu's now: `a_columns_highlight_moves_with_down` picks one there.)
         // Options (three tabs right): Game Settings; the main list's last three rows are the Vita's screens.
         for _ in 0..3 {
             run(&mut ms, Some(APT_RIGHT), 15);
@@ -554,6 +547,8 @@ mod column_tests {
             let mut ms = MenuStage::boot_with(movies, &read, &mut |c| customize(c, &worlds)).unwrap();
             register(&mut ms.menus.registry, &Settings::default());
             ms.set_sub_options(REPLAY_KIND, replay_row(&["Instant replay".to_owned(), "Saved one".to_owned()]));
+            // The world lists are the main menu's (the pause menu reaches the worlds through the Challenge Map).
+            set_main_menu(&mut ms.menus.context, target == PARKS);
             let run = |ms: &mut MenuStage, keys: Vec<(u32, usize)>, frames: usize| {
                 ms.update_keys(keys, 1.0 / 60.0);
                 for _ in 1..frames {
@@ -574,6 +569,12 @@ mod column_tests {
             let open = summary(&mut ms);
             run(&mut ms, vec![(13, 0), (17, 0)], 30);
             assert_ne!(summary(&mut ms), open, "{target}: the column's highlight moves");
+            if target == PARKS {
+                // The second row is Mega Park: A picks it.
+                let frame = ms.update_keys(vec![(APT_NEXT, 0)], 1.0 / 60.0);
+                let picked: Vec<Option<Choice>> = frame.sub_options.iter().map(|(item, sub)| choice(item, Some(*sub), &worlds)).collect();
+                assert_eq!(picked, [Some(Choice::World(2))], "{:?}", frame.sub_options);
+            }
         }
     }
 }

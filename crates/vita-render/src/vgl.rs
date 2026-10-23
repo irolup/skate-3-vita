@@ -33,6 +33,7 @@ pub const GL_TEXTURE_MIN_FILTER: GLenum = 0x2801;
 pub const GL_NEAREST: GLint = 0x2600;
 pub const GL_BLEND: GLenum = 0x0BE2;
 pub const GL_SRC_ALPHA: GLenum = 0x0302;
+pub const GL_ONE: GLenum = 1;
 pub const GL_ONE_MINUS_SRC_ALPHA: GLenum = 0x0303;
 pub const GL_STREAM_DRAW: GLenum = 0x88E0;
 pub const GL_TEXTURE0: GLenum = 0x84C0;

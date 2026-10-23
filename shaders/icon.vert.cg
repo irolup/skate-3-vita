@@ -1,0 +1,14 @@
+// skate vita teleporter icon (retail's challenge visual indicator, research b534 to b536): the ribbon mesh placed by
+// its model matrix (billboarded on the CPU), the texture's u along the spline, v across the strip.
+uniform float4x4 viewproj;
+uniform float4x4 model;
+
+void main(
+	float3 aPosition,
+	float2 aUv,
+	float2 out vUv : TEXCOORD0,
+	float4 out gl_Position : POSITION
+) {
+	gl_Position = mul(mul(float4(aPosition, 1.0f), model), viewproj);
+	vUv = aUv;
+}

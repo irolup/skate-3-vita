@@ -10,7 +10,7 @@ mod reset;
 mod services;
 use super::{ground_runtime::GroundRuntime, riding_outputs::RidingOutputs};
 pub(crate) use output_reset::reset_outputs;
-pub(crate) use services::{InputHostFrame, PlayerInputCallbacks};
+pub(crate) use services::{ArrivalSolids, InputHostFrame, PlayerInputCallbacks};
 use skate_core::{
     math::Vector3,
     physics::{
@@ -40,14 +40,13 @@ pub(crate) struct PlayerInputRuntime {
     pub grind: grind::GrindInputState,
     pending_teleport: Option<AnimationPartTransform>,
     pending_velocity: Option<[f32; 3]>,
+    /// The next actor-reply teleport fits its arrival to the ground (retail `82598428`, b475): set by `travel_ex`.
+    pending_ground_fit: Option<skate_core::physics::teleport_ground_fit::GroundFit>,
     pub pending_grind: Option<grind::Pending>,
     pub grind_observation: Option<super::grind::ManagerObservation>,
 }
 impl PlayerInputRuntime {
-    /// A pooled NPC body becoming a new NPC: retail builds a new PhysicalPlayer for every new actor
-    /// (`82590DC0` -> `82DB18A0`, b295), so every ctor-built part starts fresh (processed-input cache, grind input,
-    /// pre-input, dynamic normal). The physical / processed words mirror the live state and stay for the placement's
-    /// state Exit / Enter (b299). The same actor keeps all of it across a respawn or its next line: pool only.
+    /// A pooled NPC body becoming a new NPC starts its ctor-built parts fresh (82590DC0 -> 82DB18A0, b295 / b299).
     pub(crate) fn reset_for_new_actor(&mut self, data: &Collections) -> Result<(), String> {
         let fresh = Self::load(data)?;
         let old = std::mem::replace(self, fresh);
@@ -81,6 +80,23 @@ impl PlayerInputRuntime {
         Ok(())
     }
 
+    /// A mod's arrival velocity for the next actor-reply teleport (ours, no retail counterpart; b471 item 2): applied
+    /// after the single 702 reset, None = at rest as retail.
+    pub fn set_arrival_velocity(&mut self, velocity: Option<[f32; 3]>) -> Result<(), String> {
+        if let Some(v) = velocity {
+            if v.iter().any(|x| !x.is_finite() || x.abs() > 200.0) {
+                return Err("Teleport velocity out of range".into());
+            }
+        }
+        self.pending_velocity = velocity;
+        Ok(())
+    }
+
+    /// The ground fit-up for the next actor-reply teleport (None = the target as given, e.g. checkpoint replies).
+    pub fn set_arrival_ground_fit(&mut self, fit: Option<skate_core::physics::teleport_ground_fit::GroundFit>) {
+        self.pending_ground_fit = fit;
+    }
+
     pub fn load(data: &Collections) -> Result<Self, String> {
         let mut physical = PhysicalPlayerInput::default();
         reset_outputs(&mut physical);
@@ -97,6 +113,7 @@ impl PlayerInputRuntime {
             grind: grind::GrindInputState::load(data)?,
             pending_teleport: None,
             pending_velocity: None,
+            pending_ground_fit: None,
             pending_grind: None,
             grind_observation: None,
         })
@@ -151,6 +168,7 @@ impl PlayerInputRuntime {
         stage: InputStage,
         world: &skate_core::physics::board_world::BoardWorld,
         world_edges: crate::grind_world::RailView<'_>,
+        arrival: services::ArrivalSolids<'_>,
     ) -> Result<Option<input_phase::InputContinuation>, String> {
         let mut service = services::Services {
             board,
@@ -166,6 +184,8 @@ impl PlayerInputRuntime {
             toolkit: &mut self.toolkit,
             pending_teleport: &mut self.pending_teleport,
             pending_velocity: &mut self.pending_velocity,
+            pending_ground_fit: &mut self.pending_ground_fit,
+            arrival,
         };
         match stage {
             InputStage::ThroughTeleport => input_phase::start_input(

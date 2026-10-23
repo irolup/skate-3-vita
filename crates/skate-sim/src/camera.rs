@@ -8,7 +8,7 @@
 //! the game loop does that now.
 mod settings;
 mod collision;
-mod world_query;
+pub(crate) mod world_query;
 mod shot_data;
 mod stock_names;
 mod shake_data;

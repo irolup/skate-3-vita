@@ -48,11 +48,14 @@ pub struct SignalSettings {
     pub max_crossed_nodes: u32,
     /// Mode 4 (skitch): the GrabWorld value posted every tick (`sub_8246FA30`, `0x8231A844`, 1.0; b65).
     pub skitch_grab: f32,
+    /// The manual tunable of [`manual_value`] (`sub_82469338`: the tunable `742E...` looked up by hash, default
+    /// `0x830D0850`, 0.5; also the board yaw's manual side): `Manual` = + it for a nosemanual, - it for a tailmanual.
+    pub manual_value: f32,
 }
 
 impl Default for SignalSettings {
     fn default() -> Self {
-        Self { anticipation_distance: 3.0, anticipation_frames: 60, anticipation_heading: core::f32::consts::FRAC_PI_4, max_crossed_nodes: 3, skitch_grab: 1.0 }
+        Self { anticipation_distance: 3.0, anticipation_frames: 60, anticipation_heading: core::f32::consts::FRAC_PI_4, max_crossed_nodes: 3, skitch_grab: 1.0, manual_value: 0.5 }
     }
 }
 
@@ -105,7 +108,8 @@ pub fn signals(line: &ReplayLine, s: &SignalSettings, input: &SignalInput, chose
                     let angle = if super::npc_tricks::is_nollie(recorded) { core::f32::consts::PI } else { 0.0 };
                     out.push(("AnticAngle".into(), angle));
                 }
-                Some(8) => out.push(("Manual".into(), 1.0)),
+                // `sub_824696B8` with `pc+788` = 8: the manual's side, `sub_82469338(pc+792)` (+ nose, - tail).
+                Some(8) => out.push(("Manual".into(), manual_value(recorded, s.manual_value))),
                 _ => {}
             }
         }
@@ -122,7 +126,7 @@ pub fn signals(line: &ReplayLine, s: &SignalSettings, input: &SignalInput, chose
             if line.nodes[n as usize].event == node_events::END_TRICK {
                 slot.category = 0;
             } else {
-                dispatch(line.node_trick(&line.nodes[n as usize]), chosen(n), slot, slot_tricks, &mut out);
+                dispatch(line.node_trick(&line.nodes[n as usize]), chosen(n), slot, slot_tricks, s.manual_value, &mut out);
             }
         }
     }
@@ -141,17 +145,18 @@ pub struct IntentTuple {
 }
 
 /// The PathController's trick slot: `pc+832` category (0 = none), `pc+844` trick, `pc+904` ticks since the start
-/// node. Plain data: serialisable state of the NPC.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// node, `pc+836` the manual's value (set by a manual's dispatch). Plain data: serialisable state of the NPC.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TrickSlot {
     pub category: u8,
     pub trick: i16,
     pub ticks: u32,
+    pub manual: f32,
 }
 
 impl Default for TrickSlot {
     fn default() -> Self {
-        Self { category: 0, trick: -1, ticks: 0 }
+        Self { category: 0, trick: -1, ticks: 0, manual: 0.0 }
     }
 }
 
@@ -161,7 +166,7 @@ fn valid(trick: i16) -> bool {
 
 /// A start node: the category of the recorded trick goes in the slot, then the category's dispatch with the trick
 /// the cursor chose (`sub_8246A2E0` from 0x8246A420).
-fn dispatch(recorded: i16, trick: i16, slot: &mut TrickSlot, slot_tricks: bool, out: &mut Vec<Signal>) {
+fn dispatch(recorded: i16, trick: i16, slot: &mut TrickSlot, slot_tricks: bool, manual_tunable: f32, out: &mut Vec<Signal>) {
     slot.ticks = 0;
     slot.category = catalog::category(recorded).and_then(|c| u8::try_from(c).ok()).unwrap_or(0);
     let take = |slot: &mut TrickSlot| {
@@ -189,7 +194,15 @@ fn dispatch(recorded: i16, trick: i16, slot: &mut TrickSlot, slot_tricks: bool, 
         }
         3 | 4 | 12 => !slot_tricks || take(slot),
         5 | 7 | 10 | 13 => take(slot),
-        6 | 8 => valid(trick),
+        6 => valid(trick),
+        // 0x8246A544: a manual also stores its side, `pc+836` = `sub_82469338(trick)`, for the writer.
+        8 => {
+            let ok = valid(trick);
+            if ok {
+                slot.manual = manual_value(trick, manual_tunable);
+            }
+            ok
+        }
         11 => {
             let ok = valid(trick);
             if ok {
@@ -225,6 +238,8 @@ pub fn slot_signals(slot: &mut TrickSlot, schedule: &[IntentTuple], handplant_gr
             }
         }
         6 => out.push(("GrabWorld".into(), handplant_grab)),
+        // `loc_82469954`: a manual holds `Manual` = `pc+836` every tick until its end node.
+        8 => out.push(("Manual".into(), slot.manual)),
         _ => {}
     }
     slot.ticks = slot.ticks.saturating_add(1);
@@ -252,13 +267,11 @@ pub struct BoardYawTuning {
     pub mag_scale: f32,
     /// `BoardAdjustAngle` with a manual ahead: nose-side and tail-side values (`0x822F94A8` / `0x822F94AC`).
     pub manual_ahead_angles: (f32, f32),
-    /// The manual value tunable of `sub_82469338` (`742E...`, 0.5).
-    pub manual_value: f32,
 }
 
 impl Default for BoardYawTuning {
     fn default() -> Self {
-        Self { dead_zone: 0.31416, mag_scale: 6.0606, manual_ahead_angles: (-2.677, 0.257), manual_value: 0.5 }
+        Self { dead_zone: 0.31416, mag_scale: 6.0606, manual_ahead_angles: (-2.677, 0.257) }
     }
 }
 
@@ -419,7 +432,7 @@ mod tests {
         let mut slot = TrickSlot::default();
         let v = signals(&l, &s, &at(10, Some(9)), &|_| BS_5_O, &mut slot, true);
         assert!(!names(&v).contains(&"Trick"), "no perform signals for a grind: {v:?}");
-        assert_eq!(slot, TrickSlot { category: 5, trick: BS_5_O, ticks: 0 });
+        assert_eq!(slot, TrickSlot { category: 5, trick: BS_5_O, ticks: 0, manual: 0.0 });
         // The 5-0's schedule: PhysGrindUpDown -1 from the slot tick on, open-ended.
         let schedule = [IntentTuple { intent: 71, value: -1.0, start: 0, end: -1 }];
         for _ in 0..3 {
@@ -438,17 +451,20 @@ mod tests {
             IntentTuple { intent: 32, value: -1.0, start: 2, end: -1 },
             IntentTuple { intent: 0, value: 1.0, start: 0, end: -1 },
         ];
-        let mut slot = TrickSlot { category: 10, trick: 20, ticks: 0 };
+        let mut slot = TrickSlot { category: 10, trick: 20, ticks: 0, manual: 0.0 };
         let seen: Vec<Vec<Signal>> = (0..4).map(|_| slot_signals(&mut slot, &schedule, 1.0)).collect();
         assert_eq!(seen[0], vec![("LeftPush".to_string(), 1.0)]);
         assert_eq!(seen[1], vec![("LeftPush".to_string(), 1.0)]);
         assert_eq!(seen[2], vec![("TweakY".to_string(), -1.0)]);
         assert_eq!(seen[3], vec![("TweakY".to_string(), -1.0)]);
-        // Handplant: GrabWorld every tick, no schedule. Revert and manual: nothing from the slot.
-        let mut hp = TrickSlot { category: 6, trick: FS_HANDPLANT, ticks: 0 };
+        // Handplant: GrabWorld every tick, no schedule. Manual: its side every tick (`pc+836`). Powerslide and revert:
+        // nothing from the slot.
+        let mut hp = TrickSlot { category: 6, trick: FS_HANDPLANT, ticks: 0, manual: 0.0 };
         assert_eq!(slot_signals(&mut hp, &schedule, 1.0), vec![("GrabWorld".to_string(), 1.0)]);
-        for c in [8, 9, 11] {
-            assert!(slot_signals(&mut TrickSlot { category: c, trick: 20, ticks: 0 }, &schedule, 1.0).is_empty());
+        let mut tail = TrickSlot { category: 8, trick: 3, ticks: 0, manual: -0.5 };
+        assert_eq!(slot_signals(&mut tail, &schedule, 1.0), vec![("Manual".to_string(), -0.5)]);
+        for c in [9, 11] {
+            assert!(slot_signals(&mut TrickSlot { category: c, trick: 20, ticks: 0, manual: 0.0 }, &schedule, 1.0).is_empty());
         }
     }
 
@@ -462,9 +478,9 @@ mod tests {
         // A grab (category 4) without the profile byte keeps the old trick in the slot.
         let grab = (0..332).find(|&t| catalog::category(t) == Some(4)).unwrap();
         let l = line(10, grab, &[]);
-        let mut slot = TrickSlot { category: 0, trick: BS_5_O, ticks: 7 };
+        let mut slot = TrickSlot { category: 0, trick: BS_5_O, ticks: 7, manual: 0.0 };
         signals(&l, &s, &at(10, Some(9)), &|_| grab, &mut slot, false);
-        assert_eq!(slot, TrickSlot { category: 4, trick: BS_5_O, ticks: 0 });
+        assert_eq!(slot, TrickSlot { category: 4, trick: BS_5_O, ticks: 0, manual: 0.0 });
         signals(&l, &s, &at(10, Some(9)), &|_| grab, &mut slot, true);
         assert_eq!(slot.trick, grab);
     }
@@ -508,7 +524,7 @@ mod tests {
             assert!(!b.set && b.post(None, &t).is_none(), "{deg}: {b:?}");
         }
         // Posting: a manual ahead wins; a nosemanual sends the nose-side angle.
-        let p = b.post(Some(manual_value(2, t.manual_value)), &t).unwrap();
+        let p = b.post(Some(manual_value(2, SignalSettings::default().manual_value)), &t).unwrap();
         assert_eq!(p, [("BoardAdjustAngle".to_string(), -2.677), ("BoardAdjustMag".to_string(), 0.5)]);
         assert_eq!(BoardYaw::takeoff(decode(yaw(80.0)), decode(yaw(0.0)), &t).post(None, &t).unwrap()[0], ("BoardAdjustAngle".to_string(), -FRAC_PI_2));
     }
@@ -553,6 +569,29 @@ mod tests {
         assert_eq!(v[1], ("AnticAngle".to_string(), core::f32::consts::PI));
         let go = sig(&l, &s, &at(10, Some(9)), &|_| 85);
         assert_eq!(go[1].0, "360flip");
+    }
+
+    /// A tailmanual (3) is anticipated with its side (`Manual` = -0.5, not a nose-side 1.0) and held with that value
+    /// every tick from its start node until its end node (`pc+836`, `loc_82469954`); before, the manual dropped at its
+    /// start node and the ollie right after it never popped (andrew_reynolds at DownTown node 58).
+    #[test]
+    fn a_manual_is_anticipated_and_held_with_its_side() {
+        let mut l = line(10, 3, &[]);
+        l.nodes[14].event = node_events::END_TRICK;
+        let s = SignalSettings::default();
+        let ahead = sig(&l, &s, &at(5, Some(4)), &|_| 3);
+        assert_eq!(ahead, vec![("Manual".to_string(), -0.5)]);
+        let mut slot = TrickSlot::default();
+        let start = signals(&l, &s, &at(10, Some(9)), &|_| 3, &mut slot, true);
+        assert!(names(&start).iter().all(|n| *n != "Trick"), "a manual posts no Trick: {start:?}");
+        assert_eq!((slot.category, slot.manual), (8, -0.5));
+        for _ in 0..3 {
+            assert_eq!(slot_signals(&mut slot, &[], 1.0), vec![("Manual".to_string(), -0.5)]);
+        }
+        signals(&l, &s, &SignalInput { in_trick: true, ..at(14, Some(13)) }, &|_| 3, &mut slot, true);
+        assert_eq!(slot.category, 0);
+        assert!(slot_signals(&mut slot, &[], 1.0).is_empty(), "nothing after the end node");
+        assert_eq!(manual_value(2, s.manual_value), 0.5, "a nosemanual's side is +");
     }
 
     #[test]

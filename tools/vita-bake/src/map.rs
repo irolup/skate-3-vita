@@ -88,6 +88,51 @@ pub fn bake(install: &Path, out: &Path, names: &[String]) -> Result<(), String> 
     Ok(())
 }
 
+/// R2: `trickguide.pak`, the Trick Guide's 3D demo (the prepared `private/hud/scene`): the set as a map pack
+/// (`private/hud/scene/TrickGuide.map`), the ViewScene camera tracks (`ice_000.bin`) and the demo clips
+/// (`trickguide/<name>1.abin`, about 29 MB). The Vita reads it from the card a file at a time (one clip in memory).
+pub fn bake_trick_guide(install: &Path, out: &Path) -> Result<(), String> {
+    use vita_pack::files::File;
+    let started = std::time::Instant::now();
+    let scene = install.join("assets/private/hud/scene");
+    let read = |p: &Path| std::fs::read(p).map_err(|e| format!("{}: {e}", p.display()));
+    let set = SkateMap::parse_render_only(&read(&scene.join("TrickGuide.skate"))?)?;
+    let render = build_render(&set, None)?;
+    let (spawn, heading) = (set.spawn, set.heading);
+    let set_pack = Map { sim: map::strip_render(set), authored_spawn: spawn, authored_heading: heading, render }.to_pack();
+    let root = "private/hud/scene";
+    let mut files = vec![
+        File { path: format!("{root}/TrickGuide.map"), bytes: set_pack },
+        File { path: format!("{root}/ice_000.bin"), bytes: read(&scene.join("ice_000.bin"))? },
+    ];
+    let mut clips: Vec<_> = std::fs::read_dir(scene.join("trickguide"))
+        .map_err(|e| e.to_string())?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "abin"))
+        .collect();
+    clips.sort();
+    for clip in &clips {
+        let name = clip.file_name().unwrap().to_string_lossy().into_owned();
+        files.push(File { path: format!("{root}/trickguide/{name}"), bytes: read(clip)? });
+    }
+    let pack = vita_pack::files::to_pack(&files);
+    let path = out.join("trickguide.pak");
+    std::fs::create_dir_all(out).map_err(|e| e.to_string())?;
+    std::fs::write(&path, &pack).map_err(|e| e.to_string())?;
+    // The index next to it (as the audio packs): the Vita reads it instead of one pass over the 29 MB pack.
+    let index = vita_pack::files::index_of(&pack)?;
+    std::fs::write(out.join("trickguide.pak.idx"), vita_pack::files::encode_index(&pack[24..56], &index)).map_err(|e| e.to_string())?;
+    println!(
+        "{}: the set ({} KiB), {} clips, {} KiB in all [{:.1} s]",
+        path.display(),
+        files[0].bytes.len() / 1024,
+        clips.len(),
+        pack.len() / 1024,
+        started.elapsed().as_secs_f32()
+    );
+    Ok(())
+}
+
 /// `VITA_BAKE_MOVABLE_PROPS=1`: the props are drawn from `props.pak` (`vita-bake props`) at
 /// their physics poses, so the park and district renders leave them out.
 pub fn movable_props() -> bool {

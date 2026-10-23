@@ -37,7 +37,11 @@ impl Object {
 pub struct Registry {pub objects:Vec<Object>}
 impl Registry {
     pub fn new(objects:Vec<Object>)->Result<Self,&'static str> {
-        for (index,object) in objects.iter().enumerate() {
+        //The ids before this object: the same answer as scanning objects[..index] (each id goes in after its object
+        //passed every check, so at index i the set holds exactly the earlier ids), without the O(n^2) scan over the
+        //~700 DownTown props and cars rebuilt three times a tick (b334).
+        let mut seen=std::collections::BTreeSet::new();
+        for object in &objects {
             if object.id==0 {return Err("Interactable object ID zero is reserved for none");}
             if let Provider::Dmo {selection_variant,..}=object.provider {
                 if selection_variant>1 {return Err("Dmo body selection is a single bit");}
@@ -49,7 +53,7 @@ impl Registry {
                 }
                 object.record(spline)?;
             }
-            if objects[..index].iter().any(|prior|prior.id==object.id) {
+            if !seen.insert(object.id) {
                 return Err("Duplicate authored interactable object ID");
             }
         }

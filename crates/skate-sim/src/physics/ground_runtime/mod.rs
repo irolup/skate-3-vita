@@ -4,7 +4,7 @@ mod corrections;
 mod entry;
 mod state;
 mod update;
-mod skitch;
+pub(crate) mod skitch;
 pub(crate) use entry::GroundEntryTargets;
 pub(crate) use skitch::{latch_enabled as skitch_enabled, set_latch_enabled as set_skitch_enabled};
 pub(crate) use state::GroundState;

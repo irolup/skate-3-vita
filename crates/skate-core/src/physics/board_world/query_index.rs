@@ -95,18 +95,30 @@ impl QueryIndex {
 
     pub(super) fn query(&self, bounds: Bounds, meshes: &[QueryMesh]) -> Vec<usize> {
         let mut result = Vec::new();
+        self.query_into(bounds, meshes, &mut result);
+        result
+    }
+
+    /// skate_vita (performance): [`Self::query`] into `result` (cleared first), with the traversal stack an array
+    /// (the same pushes and pops; the builder splits at the median, so the depth stays near log2 of the meshes, far
+    /// below 64). A query allocated its stack and result every call (the walker's line queries: ~1,300 a tick).
+    pub(super) fn query_into(&self, bounds: Bounds, meshes: &[QueryMesh], result: &mut Vec<usize>) {
+        result.clear();
         if self.nodes.is_empty() {
-            return result;
+            return;
         }
-        let mut stack = vec![0];
-        while let Some(id) = stack.pop() {
-            let node = &self.nodes[id];
+        let mut stack = [0usize; 64];
+        let mut depth = 1;
+        while depth > 0 {
+            depth -= 1;
+            let node = &self.nodes[stack[depth]];
             if !node.bounds.overlaps(bounds) {
                 continue;
             }
             if let Some((left, right)) = node.children {
-                stack.push(right);
-                stack.push(left);
+                stack[depth] = right;
+                stack[depth + 1] = left;
+                depth += 2;
             } else {
                 result.extend(
                     self.order[node.range.clone()]
@@ -117,7 +129,6 @@ impl QueryIndex {
             }
         }
         result.sort_unstable();
-        result
     }
 }
 

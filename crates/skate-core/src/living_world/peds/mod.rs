@@ -25,6 +25,7 @@
 pub mod anim;
 pub mod brain;
 pub mod chase;
+pub mod chase_alert;
 pub mod conversation;
 pub mod perception;
 pub mod takedown;

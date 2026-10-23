@@ -11,8 +11,8 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::Instant;
 
 use skate_sim::live::HudFeed;
-use skate_ui::apt_scene::{self, Shapes};
-use skate_ui::apt_vm::Value;
+use skate_ui::fe::apt_scene::{self, Shapes};
+use skate_ui::fe::apt_vm::Value;
 use skate_ui::hud_runtime::{Input, Runtime};
 use vita_render::apt::Apt;
 
@@ -327,10 +327,10 @@ impl Marker {
             .meshes
             .iter()
             .map(|m| {
-                let (texture, size) = m.texture.and_then(|i| keys.get(i)).map_or(("white".to_owned(), [1, 1]), |(k, s)| (k.clone(), *s));
+                let texture = m.texture.and_then(|i| keys.get(i)).map_or_else(|| "white".to_owned(), |(k, _)| k.clone());
                 apt_scene::Draw {
                     texture,
-                    size,
+                    fill: apt_scene::Fill::TextureClamped,
                     vertices: m.vertices.iter().map(|v| apt_scene::Vertex { position: v.position, uv: v.uv }).collect(),
                     // The reference's ColorMaterial colour is sRGB; the shader works in linear light.
                     multiply: [linear(m.color[0]), linear(m.color[1]), linear(m.color[2]), m.color[3]],

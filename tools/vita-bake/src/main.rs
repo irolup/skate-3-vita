@@ -43,6 +43,7 @@ fn main() -> ExitCode {
         ["sim", assets, out] => sim::bake(Path::new(assets), Path::new(out)),
         ["audio", export, out] => audio::bake(Path::new(export), Path::new(out)),
         ["ambience", export, out] => audio::bake_ambience(Path::new(export), Path::new(out)),
+        ["trickguide", install, out] => map::bake_trick_guide(Path::new(install), Path::new(out)),
         ["ui", assets, out] => ui::bake(Path::new(assets), Path::new(out), None),
         ["ui", assets, out, screens] => ui::bake(Path::new(assets), Path::new(out), Some(Path::new(screens))),
         ["maps", install, out, names @ ..] => {

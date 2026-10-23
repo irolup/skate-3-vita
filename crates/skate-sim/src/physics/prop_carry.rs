@@ -173,6 +173,7 @@ pub(crate) struct LocomotionOverrides {
     pub hand_ik_curve: Option<[[f32; 8]; 2]>,
     pub hand_ik_rate: Option<f32>,
     pub hand_ik_reach: Option<f32>,
+    pub root_yaw_gain: Option<[[f32; 8]; 2]>,
 }
 
 impl LocomotionOverrides {
@@ -200,6 +201,7 @@ impl LocomotionOverrides {
         if let Some(v) = self.lever_yaw { m.lever_yaw = curve(v); }
         if let Some(v) = self.mass_speed { m.mass_speed = curve(v); }
         if let Some(v) = self.inertia_yaw_gain { m.inertia_yaw_gain = curve(v); }
+        if let Some(v) = self.root_yaw_gain { m.root_yaw_gain = curve(v); }
         // `grip_reach` (the old engine reach) now sets the retail follow
         // reach (0.65 m, 82D44A10) between the edge point and the body.
         if let Some(v) = self.grip_reach { m.follow_reach = v; }
@@ -283,7 +285,7 @@ fn authored_frame(record: &Record, held: &skate_core::player::offboard::move_obj
 
 /// The authored grab records of prop `id` from its current pose; `None`
 /// without grab splines or when `enabled` is false.
-fn authored_records(dynamics: &PropDynamics, id: u32, enabled: bool) -> Option<Vec<Record>> {
+pub(crate) fn authored_records(dynamics: &PropDynamics, id: u32, enabled: bool) -> Option<Vec<Record>> {
     if !enabled {
         return None;
     }
@@ -392,6 +394,12 @@ pub(crate) struct Carrier {
     /// Retail skater observations for Move Object; `None` (host tests, the
     /// HUD) skips the record qualification and uses `position` as body.
     pub skeleton: Option<CarrierSkeleton>,
+    /// The Ground grab decision this tick (82D324B0, `biped_ground::grab`): `Some(Some(descriptor))` when a validated
+    /// record qualified (state +144, descriptor +152 / +156), `Some(None)` when none did or in another state. The game
+    /// always passes one: a carry then starts only from the Move Object enter's bind of the published record
+    /// (`bind_published`, b233). `None` (host tests, the HUD) has no decision and keeps the interim pick (nearest prop
+    /// within `grab_range`, its nearest record).
+    pub ground_grab: Option<Option<(u32, u32)>>,
 }
 
 /// The skater inputs retail Move Object reads, from the skater runtime.
@@ -493,9 +501,17 @@ pub(crate) struct PropCarry {
     frame: Option<GrabFrame>,
     /// Closest the skater got to its follow point (optional mod let-go rule).
     closest: f32,
+    /// The grab button last tick (the press edge for `PROP_GRAB_MISS`).
+    grab_down: bool,
+    /// The published record the Move Object enter (82D442D0) passed its gate with, bound at the next update.
+    pending_bind: Option<Record>,
     /// Retail skater follow state (+416 / +608 / +624); `None` until the
     /// first held tick.
     follow: Option<SkaterFollow>,
+    /// The last stick input `CARRY_STICK` logged (tenths of OB_ObjectMvZ / MvX / MvRot), so it writes on change.
+    stick_logged: Option<[i32; 3]>,
+    /// Held steps since the grab (`None` until CARRY_WEIGHT is logged for this grab); CARRY_ORBIT every 15 while turning.
+    held_steps: Option<u32>,
     /// Last command, for HELD_PROP.
     last: MoveObjectCommand,
     last_input: [f32; 3],
@@ -573,6 +589,13 @@ impl PropCarry {
     pub(crate) fn skater_target(&self) -> Option<(Vector3, Vector3)> {
         self.held?;
         self.frame.map(|f| (f.skater, f.forward))
+    }
+
+    /// Share of the angle to the grab edge the skater root turns this tick
+    /// (82D46610 +1124: curve 023D73966B8669A5 at the time held); 1.0 (a
+    /// snap) before the follow state exists.
+    pub(crate) fn root_yaw_gain(&self) -> f32 {
+        self.follow.map_or(1.0, |f| f.root_yaw_gain)
     }
 
     /// Snapshot of this slot's Move Object state: held id and the flat
@@ -658,7 +681,7 @@ impl PropCarry {
         if self.held.is_some() || carrier.state != PhysicalStateId::BipedGround {
             return None;
         }
-        let (id, _) = dynamics.nearest_body(carrier.position, self.grab_range())?;
+        let id = dynamics.nearest_body(carrier.position, self.grab_range())?.0;
         let body = dynamics.held_body(id)?;
         let (frame, record) = self.frame_for(dynamics, id, &body, carrier, &mut None, &mut None)?;
         self.holds(&record, &frame, carrier).then_some(id)
@@ -746,6 +769,50 @@ impl PropCarry {
         Some((authored_frame(&record, &new)?, record, new))
     }
 
+    /// `PROP_GRAB_MISS` (laptop 2026-10-18: the blue dumpsters never grabbed and left no line): once per grab press
+    /// that starts no carry, with the Ground decision (82D324B0: the qualified record, or none) and the nearest prop.
+    fn log_miss(&self, dynamics: &PropDynamics, carrier: Carrier, reason: &str) {
+        let decision = match carrier.ground_grab {
+            Some(Some((kind, key))) => format!("qualified {kind}/{key:#x} (prop {:?} record {})", dynamics.prop_of_grab_key(key, true), key & 63),
+            Some(None) => "no record qualified".to_owned(),
+            None => "no ground decision".to_owned(),
+        };
+        let nearest = dynamics.nearest_body(carrier.position, self.grab_range()).map_or_else(
+            || "none".to_owned(),
+            |(id, centre)| {
+                let d = sub(centre, carrier.position);
+                format!("{id} ({}) {:.2} m to its centre", dynamics.describe_template(id), dot(d, d).sqrt())
+            },
+        );
+        tracing::info!("PROP_GRAB_MISS {reason}: decision {decision}; nearest prop {nearest}; state {:?}", carrier.state);
+    }
+
+    /// The Move Object enter's bind (82D442D0, research b233): with the published record (Player+0x760) passing the
+    /// gate (flags_2480 bit 0x400000, geometry +196 and rates identity +216 set), it is copied (82762AB0) and bound
+    /// with a new grip (82D444A0 full) at the next carry update. The skater enters 502 either way.
+    pub(crate) fn bind_published(&mut self, record: Record) {
+        self.pending_bind = Some(record);
+    }
+
+    /// Binds a published record: the prop from its spline key, a new grip from bone 23 (82D444A0 full; no hold test,
+    /// as in the enter). None (logged) for a record that is not a prop's or a prop that is gone.
+    fn bind(&mut self, dynamics: &PropDynamics, mut record: Record, carrier: Carrier) -> Option<u32> {
+        let key = record.0[48];
+        let id = dynamics.prop_of_grab_key(key, true);
+        let Some(id) = id.filter(|&id| dynamics.held_body(id).is_some()) else {
+            self.log_miss(dynamics, carrier, "the published record is not a prop's that is still there");
+            return None;
+        };
+        let r = carrier.skeleton.map_or(carrier.position, |s| s.reference);
+        let held = skate_core::player::offboard::move_object::begin_grip(&mut record, [r.x, r.y, r.z], self.locomotion.move_object.grab_end_exclusion);
+        self.let_go();
+        self.held = Some(id);
+        self.bound = Some(held);
+        self.closest = f32::INFINITY;
+        tracing::info!("PROP_GRAB_BIND prop={id} ({}) record {} kind {}", dynamics.describe_template(id), key & 63, record.0[47]);
+        Some(id)
+    }
+
     fn let_go(&mut self) {
         self.held = None;
         self.mode = Mode::Carry;
@@ -756,6 +823,8 @@ impl PropCarry {
         self.hand_ik = Default::default();
         self.frame = None;
         self.follow = None;
+        self.stick_logged = None;
+        self.held_steps = None;
         self.controller = MoveObjectController::default();
     }
 
@@ -764,14 +833,26 @@ impl PropCarry {
             carrier.state,
             PhysicalStateId::BipedGround | PhysicalStateId::OffBoardPushing
         );
+        let pressed = tick.grab && !self.grab_down;
+        self.grab_down = tick.grab;
         let Some(id) = self.held else {
-            if tick.grab {
+            if let Some(record) = self.pending_bind.take() {
+                if let Some(id) = self.bind(dynamics, record, carrier) {
+                    self.hold(dynamics, id, tick, carrier);
+                }
+                return;
+            }
+            // With a Ground decision the carry starts only from the Move Object enter's bind (the decision on tick N,
+            // the published record and 502 on N+1, b233); the interim pick is for host tests and the HUD.
+            if tick.grab && carrier.ground_grab.is_none() {
                 if let Some(id) = self.candidate(dynamics, carrier) {
                     self.let_go();
                     self.held = Some(id);
                     self.closest = f32::INFINITY;
                     self.hold(dynamics, id, tick, carrier);
                 }
+            } else if pressed && carrier.state == PhysicalStateId::BipedGround && carrier.ground_grab == Some(None) {
+                self.log_miss(dynamics, carrier, "no validated record passed 82E08DB8");
             }
             return;
         };
@@ -949,6 +1030,36 @@ impl PropCarry {
             record_272: body.record_272,
         };
         let command = skate_core::player::offboard::move_object::command(&tuning, &mut self.controller, &input);
+        // CARRY_STICK (laptop 2026-10-18: the log had no stick input while carrying): on change, the stick
+        // (push / pull, side, turn), the skater's facing and right, and where the target velocity points.
+        let stick = [input.move_z, input.move_x, input.move_rotation].map(|v| (v * 10.0).round() as i32);
+        if self.stick_logged != Some(stick) {
+            self.stick_logged = Some(stick);
+            let (f, v) = (input.forward, command.target_velocity);
+            tracing::info!(
+                "CARRY_STICK prop={id} push={:.1} side={:.1} turn={:.1} facing=[{:.2}, {:.2}] right=[{:.2}, {:.2}] target_velocity=[{:.2}, {:.2}] yaw_target={:.2}",
+                input.move_z, input.move_x, input.move_rotation, f[0], f[2], -f[2], f[0], v[0], v[2], command.yaw_target
+            );
+        }
+        // CARRY_WEIGHT once per grab (b284: a held prop's weight is only these two curve outputs, set at the grab;
+        // a light dumpster means a light mass or yaw inertia here). CARRY_ORBIT while turning: retail turns the prop
+        // about its centre and the skater walks round it, so the skater's angle round the centre should follow the
+        // prop's heading.
+        let steps = self.held_steps.map_or(0, |s| s + 1);
+        if self.held_steps.is_none() {
+            tracing::info!(
+                "CARRY_WEIGHT prop={id} mass={:.1} yaw_inertia={:.1} speed_scale={:.2} yaw_gain={:.2}",
+                input.mass, input.yaw_inertia, tuning.speed_scale(input.mass), tuning.yaw_gain(input.yaw_inertia)
+            );
+        }
+        self.held_steps = Some(steps);
+        if input.move_rotation.abs() > 0.05 && steps % 15 == 0 {
+            let d = [body_position.x - input.center[0], body_position.z - input.center[2]];
+            tracing::info!(
+                "CARRY_ORBIT prop={id} turn={:.1} prop_heading={:.3} skater_angle={:.3} radius={:.2} yaw_target={:.2} step={steps}",
+                input.move_rotation, input.heading, d[0].atan2(d[1]), d[0].hypot(d[1]), command.yaw_target
+            );
+        }
         // Follow step after the command (this tick's latch): +416 steps
         // toward the edge and that step is the displacement handed to the
         // character move (82D44A10 -> 82BDF268). NOT RETAIL YET: 82BDF268

@@ -360,11 +360,15 @@ pub(crate) struct TrafficCar {
     pub spawn_tick: u64,
 }
 
-/// Fixed-step pose of a car (render interpolates between `prev` and `curr`).
+/// Fixed-step pose of a car. The skater's solve of tick N meets `curr` of tick N-1 (traffic moves after Physics), so
+/// the car is drawn between `drawn_prev` and `prev`, one tick behind `curr`, the ticks the skater and camera are
+/// drawn between (b285: drawn `prev` -> `curr` it was a tick ahead of the skater holding it, 0.5 m at 30 m/s).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct CarMotion {
+    pub drawn_prev: Transform,
     pub prev: Transform,
     pub curr: Transform,
+    pub wheel_drawn_prev: f32,
     pub wheel_prev: f32,
     pub wheel: f32,
     pub velocity: Vec3,
@@ -539,7 +543,7 @@ pub(crate) fn apply_vehicle_records(decisions: &[Decision], state: &PopulationSt
         choose_first(net, &traffic.cars, &mut car, overrides.connector_choice, &mut traffic.rng);
         let t = car_transform(net, &car);
         traffic.events.push(TrafficEvent::Spawned { id: s.id, entity: meta.entity.clone(), model: meta.model.clone(), chassis: meta.chassis_id.clone() });
-        let motion = CarMotion { prev: t, curr: t, wheel_prev: 0.0, wheel: 0.0, velocity: Vec3::ZERO };
+        let motion = CarMotion { drawn_prev: t, prev: t, curr: t, wheel_drawn_prev: 0.0, wheel_prev: 0.0, wheel: 0.0, velocity: Vec3::ZERO };
         traffic.index.insert(s.id.serial, (CarEntity { meta, motion }, s.tick));
         let at = traffic.cars.partition_point(|c| c.key < car.key);
         traffic.cars.insert(at, car);
@@ -652,8 +656,12 @@ pub(crate) fn drive_traffic(
         let Some((entity, _)) = traffic.index.get_mut(&c.key) else { continue };
         let (meta, motion) = (&entity.meta, &mut entity.motion);
         let t = car_transform(net, c);
-        motion.prev = prev_pose.get(&c.key).copied().unwrap_or(t);
+        let prev = prev_pose.get(&c.key).copied().unwrap_or(t);
+        // A car new to this list (spawned or teleported this tick) starts its drawn pair here too.
+        motion.drawn_prev = if prev_pose.contains_key(&c.key) { motion.prev } else { t };
+        motion.prev = prev;
         motion.curr = t;
+        motion.wheel_drawn_prev = motion.wheel_prev;
         motion.wheel_prev = motion.wheel;
         motion.wheel = (motion.wheel + travelled.get(&c.key).copied().unwrap_or(0.0) / meta.wheel_radius) % std::f32::consts::TAU;
         motion.velocity = Vec3::from_array(frame.forward) * c.speed;

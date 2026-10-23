@@ -169,6 +169,10 @@ pub struct MoveObjectTuning {
     pub hand_ik_threshold: f32,
     pub hand_ik_rate: f32,
     pub hand_ik_reach: f32,
+    /// Root yaw ease (82D46610 -> +1124, applied by 82BDF268 / 82BE1058) [code + data]: each held tick the skater
+    /// root turns by the wrapped angle to the edge frame times this curve (023D73966B8669A5) at the time held
+    /// (+1140, 0 at the grab, + `tick` per held tick). 0.18 at the grab, ~0.09 a tick later, 1.0 from 0.5 s.
+    pub root_yaw_gain: PointGraph<8>,
 }
 
 const fn graph(x: [f32; 8], y: [f32; 8]) -> PointGraph<8> {
@@ -221,6 +225,10 @@ impl Default for MoveObjectTuning {
             hand_ik_threshold: 0.1,
             hand_ik_rate: 0.2,
             hand_ik_reach: 0.65,
+            root_yaw_gain: graph(
+                [0.0, 0.0154723, 0.0757329, 0.17671, 0.239414, 0.330619, 0.421824, 0.5],
+                [0.182143, 0.0892857, 0.121429, 0.278571, 0.475, 0.764286, 0.935714, 1.0],
+            ),
         }
     }
 }
@@ -293,6 +301,7 @@ impl MoveObjectTuning {
             hand_ik_threshold: fin(self.hand_ik_threshold, fallback.hand_ik_threshold),
             hand_ik_rate: ok(self.hand_ik_rate, fallback.hand_ik_rate),
             hand_ik_reach: ok(self.hand_ik_reach, fallback.hand_ik_reach),
+            root_yaw_gain: curve(self.root_yaw_gain, fallback.root_yaw_gain),
         }
     }
 }
@@ -437,7 +446,8 @@ fn clamp_length(v: [f32; 3], limit: f32) -> [f32; 3] {
     if l > limit && l > 0.0 { v.map(|c| c * limit / l) } else { v }
 }
 
-/// Side axis of a horizontal forward: the skater's right, (0,0,1) -> (1,0,0).
+/// Side axis of a horizontal forward: Y x forward (retail's edge row +144), (0,0,1) -> (1,0,0). In our right-handed,
+/// +Y-up world that is the skater's LEFT; the stick's x uses its negation (+400).
 pub fn side_of(forward: [f32; 3]) -> [f32; 3] {
     [forward[2], 0.0, -forward[0]]
 }
@@ -480,18 +490,21 @@ pub fn command(tuning: &MoveObjectTuning, state: &mut MoveObjectController, inpu
     // wrapped angle between the facing and +368 (8296EBB0) is the drift; above
     // the re-latch threshold (557FA142008FD7CE) the latch is stored, below it
     // the store is skipped (0x82D4570C). The drift does not enter the yaw error.
+    // The latched side row is +400 = -(+144) [code, b240 / b241]: +144 = Y x forward = `side`, so the stick's x moves
+    // the pair to the skater's right, (-f.z, 0, f.x) (laptop 2026-10-18: left / right were reversed while carrying).
+    let right = [-side[0], 0.0, -side[2]];
     let mut drift = 0.0;
     if !state.latched || yaw_target.abs() >= tuning.turning_threshold {
         state.latched = true;
         state.latched_yaw = input.heading;
         state.latched_forward = input.forward;
-        state.latched_side = side;
+        state.latched_side = right;
     } else {
         drift = wrap(input.heading - state.latched_yaw);
         if drift.abs() > tuning.relatch {
             state.latched_yaw = input.heading;
             state.latched_forward = input.forward;
-            state.latched_side = side;
+            state.latched_side = right;
             drift = 0.0;
         }
     }
@@ -674,6 +687,11 @@ pub struct SkaterFollow {
     pub anchor: [f32; 3],
     /// +624: smoothed anchor velocity (m/s, horizontal).
     pub velocity: [f32; 3],
+    /// +1140: time held (s), 0 at the grab, + `tick` per held update.
+    pub time_held: f32,
+    /// Share of the wrapped angle to the edge frame the root turns this tick:
+    /// `root_yaw_gain` at the time held (82D46610 -> +1124).
+    pub root_yaw_gain: f32,
 }
 
 impl SkaterFollow {
@@ -686,12 +704,23 @@ impl SkaterFollow {
     /// `back` is the latched frame row +368: horizontal, from the edge
     /// toward the skater.
     pub fn begin(tuning: &MoveObjectTuning, body: [f32; 3], grip: [f32; 3], back: [f32; 3]) -> Self {
-        Self { point: body, anchor: Self::anchor_of(tuning, grip, back), velocity: [0.0; 3] }
+        Self {
+            point: body,
+            anchor: Self::anchor_of(tuning, grip, back),
+            velocity: [0.0; 3],
+            time_held: 0.0,
+            root_yaw_gain: tuning.root_yaw_gain.evaluate(0.0),
+        }
     }
 
     /// 82D46610 (before the object command, so `back` is the previous
     /// tick's latch): v = keep v + new (anchor - previous anchor) / tick.
+    /// Also the root yaw share for this tick from the time held, then the
+    /// time held advances one tick (+1140; whether retail reads it before or
+    /// after the advance within the tick is not traced).
     pub fn update_anchor(&mut self, tuning: &MoveObjectTuning, grip: [f32; 3], back: [f32; 3]) {
+        self.root_yaw_gain = tuning.root_yaw_gain.evaluate(self.time_held);
+        self.time_held += tuning.tick;
         let anchor = Self::anchor_of(tuning, grip, back);
         let inv = 1.0 / tuning.tick;
         self.velocity = std::array::from_fn(|i| {
@@ -776,6 +805,27 @@ mod tests {
         // 30 deg off the edge normal: within the 80 deg approach limit.
         let (s, c) = 30f32.to_radians().sin_cos();
         assert!(hold([0.0; 3], [s, 0.0, c]), "turned 30 deg");
+    }
+
+    #[test]
+    fn root_yaw_eases_in_over_the_time_held() {
+        // 82D46610 +1124 = angle x curve 023D73966B8669A5 at the time held (+1140, 0 at the grab, + 1/60 per tick).
+        let t = MoveObjectTuning::default();
+        let (grip, back) = ([0.0, 0.0, 1.0], [0.0, 0.0, -1.0]);
+        let mut f = SkaterFollow::begin(&t, [0.0; 3], grip, back);
+        assert_eq!((f.time_held, f.root_yaw_gain), (0.0, t.root_yaw_gain.evaluate(0.0)));
+        assert!((f.root_yaw_gain - 0.182143).abs() < 1e-6);
+        f.update_anchor(&t, grip, back);
+        assert!((f.root_yaw_gain - 0.182143).abs() < 1e-6, "the first held tick reads the time held before it advances");
+        assert!((f.time_held - t.tick).abs() < 1e-7);
+        f.update_anchor(&t, grip, back);
+        assert!(f.root_yaw_gain < 0.182143, "the curve dips after the grab ({})", f.root_yaw_gain);
+        for _ in 0..30 {
+            f.update_anchor(&t, grip, back);
+        }
+        assert_eq!(f.root_yaw_gain, 1.0, "the whole angle from 0.5 s held");
+        // A new grab starts over.
+        assert_eq!(SkaterFollow::begin(&t, [0.0; 3], grip, back).time_held, 0.0);
     }
 
     #[test]
@@ -921,7 +971,8 @@ mod tests {
         let c = command(&t, &mut s, &i);
         assert!(c.blocked);
         assert!(c.target_velocity[2].abs() < 1e-6, "{c:?}");
-        assert!(c.target_velocity[0] > 0.0, "along the wall kept: {c:?}");
+        // Stick right facing +Z is the skater's right, -X (the +400 side row).
+        assert!(c.target_velocity[0] < 0.0, "along the wall kept: {c:?}");
         // Decays away once free.
         i.contact_normal = [0.0; 3];
         for _ in 0..200 {

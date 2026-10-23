@@ -49,3 +49,43 @@ fn a_car_needs_its_assembly_and_must_be_within_the_sphere() {
     assert!(query(&registry, &q(255)).unwrap().is_empty());
     assert!(Registry::new(vec![object(3, Provider::Vehicle, 2, 0.0)]).is_err(), "car records are type 1");
 }
+
+/// b334: the registry's duplicate-id check by set reports the same error as the old scan of the earlier ids, at the same
+/// object, also when another check fails first (an id 0 or a wrong record kind later or earlier in the list).
+#[test]
+fn registry_errors_match_the_old_duplicate_scan() {
+    fn old(objects: &[Object]) -> Result<(), &'static str> {
+        for (index, object) in objects.iter().enumerate() {
+            if object.id == 0 {
+                return Err("Interactable object ID zero is reserved for none");
+            }
+            for spline in &object.splines {
+                if matches!(object.provider, Provider::Vehicle) != (spline.descriptor.kind == 1) {
+                    return Err("Car grab records are type 1, others type 2");
+                }
+            }
+            if objects[..index].iter().any(|prior| prior.id == object.id) {
+                return Err("Duplicate authored interactable object ID");
+            }
+        }
+        Ok(())
+    }
+    let mut seed = 0x2545_F491_4F6C_DD1Du64;
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    for _ in 0..2000 {
+        let n = (next() % 8) as usize;
+        let objects: Vec<Object> = (0..n)
+            .map(|_| {
+                let id = (next() % 6) as u32;
+                // One in eight a car with a type 2 record (a wrong kind).
+                if next() % 8 == 0 { object(id.max(1), Provider::Vehicle, 2, 0.0) } else { object(id, Provider::LivingWorld, 2, 0.0) }
+            })
+            .collect();
+        assert_eq!(Registry::new(objects.clone()).map(|_| ()), old(&objects), "{:?}", objects.iter().map(|o| o.id).collect::<Vec<_>>());
+    }
+}

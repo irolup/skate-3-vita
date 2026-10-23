@@ -14,6 +14,7 @@
 //!
 //! Multiplayer: [`PluginProp`] and [`RefusalMemory`] are plain host-owned data; every roll takes the host's seeded RNG.
 
+use super::conversation::{Conversation, ConversationRow};
 use crate::living_world::{Rng, Vec3};
 
 /// Retail values; every field is data a mod can override.
@@ -32,12 +33,33 @@ pub struct PluginSettings {
     /// vector must be under this (`0x821DBCF0` 0.523599 rad = 30 degrees; the upper bound `0x822F9114` 5.75959 is the
     /// same cone on the other side). No distance limit.
     pub front_half_angle: f32,
+    /// NOT RETAIL (ours, user 2026-10-18): a moved prop with a seat in water (at most `water_max_depth` under a water
+    /// surface, or less than `water_above` over it) is switched off like a tipped one; back on once every seat is dry.
+    pub water_disables_seats: bool,
+    pub water_above: f32,
+    pub water_max_depth: f32,
 }
 
 impl Default for PluginSettings {
     fn default() -> Self {
-        Self { refusal_capacity: 16, refusal_value: 30.0, refusal_floor: -30.0, scan_period: 11, height_tolerance: 1.8, front_half_angle: 0.523_599 }
+        Self {
+            refusal_capacity: 16,
+            refusal_value: 30.0,
+            refusal_floor: -30.0,
+            scan_period: 11,
+            height_tolerance: 1.8,
+            front_half_angle: 0.523_599,
+            water_disables_seats: true,
+            water_above: 0.05,
+            water_max_depth: 10.0,
+        }
     }
+}
+
+/// Whether any of the seats is in water by `surface(seat, above, max_depth)` (a water surface over the point, see
+/// [`PluginSettings::water_disables_seats`]); `false` when the rule is off.
+pub fn seats_in_water(prop: &PluginProp, settings: &PluginSettings, mut surface: impl FnMut([f32; 3], f32, f32) -> Option<f32>) -> bool {
+    settings.water_disables_seats && prop.waypoints.iter().any(|w| surface(w.position, settings.water_above, settings.water_max_depth).is_some())
 }
 
 /// The plugin class a DMO hotpoint type makes (`82C4E128`); `None` for the root (0) and the skipped type (8).
@@ -131,12 +153,19 @@ impl TransferView {
         match name {
             "HasFirstWaypointAvailable" => first.is_some_and(|w| w.occupant.is_none()),
             "InFrontOfFirstWaypoint" => first.is_some_and(|w| in_front(w.position, w.facing, ped, s.front_half_angle)),
+            _ => self.ped_condition(name).unwrap_or(false),
+        }
+    }
+
+    /// The conditions that read only the ped; `None` for other names.
+    pub fn ped_condition(&self, name: &str) -> Option<bool> {
+        Some(match name {
             "HasHandProp" => self.hand_prop,
             "HasDisposableHandProp" => self.hand_prop && self.disposable,
             "CanSitWithHandProp" => !self.hand_prop || self.can_sit,
             "IsChasing" => self.chasing,
-            _ => false,
-        }
+            _ => return None,
+        })
     }
 }
 
@@ -296,20 +325,26 @@ impl RefusalMemory {
 
 /// `82E3B060`: does this ped take the offered prop? A prop it refused before is skipped; a refusal is remembered.
 pub fn ped_wants(odds: &[(String, f32)], prop: &PluginProp, memory: &mut RefusalMemory, s: &PluginSettings, rng: &mut Rng) -> bool {
-    if memory.contains(prop.id) {
+    ped_wants_offer(odds, prop.id, &prop.class, memory, s, rng)
+}
+
+/// `ped_wants` for any offer by its refusal key and plugin class (a prop, or a conversation area).
+pub fn ped_wants_offer(odds: &[(String, f32)], key: u64, class: &str, memory: &mut RefusalMemory, s: &PluginSettings, rng: &mut Rng) -> bool {
+    if memory.contains(key) {
         return false;
     }
-    let p = odds_for(odds, &prop.class);
-    if roll_percent(p, rng) {
+    if roll_percent(odds_for(odds, class), rng) {
         return true;
     }
-    memory.remember(prop.id, s);
+    memory.remember(key, s);
     false
 }
 
 /// A ped as the offer scan sees it.
 pub struct OfferPed<'a> {
     pub id: u64,
+    /// Entity type (a conversation row's participant key).
+    pub entity: &'a str,
     pub position: Vec3,
     /// Participant slot 4: the ped's current plugin.
     pub has_plugin: bool,
@@ -361,6 +396,56 @@ pub fn offer(prop: &mut PluginProp, radius: f32, max_participants: u32, peds: &m
         }
     }
     out
+}
+
+/// The plugin class of a spawned conversation area (its descriptor, offer radius and `plugin_odds` key).
+pub const CONVERSATION_CLASS: &str = "waypoint_conversation";
+
+/// A conversation area's refusal key, apart from prop ids (which are 64-bit hashes; area ids count up from 1).
+pub fn conversation_key(id: u64) -> u64 {
+    0xC0_0000_0000_0000 | id
+}
+
+/// The conversation transfer conditions (`ConversationIsGatheringMembers` `8269CE40` = vf4,
+/// `EntityAllowedToJoinConversation` `8269CD70` = vf8); `None` for other names.
+pub fn conversation_condition(name: &str, c: &Conversation, entity: &str, rows: &[ConversationRow]) -> Option<bool> {
+    match name {
+        "ConversationIsGatheringMembers" => Some(c.is_gathering()),
+        "EntityAllowedToJoinConversation" => Some(c.allowed_to_join(entity, rows)),
+        _ => None,
+    }
+}
+
+/// The conversation descriptor's transfer expression for a ped: the two conversation conditions, then the ped's own
+/// (`IsChasing`, hand props); other names answer false. No expression: every ped qualifies.
+pub fn conversation_qualifies(transfer: Option<&Transfer>, c: &Conversation, entity: &str, view: TransferView, rows: &[ConversationRow]) -> bool {
+    transfer.is_none_or(|t| t.evaluate(&mut |name, _| conversation_condition(name, c, entity, rows).or_else(|| view.ped_condition(name)).unwrap_or(false)))
+}
+
+/// A conversation area offered to one ped (`826BFE18` with the conversation offer `0x8232B798`, b212): a ped without a
+/// plugin, not refusing the area, within `height_tolerance` vertically and `radius` horizontally of its centre, passing
+/// the descriptor's transfer expression (`qualifies`) and its `plugin_odds` roll for [`CONVERSATION_CLASS`] attaches
+/// (`82E1BF00`); the add (`82E1D380`) can still turn it away. Used by the scan for passers-by and by the spawner for
+/// the founders (`826A6CD8`). Joining remembers the area like a prop.
+#[allow(clippy::too_many_arguments)]
+pub fn offer_conversation(c: &mut Conversation, radius: f32, ped: &mut OfferPed, qualifies: &mut dyn FnMut(&Conversation, &OfferPed) -> bool, rows: &[ConversationRow], s: &PluginSettings, rng: &mut Rng) -> bool {
+    let key = conversation_key(c.id);
+    if ped.has_plugin || ped.memory.contains(key) {
+        return false;
+    }
+    let (dx, dy, dz) = (c.center[0] - ped.position[0], c.center[1] - ped.position[1], c.center[2] - ped.position[2]);
+    if dy.abs() >= s.height_tolerance || dx * dx + dz * dz >= radius * radius {
+        return false;
+    }
+    if !qualifies(c, ped) || !ped_wants_offer(ped.odds, key, CONVERSATION_CLASS, ped.memory, s, rng) {
+        return false;
+    }
+    if !c.join(ped.id, ped.entity, rows) {
+        return false;
+    }
+    ped.has_plugin = true;
+    ped.memory.remember(key, s);
+    true
 }
 
 /// `826B90F8`'s pick: candidates (ped type index, group weight, the type's odds for the prop class); weight =
@@ -419,6 +504,24 @@ mod tests {
     fn bench() -> PluginProp {
         let w = |x: f32| PluginWaypoint { position: [x, 0.0, 0.0], facing: [0.0, 0.0, 1.0], occupant: None };
         PluginProp { id: 7, class: "waypoint_sit".into(), waypoints: vec![w(0.0), w(1.0)], cooldown: 0.0, cooldown_reset: 10.0, disabled: false }
+    }
+
+    /// Ours (user 2026-10-18): one seat in water switches the bench off; the query gets the settings' depths; the rule
+    /// can be switched off.
+    #[test]
+    fn a_seat_in_water_switches_the_bench_off() {
+        let s = PluginSettings::default();
+        let dry = |_: [f32; 3], _: f32, _: f32| None;
+        assert!(!seats_in_water(&bench(), &s, dry));
+        let mut asked = Vec::new();
+        let second_wet = |p: [f32; 3], above: f32, depth: f32| {
+            asked.push((above, depth));
+            (p[0] > 0.5).then_some(0.4)
+        };
+        assert!(seats_in_water(&bench(), &s, second_wet));
+        assert_eq!(asked[0], (0.05, 10.0));
+        let off = PluginSettings { water_disables_seats: false, ..s };
+        assert!(!seats_in_water(&bench(), &off, |_, _, _| Some(0.0)));
     }
 
     #[test]
@@ -512,16 +615,45 @@ mod tests {
         let yes = vec![("waypoint_sit".to_string(), 1.0)];
         let (mut m1, mut m2, mut m3, mut m4) = (RefusalMemory::default(), RefusalMemory::default(), RefusalMemory::default(), RefusalMemory::default());
         let mut peds = vec![
-            OfferPed { id: 1, position: [0.0, 2.0, 0.0], has_plugin: false, odds: &yes, memory: &mut m1 },
-            OfferPed { id: 2, position: [20.0, 0.0, 0.0], has_plugin: false, odds: &yes, memory: &mut m2 },
-            OfferPed { id: 3, position: [0.5, 0.0, 1.0], has_plugin: true, odds: &yes, memory: &mut m3 },
-            OfferPed { id: 4, position: [1.2, 0.0, 1.0], has_plugin: false, odds: &yes, memory: &mut m4 },
+            OfferPed { id: 1, entity: "a", position: [0.0, 2.0, 0.0], has_plugin: false, odds: &yes, memory: &mut m1 },
+            OfferPed { id: 2, entity: "a", position: [20.0, 0.0, 0.0], has_plugin: false, odds: &yes, memory: &mut m2 },
+            OfferPed { id: 3, entity: "a", position: [0.5, 0.0, 1.0], has_plugin: true, odds: &yes, memory: &mut m3 },
+            OfferPed { id: 4, entity: "a", position: [1.2, 0.0, 1.0], has_plugin: false, odds: &yes, memory: &mut m4 },
         ];
         let got = offer(&mut b, 10.0, 2, &mut peds, &mut |_, _| true, &s, &mut rng);
         // 1: 2 m above (over 1.8); 2: 20 m away; 3: already in a plugin; 4 takes the nearest seat (x = 1).
         assert_eq!(got, vec![Attach { ped: 4, prop: 7, waypoint: 1 }]);
         assert_eq!(b.waypoints[1].occupant, Some(4));
         assert!(peds[3].has_plugin && peds[3].memory.contains(7));
+    }
+
+    #[test]
+    fn a_passer_by_joins_a_gathering_conversation_through_the_offer() {
+        use super::super::conversation::ConversationParams;
+        let rows = vec![ConversationRow { name: "r".into(), participants: vec!["a".into(), "b".into(), "a".into()], values: vec![] }];
+        let s = PluginSettings::default();
+        let mut rng = Rng::new(1);
+        let mut half = || 0.5f32;
+        let mut c = Conversation::new(5, Some([0.0; 3]), vec![0], &ConversationParams::default(), None, &mut half);
+        assert!(c.join(1, "a", &rows) && c.join(2, "b", &rows));
+        let yes = vec![(CONVERSATION_CLASS.to_string(), 1.0)];
+        let (mut m3, mut m4, mut m5, mut m6) = Default::default();
+        let mut peds = [
+            OfferPed { id: 3, entity: "a", position: [0.0, 2.0, 5.0], has_plugin: false, odds: &yes, memory: &mut m3 },
+            OfferPed { id: 4, entity: "a", position: [21.0, 0.0, 0.0], has_plugin: false, odds: &yes, memory: &mut m4 },
+            OfferPed { id: 5, entity: "b", position: [5.0, 0.0, 0.0], has_plugin: false, odds: &yes, memory: &mut m5 },
+            OfferPed { id: 6, entity: "a", position: [19.0, 0.5, 0.0], has_plugin: false, odds: &yes, memory: &mut m6 },
+        ];
+        // The stock transfer: ConversationIsGatheringMembers and EntityAllowedToJoinConversation and not IsChasing.
+        let c_ = |n: &str| Transfer::Condition { name: n.into(), params: Vec::new() };
+        let transfer = Transfer::And(vec![c_("ConversationIsGatheringMembers"), c_("EntityAllowedToJoinConversation"), Transfer::Not(vec![c_("IsChasing")])]);
+        let mut qualifies = |c: &Conversation, p: &OfferPed| conversation_qualifies(Some(&transfer), c, p.entity, TransferView::default(), &rows);
+        let joined: Vec<u64> = peds.iter_mut().filter_map(|p| offer_conversation(&mut c, 20.0, p, &mut qualifies, &rows, &s, &mut rng).then_some(p.id)).collect();
+        // 3: 2 m above; 4: 21 m away; 5: no b slot left; 6 takes the last a slot.
+        assert_eq!(joined, vec![6]);
+        assert_eq!(c.members.len(), 3);
+        assert!(peds[3].has_plugin && peds[3].memory.contains(conversation_key(5)));
+        assert!(!peds[2].memory.contains(conversation_key(5)), "a misfit is not refused, only not offered");
     }
 
     #[test]

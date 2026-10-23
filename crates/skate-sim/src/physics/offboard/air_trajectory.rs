@@ -111,7 +111,7 @@ pub(crate) fn launch(
             );
             let edges = cache.with_primary_edges(|vehicle_edges| {
                 super::ground_query::with_world_scene(
-                    &physics.world,
+                    physics.biped_world(),
                     vehicle_edges,
                     &[],
                     |scene| scene.edge_candidates(&search),
@@ -158,7 +158,7 @@ pub(crate) fn launch(
             );
             let mut hits = cache.with_primary_edges(|vehicle_edges| {
                 super::ground_query::with_world_scene(
-                    &physics.world,
+                    physics.biped_world(),
                     vehicle_edges,
                     &[],
                     |scene| scene.query_lines(&packet),

@@ -6,6 +6,7 @@ uniform float4x4 viewproj;
 uniform float4x4 bones[40];
 uniform float3 lightDir; // unit vector towards the light
 uniform float2 light;    // ambient, diffuse
+uniform float2 gradeDepth; // the grade's near distance and 1 / (far - near)
 
 void main(
 	float3 aPosition,
@@ -29,6 +30,7 @@ void main(
 	               + mul(n, b2) * aWeights.z + mul(n, b3) * aWeights.w).xyz;
 	gl_Position = mul(float4(world.xyz, 1.0f), viewproj);
 	float lit = light.x + light.y * max(dot(normalize(normal), lightDir), 0.0f);
-	vColor = float4(lit, lit, lit, 1.0f);
+	// The alpha carries the grade's depth weight (no fragment shader reads the lighting alpha).
+	vColor = float4(lit, lit, lit, saturate((gl_Position.w - gradeDepth.x) * gradeDepth.y));
 	vTexcoord = aTexcoord;
 }

@@ -2,7 +2,7 @@
 //! game draws the Xbox glyphs natively): anti-aliased RGBA textures made here, drawn through the
 //! movie renderer in the slots' place. Original art (circles and lines), nothing from Skate 3.
 #![cfg_attr(not(target_os = "vita"), allow(dead_code))]
-use skate_ui::apt_scene::{Draw, Vertex};
+use skate_ui::fe::apt_scene::{Draw, Vertex};
 
 /// Texture side in pixels.
 pub const SIZE: u32 = 64;
@@ -114,7 +114,7 @@ pub fn draw(icon: Icon, x: f32, y: f32, side: f32) -> Draw {
     let v = |px: f32, py: f32, u: f32, w: f32| Vertex { position: [px, py], uv: [u, w] };
     Draw {
         texture: icon.key().to_owned(),
-        size: [SIZE, SIZE],
+        fill: skate_ui::fe::apt_scene::Fill::TextureClamped,
         vertices: vec![
             v(x - h, y - h, 0.0, 0.0),
             v(x + h, y - h, 1.0, 0.0),

@@ -75,10 +75,6 @@ fn main() -> ExitCode {
         Some("ui-render") if args.len() >= 4 => ui_render(&args[1], &args[2], &args[3], args.get(4).and_then(|n| n.parse().ok()).unwrap_or(60)),
         Some("ui-analyzer") if args.len() >= 5 => ui_analyzer(&args[1], &args[2], &args[3], &args[4]),
         Some("ui-meter") if args.len() >= 5 => ui_meter(&args[1], &args[2], &args[3], &args[4]),
-        Some("ui-replay-help") if args.len() >= 5 => ui_replay_help(&args[1], &args[2], &args[3], &args[4]),
-        Some("ui-popup") if args.len() >= 4 => ui_popup(&args[1], &args[2], &args[3]),
-        Some("ui-replay") if args.len() >= 5 => ui_replay(&args[1], &args[2], &args[3], &args[4]),
-        Some("ui-crossbar") if args.len() >= 5 => ui_crossbar(&args[1], &args[2], &args[3], &args[4]),
         Some("compare") if args.len() >= 3 => compare(&args[1], &args[2], &args[3..]),
         Some("states") if args.len() == 2 => states(Path::new(&args[1])),
         Some("check-assets") if (2..=3).contains(&args.len()) => {
@@ -317,7 +313,7 @@ fn hud_trace(assets: &str, scenarios: &str, out: &str) -> Result<bool, String> {
         &std::fs::read(Path::new(assets).join("private/hud/runtime/trickdisplay.json")).map_err(io)?,
     )
     .map_err(|e| e.to_string())?;
-    let shapes: skate_ui::apt_scene::Shapes = serde_json::from_value(json["shapes"].clone()).map_err(|e| e.to_string())?;
+    let shapes: skate_ui::fe::apt_scene::Shapes = serde_json::from_value(json["shapes"].clone()).map_err(|e| e.to_string())?;
     let to_input = |f: &skate_sim::live::HudFeed| Input {
         sequence_score: f.sequence_score,
         line_score: f.line_score,
@@ -330,11 +326,11 @@ fn hud_trace(assets: &str, scenarios: &str, out: &str) -> Result<bool, String> {
         stance: f.stance,
         trick_name: f.trick_name.clone(),
         trick_metrics: [
-            skate_ui::apt_vm::Value::Text(f.trick_name.clone()),
-            skate_ui::apt_vm::Value::Bool(false),
-            skate_ui::apt_vm::Value::Bool(false),
-            skate_ui::apt_vm::Value::Bool(false),
-            skate_ui::apt_vm::Value::Bool(false),
+            skate_ui::fe::apt_vm::Value::Text(f.trick_name.clone()),
+            skate_ui::fe::apt_vm::Value::Bool(false),
+            skate_ui::fe::apt_vm::Value::Bool(false),
+            skate_ui::fe::apt_vm::Value::Bool(false),
+            skate_ui::fe::apt_vm::Value::Bool(false),
         ],
         context_tricks: Vec::new(),
     };
@@ -360,7 +356,7 @@ fn hud_trace(assets: &str, scenarios: &str, out: &str) -> Result<bool, String> {
             let feed = session.hud_feed();
             pulses += u32::from(feed.new_trick || feed.modified_trick || feed.close_tricks);
             runtime.update(to_input(&feed), feed.new_trick, feed.modified_trick, feed.close_tricks)?;
-            let draws = skate_ui::apt_scene::draw(&runtime.bindings.movie, &runtime.vm, &shapes)?;
+            let draws = skate_ui::fe::apt_scene::draw(&runtime.bindings.movie, &runtime.vm, &shapes)?;
             max_draws = max_draws.max(draws.len());
             for (&id, instance) in &runtime.bindings.movie.instances {
                 let character = &runtime.bindings.movie.characters[&instance.character];
@@ -391,8 +387,8 @@ fn hud_trace(assets: &str, scenarios: &str, out: &str) -> Result<bool, String> {
 /// dark background) so the look can be checked without a device. Textures are read from
 /// ROOT (the prepare output folder) by the paths the movie names.
 fn ui_render(path: &str, root: &str, out: &str, frames: usize) -> Result<bool, String> {
-    use skate_ui::apt_scene::{self, Shapes};
-    use skate_ui::apt_vm::{Value, Vm};
+    use skate_ui::fe::apt_scene::{self, Shapes};
+    use skate_ui::fe::apt_vm::{Value, Vm};
     use skate_ui::menu_runtime::{MenuRuntime, Natives};
     use std::collections::HashMap;
 
@@ -491,21 +487,31 @@ fn ui_render(path: &str, root: &str, out: &str, frames: usize) -> Result<bool, S
         runtime.update()?;
     }
     let draws = apt_scene::draw(&runtime.bindings.movie, &runtime.vm, &shapes)?;
-    rasterize(&draws, root, out)
+    rasterize(&draws, &json, root, out)
 }
 
 /// Rasterizes draw batches to a 960 x 544 PNG with the Vita shader's maths (see `ui_render`).
-fn rasterize(draws: &[skate_ui::apt_scene::Draw], root: &str, out: &str) -> Result<bool, String> {
-    use skate_ui::apt_scene;
+fn rasterize(draws: &[skate_ui::fe::apt_scene::Draw], json: &serde_json::Value, root: &str, out: &str) -> Result<bool, String> {
+    use skate_ui::fe::apt_scene;
     use std::collections::HashMap;
+    // The textures' sizes: the movie's shape atlases and its fonts (the draws name only the path).
+    let mut sizes: HashMap<String, [u32; 2]> = HashMap::new();
+    let shapes: apt_scene::Shapes = serde_json::from_value(json["shapes"].clone()).map_err(|e| e.to_string())?;
+    for t in shapes.values().flatten().filter_map(|s| s.texture.as_ref()) {
+        sizes.insert(t.rgba.clone(), [t.width, t.height]);
+    }
+    for font in skate_ui::fe::apt_movie::Movie::load(json)?.text_assets.fonts.values() {
+        sizes.insert(font.texture.clone(), font.size);
+    }
     // Textures by the paths the draws name.
     let mut textures: HashMap<String, (usize, usize, Vec<u8>)> = HashMap::new();
     textures.insert("white".into(), (1, 1, vec![255; 4]));
     for d in draws {
+        let Some(size) = sizes.get(&d.texture).copied() else { continue };
         if !textures.contains_key(&d.texture) {
             match std::fs::read(Path::new(root).join(&d.texture)) {
-                Ok(bytes) if bytes.len() == d.size[0] as usize * d.size[1] as usize * 4 => {
-                    textures.insert(d.texture.clone(), (d.size[0] as usize, d.size[1] as usize, bytes));
+                Ok(bytes) if bytes.len() == size[0] as usize * size[1] as usize * 4 => {
+                    textures.insert(d.texture.clone(), (size[0] as usize, size[1] as usize, bytes));
                 }
                 other => eprintln!("texture {}: {:?}", d.texture, other.map(|b| b.len())),
             }
@@ -573,75 +579,6 @@ fn rasterize(draws: &[skate_ui::apt_scene::Draw], root: &str, out: &str) -> Resu
     Ok(true)
 }
 
-/// The crossbar (`skate_ui::crossbar`) with a sample menu model, driven by EVENTS (M9): the
-/// events are applied in order with 30 frames after each, their outcomes are printed and
-/// the final frame is rendered.
-fn ui_crossbar(path: &str, root: &str, out: &str, events: &str) -> Result<bool, String> {
-    use skate_ui::crossbar::{Action, Crossbar, Event, MenuDef, OptionDef};
-    let option = |name: &str, icon: &'static str, help: &str, action: Action, values: &[&str], current: usize| OptionDef {
-        name: name.to_owned(),
-        icon,
-        help: help.to_owned(),
-        action,
-        values: values.iter().map(|v| (*v).to_owned()).collect(),
-        current,
-    };
-    let menus = vec![
-        MenuDef {
-            name: "SKATE",
-            icon: "singleplayer",
-            options: vec![
-                option("Resume", "freeskate", "Back to the park.", Action::Resume, &[], 0),
-                option("Respawn", "restart", "Return to the park's spawn point.", Action::Respawn, &[], 0),
-                option("Park", "skatepark", "Choose where to skate.", Action::Park, &["Course", "StartPark", "MegaPark", "BlackBoxPark", "IndustrialSkatePark", "DownTownSkatePark", "MaloofMoneyCup", "SkateSchool"], 3),
-                option("Difficulty", "settings", "How forgiving the board is.", Action::Difficulty, &["Easy", "Normal", "Hardcore"], 1),
-                option("Quit", "quit", "Leave the game.", Action::Quit, &[], 0),
-            ],
-        },
-        MenuDef {
-            name: "LEARN",
-            icon: "learn",
-            options: vec![
-                option("Controls", "trickguide", "Buttons and what they do.", Action::Controls, &[], 0),
-                option("Stick calibration", "onscreenhelp", "Check the sticks.", Action::Calibration, &[], 0),
-            ],
-        },
-        MenuDef {
-            name: "OPTIONS",
-            icon: "options",
-            options: vec![
-                option("Volume", "settings", "Sound level.", Action::Volume, &["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"], 8),
-                option("Debug overlay", "view", "Frame rate and timing.", Action::DebugHud, &["Off", "On"], 0),
-            ],
-        },
-    ];
-    let json: serde_json::Value = serde_json::from_slice(&std::fs::read(path).map_err(|e| format!("{path}: {e}"))?).map_err(|e| e.to_string())?;
-    let mut crossbar = Crossbar::load(&json, menus.clone())?;
-    println!("loaded: {} instances", crossbar.runtime.bindings.movie.instances.len());
-    crossbar.open(menus, 0, 0).map_err(|e| format!("open: {e} ({} instances)", crossbar.runtime.bindings.movie.instances.len()))?;
-    for _ in 0..90 {
-        crossbar.update()?;
-    }
-    for name in events.split(',').filter(|e| !e.is_empty()) {
-        let event = match name {
-            "Left" => Event::Left,
-            "Right" => Event::Right,
-            "Up" => Event::Up,
-            "Down" => Event::Down,
-            "Accept" => Event::Accept,
-            "Back" => Event::Back,
-            other => return Err(format!("unknown event {other}")),
-        };
-        let outcome = crossbar.event(event)?;
-        for _ in 0..30 {
-            crossbar.update()?;
-        }
-        println!("{name:<7} -> {outcome:?}   cursor {:?}  picker {}", crossbar.cursor(), crossbar.in_picker());
-    }
-    let draws = crossbar.draw()?;
-    rasterize(&draws, root, out)
-}
-
 fn ui_analyzer(path: &str, root: &str, out: &str, trick: &str) -> Result<bool, String> {
     let json: serde_json::Value = serde_json::from_slice(&std::fs::read(path).map_err(|e| format!("{path}: {e}"))?).map_err(|e| e.to_string())?;
     let mut analyzer = skate_ui::analyzer::TrickAnalyzer::load(&json)?;
@@ -653,232 +590,7 @@ fn ui_analyzer(path: &str, root: &str, out: &str, trick: &str) -> Result<bool, S
     for d in &draws {
         println!("  {} {:?} mul {:?}", d.texture, d.vertices.first().map(|v| v.position), d.multiply);
     }
-    rasterize(&draws, root, out)
-}
-
-/// The retail list popup with the replay editor's Finished options, the second selected.
-fn ui_popup(path: &str, root: &str, out: &str) -> Result<bool, String> {
-    let json: serde_json::Value = serde_json::from_slice(&std::fs::read(path).map_err(|e| format!("{path}: {e}"))?).map_err(|e| e.to_string())?;
-    let mut popup = skate_ui::popup::Popup::load(&json)?;
-    popup.open(["ID_REPLAYEDITOR_UPLOAD", "ID_REPLAYEDITOR_BASIC_SAVE_REPLAY", "ID_REPLAYEDITOR_EXIT"].map(String::from).to_vec(), "")?;
-    for _ in 0..30 {
-        popup.update()?;
-    }
-    for (name, b) in popup.glyphs() {
-        println!("glyph {name} {b:?}");
-    }
-    {
-        use skate_ui::apt_vm::Value;
-        let vm = &popup.runtime.vm;
-        let root = popup.runtime.bindings.movie.root;
-        println!("root vis {:?} alpha {:?} frame {:?}", vm.get(root, "_visible"), vm.get(root, "_alpha"), vm.get(root, "_currentframe"));
-        if let Value::Object(panel) = vm.get(root, "mcPanel") {
-            println!("panel x {:?} y {:?} alpha {:?} vis {:?} frame {:?}", vm.get(panel, "_x"), vm.get(panel, "_y"), vm.get(panel, "_alpha"), vm.get(panel, "_visible"), vm.get(panel, "_currentframe"));
-            if let Value::Object(fb) = vm.get(panel, "mFrameBottom") {
-                if let Value::Object(b) = vm.get(fb, "mButtons") {
-                    println!("mButtons x {:?} y {:?} vis {:?} alpha {:?} count {:?}", vm.get(b, "_x"), vm.get(b, "_y"), vm.get(b, "_visible"), vm.get(b, "_alpha"), vm.get(b, "mItemCount"));
-                    for k in ["mButton0", "mButton1", "mText0", "mText1"] {
-                        if let Value::Object(o) = vm.get(b, k) {
-                            println!("   {k}: x {:?} y {:?} vis {:?} w {:?} img {:?} text {:?}", vm.get(o, "_x"), vm.get(o, "_y"), vm.get(o, "_visible"), vm.get(o, "_width"), vm.get(o, "mButtonImage"), vm.get(o, "text"));
-                        }
-                    }
-                }
-            }
-            if let Value::Object(p) = vm.get(panel, "mMenuPicker") {
-                let mut keys: Vec<String> = vm.objects[p].fields.iter().map(|(k, v)| format!("{k}={}", match v { Value::Object(_) => "{}".to_owned(), v => format!("{v:?}") })).collect();
-                keys.sort();
-                println!("picker fields: {}", keys.join(" "));
-                let mv = &popup.runtime.bindings.movie;
-                println!("picker display children: {}", mv.instances.get(&p).map_or(0, |i| i.children.len()));
-            }
-            for k in ["mFrameTop", "mFrameBottom", "mMenuPicker", "body"] {
-                if let Value::Object(o) = vm.get(panel, k) {
-                    println!("  {k}: x {:?} y {:?} alpha {:?} vis {:?}", vm.get(o, "_x"), vm.get(o, "_y"), vm.get(o, "_alpha"), vm.get(o, "_visible"));
-                }
-            }
-        }
-    }
-    let draws = popup.draw()?;
-    println!("{} batches", draws.len());
-    rasterize(&draws, root, out)
-}
-
-/// The retail replay help for an editor mode number (0 instant, 1 main, 2 effects, 6 free camera).
-fn ui_replay_help(path: &str, root: &str, out: &str, mode: &str) -> Result<bool, String> {
-    let json: serde_json::Value = serde_json::from_slice(&std::fs::read(path).map_err(|e| format!("{path}: {e}"))?).map_err(|e| e.to_string())?;
-    let mut help = skate_ui::replay_editor::ReplayHelp::load(&json)?;
-    for _ in 0..30 {
-        help.update()?;
-    }
-    help.open(mode.parse().map_err(|_| "bad mode")?)?;
-    for _ in 0..30 {
-        help.update()?;
-    }
-    {
-        use skate_ui::apt_vm::Value;
-        let mv = &help.runtime.bindings.movie;
-        let vm = &help.runtime.vm;
-        for (&id, inst) in &mv.instances {
-            for key in ["_x", "_y", "_xscale", "_yscale", "_alpha", "_width", "_height"] {
-                if let Value::Number(n) = vm.get(id, key) {
-                    if !n.is_finite() {
-                        println!("NONFINITE id {id} char {} {key}={n}", inst.character);
-                    }
-                }
-            }
-        }
-    }
-    for (name, b) in help.glyphs() {
-        println!("glyph {name} {b:?}");
-    }
-    let draws = help.draw()?;
-    println!("{} batches", draws.len());
-    rasterize(&draws, root, out)
-}
-
-/// The retail replay editor in a mode (`scrub`, `main`, `effects`) with the playhead at 40 % and the clip trimmed to 20..80 %.
-fn ui_replay(path: &str, root: &str, out: &str, mode: &str) -> Result<bool, String> {
-    use skate_ui::replay_editor::{ReplayEditor, state};
-    let json: serde_json::Value = serde_json::from_slice(&std::fs::read(path).map_err(|e| format!("{path}: {e}"))?).map_err(|e| e.to_string())?;
-    let mut editor = ReplayEditor::load(&json)?;
-    editor.intro()?;
-    for _ in 0..60 {
-        editor.update()?;
-    }
-    println!("ready: {}", editor.model().ready);
-    let m = editor.model();
-    (m.cursor, m.start, m.end, m.length) = (0.4, 0.2, 0.8, "0:36".into());
-    m.instant = mode == "scrub";
-    if mode != "none" {
-        editor.set_state(match mode {
-            "main" => state::MAIN_EDIT,
-            "effects" => state::EFFECTS,
-            "scrub" => state::SCRUB,
-            number => number.parse().map_err(|_| format!("unknown mode {number}"))?,
-        })?;
-    }
-    for s in [state::MOVE_PLAYHEAD, state::MOVE_START, state::MOVE_END] {
-        editor.set_state(s)?;
-    }
-    for _ in 0..std::env::var("FRAMES").ok().and_then(|v| v.parse().ok()).unwrap_or(40) {
-        editor.update()?;
-    }
-    {
-        use skate_ui::apt_vm::Value;
-        let vm = &editor.runtime.vm;
-        let cls = vm.get(vm.global, "replay_editor2");
-        if let Value::Object(c) = cls {
-            if let Value::Object(screen) = vm.get(c, "mScreen") {
-                println!("mScreen visible {:?} alpha {:?}", vm.get(screen, "_visible"), vm.get(screen, "_alpha"));
-                if let Value::Object(r) = vm.get(screen, "mReplay") {
-                    for (k, v) in &vm.objects[r].fields {
-                        if let Value::Object(o) = v {
-                            if k.starts_with('_') || k == "prototype" {
-                                continue;
-                            }
-                            println!("  {k}: x {:?} y {:?} vis {:?} alpha {:?} frame {:?}", vm.get(*o, "_x"), vm.get(*o, "_y"), vm.get(*o, "_visible"), vm.get(*o, "_alpha"), vm.get(*o, "_currentframe"));
-                        }
-                    }
-                    let mv = &editor.runtime.bindings.movie;
-                    let inst = &mv.instances[&r];
-                    println!("mReplay display children {} character {} frames {}", inst.children.len(), inst.character, mv.characters[&inst.character].frames.len());
-                    for (d, c) in &inst.children {
-                        let ci = &mv.instances[c];
-                        println!("   depth {d}: instance {c} char {} type {} children {}", ci.character, mv.characters[&ci.character].type_name, ci.children.len());
-                    }
-                    {
-                        fn walk(mv: &skate_ui::apt_movie::Movie, vm: &skate_ui::apt_vm::Vm, id: usize, path: &str, depth: usize, stats: &mut [usize; 4], a: f32) {
-                            let inst = &mv.instances[&id];
-                            stats[0] += 1;
-                            if mv.characters[&inst.character].type_name == "shape" {
-                                stats[1] += 1;
-                            }
-                            if !vm.get(id, "_visible").truth() {
-                                stats[2] += 1;
-                                if depth < 3 {
-                                    println!("   hidden: {path}");
-                                }
-                                return;
-                            }
-                            if vm.get(id, "_alpha").number() <= 0.0 {
-                                stats[3] += 1;
-                                if depth < 3 {
-                                    println!("   alpha0: {path}");
-                                }
-                                return;
-                            }
-                            let a = a * (vm.get(id, "_alpha").number() as f32 / 100.0) * inst.placement.as_ref().map_or(1.0, |p| p.color[0] as f32 / 255.0);
-                            for key in ["_x", "_y", "_xscale", "_yscale"] {
-                                if let skate_ui::apt_vm::Value::Number(n) = vm.get(id, key) {
-                                    if !n.is_finite() {
-                                        println!("   NONFINITE {path} char {} {key}={n}", inst.character);
-                                    }
-                                }
-                            }
-                            if depth <= 2 && path.starts_with("root/3") {
-                                println!("   NODE {path} a={a} _alpha={:?} place={:?}", vm.get(id, "_alpha"), inst.placement.as_ref().map(|p| p.color));
-                            }
-                            if depth <= 2 && path.starts_with("root/3") {
-                                println!("   NODE {path} a={a} _alpha={:?} place={:?}", vm.get(id, "_alpha"), inst.placement.as_ref().map(|p| p.color));
-                            }
-                            if mv.characters[&inst.character].type_name == "shape" && stats[1] < 400 {
-                                if a > 0.0 {
-                                    stats[3] += 0;
-                                    println!("   SHAPE visible {path} a={a}");
-                                }
-                            }
-                            for (d, c) in &inst.children {
-                                walk(mv, vm, *c, &format!("{path}/{d}"), depth + 1, stats, a);
-                            }
-                        }
-                        let mut stats = [0; 4];
-                        walk(mv, vm, mv.root, "root", 0, &mut stats, 1.0);
-                        println!("   mReplay id {r}, screen id {screen}, root {}", mv.root);
-                        for (d, c) in &mv.instances[&screen].children {
-                            println!("   mScreen child depth {d}: {c} char {}", mv.instances[c].character);
-                        }
-                        println!("   walk: instances {} shapes {} hidden {} alpha0 {}", stats[0], stats[1], stats[2], stats[3]);
-                    }
-                    println!("mReplay y {:?} frame {:?} alpha {:?} visible {:?}", vm.get(r, "_y"), vm.get(r, "_currentframe"), vm.get(r, "_alpha"), vm.get(r, "_visible"));
-                }
-            }
-        }
-    }
-    for (c, st, en) in [(0.0f32, 0.0f32, 1.0f32), (1.0, 0.0, 1.0), (0.5, 0.25, 0.75)] {
-        let m = editor.model();
-        (m.cursor, m.start, m.end) = (c, st, en);
-        for state in [state::MOVE_PLAYHEAD, state::MOVE_START, state::MOVE_END] {
-            editor.set_state(state)?;
-        }
-        println!("cursor {c} start {st} end {en}: playhead/in/out stage x {:?}", editor.timeline_positions());
-    }
-    for (name, b) in editor.glyphs() {
-        println!("glyph {name} {b:?}");
-    }
-    {
-        use skate_ui::apt_vm::Value;
-        let vm = &editor.runtime.vm;
-        if let Value::Object(c) = vm.get(vm.global, "replay_editor2") {
-            if let Value::Object(screen) = vm.get(c, "mScreen") {
-                if let Value::Object(r) = vm.get(screen, "mReplay") {
-                    for name in ["mcStart", "mcEnd", "mcPlay", "mcCamZoom", "mcCamUpDown"] {
-                        if let Value::Object(clip) = vm.get(r, name) {
-                            let item = match vm.get(clip, "mButtonItem") { Value::Object(i) => Some(i), _ => None };
-                            println!("{name}: x {:?} y {:?} alpha {:?} vis {:?}; item {:?} x {:?} y {:?} image {:?} vis {:?}", vm.get(clip, "_x"), vm.get(clip, "_y"), vm.get(clip, "_alpha"), vm.get(clip, "_visible"), item, item.map(|i| vm.get(i, "_x")), item.map(|i| vm.get(i, "_y")), item.map(|i| vm.get(i, "mButtonImage")), item.map(|i| vm.get(i, "_visible")));
-                        }
-                    }
-                }
-            }
-        }
-    }
-    let draws = editor.draw()?;
-    for d in draws.iter().filter(|d| d.texture == "white") {
-        let xs = d.vertices.iter().map(|v| v.position[0]);
-        let ys = d.vertices.iter().map(|v| v.position[1]);
-        println!("WHITE x {:.0}..{:.0} y {:.0}..{:.0} mul {:?} add {:?}", xs.clone().fold(1e9, f32::min), xs.fold(-1e9, f32::max), ys.clone().fold(1e9, f32::min), ys.fold(-1e9, f32::max), d.multiply, d.add);
-    }
-    println!("{} batches", draws.len());
-    rasterize(&draws, root, out)
+    rasterize(&draws, &json, root, out)
 }
 
 fn ui_meter(path: &str, root: &str, out: &str, values: &str) -> Result<bool, String> {
@@ -892,14 +604,14 @@ fn ui_meter(path: &str, root: &str, out: &str, values: &str) -> Result<bool, Str
     }
     let draws = meter.draw()?;
     println!("{} batches", draws.len());
-    rasterize(&draws, root, out)
+    rasterize(&draws, &json, root, out)
 }
 
 /// Runs a linked front-end screen (`tools/link_ui_screen.py`) in `skate_ui::menu_runtime`
 /// with a host that records every native call and answers `undefined` (M9: sizing the
 /// menu work; the native objects named by NATIVES, comma separated, are defined).
 fn ui_probe(path: &str, frames: usize) -> Result<bool, String> {
-    use skate_ui::apt_vm::{ObjectKind, Value, Vm};
+    use skate_ui::fe::apt_vm::{ObjectKind, Value, Vm};
     use skate_ui::menu_runtime::{MenuRuntime, Natives};
     use std::collections::BTreeMap;
 
@@ -946,7 +658,7 @@ fn ui_probe(path: &str, frames: usize) -> Result<bool, String> {
             .map(|(k, v)| match v {
                 Value::Object(f) if matches!(vm.objects[*f].kind, ObjectKind::Function(_)) => format!("{k}()"),
                 Value::Object(_) => format!("{k}{{}}"),
-                _ => k.clone(),
+                _ => k.to_string(),
             })
             .collect();
         names.sort();
@@ -977,7 +689,7 @@ fn ui_probe(path: &str, frames: usize) -> Result<bool, String> {
         }
         let _ = before;
     }
-    println!("{path}: {} characters, {} classes registered, {frames} frames", runtime.bindings.movie.characters.len(), runtime.bindings.movie.class_for.len());
+    println!("{path}: {} characters, {} classes registered, {frames} frames", runtime.bindings.movie.characters.len(), runtime.bindings.movie.classes.len());
     match runtime.controller {
         Some(c) => {
             println!("_root.screen fields: {}", describe(&runtime.vm, c));

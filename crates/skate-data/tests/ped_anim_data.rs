@@ -110,6 +110,9 @@ fn every_census_entity_resolves_a_look_and_animation() {
     let c = |k: &str| t.anim_sets[k].collision;
     assert_eq!((c("default").knockdown_speed, c("default").can_knock_down, c("default").ground_seconds), ([3.0, 3.0], true, 1.5));
     assert!(!c("marquee").can_knock_down && c("security01").ground_seconds == 0.5);
+    // The knock-down re-hit values (b373): every set carries the stock intervals and restart times.
+    assert_eq!((c("default").recovery_front, c("default").recovery_back, c("default").recovery_side), ([2.0, 3.167], [2.0, 3.167], [1.667, 2.334]));
+    assert!(c("default").ground_restart.iter().zip([0.667, 0.833, 0.833]).all(|(a, b)| (a - b).abs() < 1e-3), "{:?}", c("default").ground_restart);
     for name in skate_core::living_world::peds::skater_contact::REACTION_ANIMS {
         assert!(t.anim_sets["default"].entries.contains_key(*name), "default set: {name} missing");
     }

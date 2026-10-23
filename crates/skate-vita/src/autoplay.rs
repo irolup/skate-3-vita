@@ -72,6 +72,18 @@ fn play(shared: &Mutex<Shared>, assets: &Path, path: &Path, name: &str) -> Resul
             Session::load(assets, &scenario.difficulty)?
         }
     };
+    // A district plays as the game runs it (`lab`): the living world with the saved settings, the Physics setting
+    // and the animation budget. Its dump is not kept (the district is at the heap's limit; the ticks are measured).
+    let district = park.as_deref().is_some_and(|p| crate::packs::DISTRICTS.contains(&p));
+    if district {
+        let (living, iterations) = {
+            let s = shared.lock().unwrap();
+            (s.living.clone(), s.solver_iterations)
+        };
+        session.set_solver_iterations(iterations);
+        session.set_animation_budget(lab::ANIMATION_BUDGET);
+        println!("AUTOPLAY {name}: living world {} ({iterations} solver iterations)", session.start_living_world(living));
+    }
     {
         let mut s = shared.lock().unwrap();
         s.loading = false;
@@ -83,7 +95,8 @@ fn play(shared: &Mutex<Shared>, assets: &Path, path: &Path, name: &str) -> Resul
     // during the run stalls the simulation thread now and then (first run: ticks
     // dropped by the accumulator, frames held), which is not what is being measured.
     let total = scenario.ticks.len();
-    let mut dump: Vec<u8> = Vec::with_capacity(64 + total * 2048);
+    let _ = skate_sim::profile_take();
+    let mut dump: Vec<u8> = Vec::with_capacity(if district { 0 } else { 64 + total * 2048 });
     session.write_header(&mut dump).map_err(io)?;
     let mut ticks = scenario.ticks.into_iter();
     let mut tick_us: Vec<u32> = Vec::with_capacity(total);
@@ -116,7 +129,9 @@ fn play(shared: &Mutex<Shared>, assets: &Path, path: &Path, name: &str) -> Resul
             tick_us.push(start.elapsed().as_micros() as u32);
             let due_at = next;
             next += session.period();
-            session.write_tick(&mut dump, report.error.is_some()).map_err(io)?;
+            if !district {
+                session.write_tick(&mut dump, report.error.is_some()).map_err(io)?;
+            }
             let mut s = shared.lock().unwrap();
             if let Some((previous, current)) = session.presentation() {
                 lab::publish(&mut s.frames, due_at, session.period(), previous, current, &[], &[], &[], &[]);
@@ -153,5 +168,12 @@ fn play(shared: &Mutex<Shared>, assets: &Path, path: &Path, name: &str) -> Resul
         sorted.get(sorted.len() * 95 / 100).copied().unwrap_or(0),
         sorted.last().copied().unwrap_or(0),
     );
+    // Feature `stage-profile`: the stage totals over the scenario.
+    let mut profile = skate_sim::profile_take();
+    profile.sort_by_key(|p| std::cmp::Reverse(p.1));
+    let stages: Vec<String> = profile.iter().filter(|p| p.0.starts_with("z_")).take(30).map(|(n, t, _)| format!("{n}={:.2}", *t as f64 / 1e6 / total.max(1) as f64)).collect();
+    if !stages.is_empty() {
+        println!("AUTOPLAY {name} STAGES ms/tick: {}", stages.join(" "));
+    }
     Ok(())
 }

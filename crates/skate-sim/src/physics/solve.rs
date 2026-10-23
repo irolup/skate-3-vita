@@ -98,6 +98,12 @@ fn advance_inner(
                     collision_flag: skater.player_input.processed.flags_2484 & 0x0400_0000 != 0,
                     state_time: skater.player_input.processed.state_timer_2664,
                 }),
+                // Only BipedGround runs the decision (82D324B0); in other states nothing qualifies.
+                ground_grab: Some({
+                    let g = &skater.biped_ground.ground;
+                    let on_foot = skater.player_state.current() == skate_core::player::state::PhysicalStateId::BipedGround;
+                    (on_foot && g.flags_144_to_150[0]).then_some((g.counter_152, g.counter_156))
+                }),
             },
         );
         // 82D45008 -> 82BD9728 / 82BD97D0: the held prop's hand points as hand IK targets (limbs 2 / 3, the
@@ -127,8 +133,13 @@ fn advance_inner(
         .collect();
     // A grind on a prop rail does not push that prop (user, from retail play): its body is spared the skater's
     // volumes while the skater is in a grind state (4xx).
-    let grinding = (400..500).contains(&skater.player_input.processed.state_2508);
-    let grinded = skater.player_input.grind.rail_owner.filter(|_| grinding).and_then(crate::grind_world::props::prop_of_owner);
+    // Also while the air aim has locked onto that prop's rail (2xx): the board drops into the prop's box on the way
+    // down and the box pushed the bench sideways before the grind took the rail (laptop 2026-10-17: the bench seat,
+    // lower than the bench's box top, was shoved on every try and the grind dropped the next frame).
+    let state = skater.player_input.processed.state_2508;
+    let grinding = (400..500).contains(&state);
+    let aimed = if (200..300).contains(&state) { skater.trajectory.selector.selection().and_then(|s| s.grind).map(|g| g.edge.owner) } else { None };
+    let grinded = skater.player_input.grind.rail_owner.filter(|_| grinding).or(aimed).and_then(crate::grind_world::props::prop_of_owner);
     // Only the prop-owning step writes it: an NPC's write was dead (the player sets it again before its own
     // `step_props`, and an NPC's `step_props` returns at once), and NPC workers only read the shared props.
     if physics.owns_props {

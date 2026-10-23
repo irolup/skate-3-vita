@@ -20,6 +20,7 @@
 pub mod ai_record;
 pub mod ai_controller;
 pub mod controller_b;
+pub mod ai_push;
 pub mod ai_signals;
 pub mod avoid;
 pub mod census;

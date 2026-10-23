@@ -46,6 +46,30 @@ pub(super) fn advance(
     };
     let current = skater.player_state.current();
     let requested = skater.player_state.selector.calculate(current, &input);
+    // SKITCH_RELEASE_TRACE: the release tick and the 30 after it, so a squash bail after letting go of a car shows
+    // how the pose error and the car contact developed (research b180: logs had only the bail tick).
+    use skate_core::player::state::PhysicalStateId as Sid;
+    if current == Sid::Skitching && requested != Sid::Skitching {
+        skater.skitch_release_trace = 31;
+    }
+    if skater.skitch_release_trace > 0 {
+        skater.skitch_release_trace -= 1;
+        let g = &skater.wipeout.settings().ground;
+        let c = &skater.collision_feedback;
+        tracing::info!(
+            "SKITCH_RELEASE_TRACE t={} {current:?}->{requested:?} max_pose_error={:?} pose_error=[{:.3}, {:.3}, {:.3}] squash_limit={:.3} vehicle_contact={} vehicle_force={:.1} time_on_ground={:.3} tick={}",
+            30 - skater.skitch_release_trace,
+            skater.collision_maximum_error,
+            skater.collision_pose_error[0],
+            skater.collision_pose_error[1],
+            skater.collision_pose_error[2],
+            if c.flags.group_8 { g.vehicle_scalar } else { 1.0 } * g.max_squash,
+            c.flags.group_8,
+            c.maximum_group_8_force,
+            p.time_on_ground_2752,
+            physics.ticks
+        );
+    }
     skater.player_state.requested_state = requested;
     if skater.player_state.selector.request_teleport {
         //0x82D8B034: count > limit sets selector+57 (request teleport -> state 702).
@@ -67,11 +91,25 @@ pub(super) fn advance(
     if requested != current && requested == skate_core::player::state::PhysicalStateId::WipeoutGround {
         let w = &skater.wipeout.state;
         let reasons: Vec<(usize, f32)> = (0..w.reasons.len()).filter(|&i| w.reasons[i]).map(|i| (i, w.values[i])).collect();
+        // The inputs of the ground squash / displacement checks (`82D8F9E0`): reason 18 = pose error over the squash
+        // limit (x the vehicle scalar while touching a vehicle).
+        let g = &skater.wipeout.settings().ground;
+        let c = &skater.collision_feedback;
         tracing::info!(
-            "WIPEOUT_REASONS from={current:?} reasons={reasons:?} count={} flags_2480_bit3={} tick={}",
+            "WIPEOUT_REASONS from={current:?} reasons={reasons:?} count={} flags_2480_bit3={} tick={} max_pose_error={:?} squash_limit={:.3} vehicle_contact={} vehicle_force={:.1} ped_force={:.1} side_on_trick={} trick_scalar={:.2} time_on_ground={:.3}",
             w.count,
             p.flags_2480 & (1 << 3) != 0,
-            physics.ticks
+            physics.ticks,
+            skater.collision_maximum_error,
+            if c.flags.group_8 { g.vehicle_scalar } else { 1.0 } * g.max_squash,
+            c.flags.group_8,
+            c.maximum_group_8_force,
+            // A bail from a ped hit (research b448): the ped body parts' contact force (group 11, the ordinary
+            // force check) and whether the side-on mid-trick factor applied.
+            c.maximum_group_11_force,
+            p.flags_2472 & (1 << 15) != 0,
+            g.trick_scalar,
+            p.time_on_ground_2752
         );
     }
     //SystemLogic82DB6000 clears the per-frame Wipeout request accumulator.

@@ -171,8 +171,15 @@ pub(crate) struct Shared {
     pub solver_iterations: u32,
     /// No stepping while set (menus); the clock restarts on resume.
     pub paused: bool,
+    /// The replay asks for the collision world (its cameras' sweeps); the paused sim thread lends it and takes it
+    /// back before any tick (a tick changes the world in place and needs it unshared).
+    pub want_camera_world: bool,
+    pub camera_world: Option<skate_sim::live::CameraWorld>,
     /// Request: teleport the skater to the world's spawn.
     pub respawn: bool,
+    /// Request: teleport the skater to a locator (a Challenge Map location); it waits while a world loads, then
+    /// applies to the new session.
+    pub teleport: Option<[[f32; 4]; 4]>,
     pub score: skate_sim::live::Score,
     pub state_id: u32,
     /// The session marker overlay's state.
@@ -354,7 +361,7 @@ fn wait_for_reload(shared: &Mutex<Shared>, input: &Input) {
 }
 
 /// The bound of the decoded animation keys on the Vita (see `run_session`).
-const ANIMATION_BUDGET: usize = 16 << 20;
+pub(crate) const ANIMATION_BUDGET: usize = 16 << 20;
 
 fn run_session(shared: &Mutex<Shared>, input: &Input, session: &mut Session, mut difficulty: &'static str, map: &str) {
     let mut next = Instant::now();
@@ -373,6 +380,10 @@ fn run_session(shared: &Mutex<Shared>, input: &Input, session: &mut Session, mut
     // This tick's peds in view, and the ped model list `PedPose::model` indexes.
     let mut peds: Vec<skate_sim::PedPose> = Vec::new();
     let ped_models = session.ped_models();
+    // The ped rig's parents (the world replay's local joints).
+    let ped_parents: Vec<i32> = session.ped_rig().map(|(_, parents, _)| parents).unwrap_or_default();
+    // This tick's streamed-in props.
+    let mut props: Vec<skate_sim::live::PropPose> = Vec::new();
     // This tick's released hand props.
     let mut hand_props: Vec<skate_sim::HandPropPose> = Vec::new();
     // The Physics setting, applied before the first tick and whenever it changes.
@@ -382,6 +393,7 @@ fn run_session(shared: &Mutex<Shared>, input: &Input, session: &mut Session, mut
     // are at the heap's limit; a trimmed clip decodes again to the same words).
     session.set_animation_budget(ANIMATION_BUDGET);
     crate::session_replay::clear();
+    crate::world_replay::clear();
     println!("physics: {iterations} solver iterations");
     let mut paused_since: Option<Instant> = None;
     #[cfg(feature = "state-log")]
@@ -401,6 +413,13 @@ fn run_session(shared: &Mutex<Shared>, input: &Input, session: &mut Session, mut
                     neutral = true;
                 } else {
                     paused_since.get_or_insert_with(Instant::now);
+                    if s.want_camera_world {
+                        if s.camera_world.is_none() {
+                            s.camera_world = Some(session.camera_world());
+                        }
+                    } else {
+                        s.camera_world = None;
+                    }
                     drop(s);
                     crate::retail_audio::silence();
                     let mut feed = crate::audio::FEED.lock().unwrap();
@@ -410,6 +429,8 @@ fn run_session(shared: &Mutex<Shared>, input: &Input, session: &mut Session, mut
                     continue;
                 }
             }
+            // No tick runs while the world is lent out.
+            s.camera_world = None;
             // Resume: the clock restarts (no catch-up) and the published ticks move
             // forward by the pause, so the interpolation continues without a hold.
             if let Some(since) = paused_since.take() {
@@ -444,6 +465,14 @@ fn run_session(shared: &Mutex<Shared>, input: &Input, session: &mut Session, mut
             if std::mem::take(&mut s.respawn) {
                 if let Err(e) = session.respawn() {
                     println!("respawn: {e}");
+                }
+            }
+            if !s.reload && !s.loading {
+                if let Some(matrix) = s.teleport.take() {
+                    match session.teleport(matrix) {
+                        Ok(()) => println!("teleport to ({:.1}, {:.1}, {:.1})", matrix[3][0], matrix[3][1], matrix[3][2]),
+                        Err(e) => println!("teleport: {e}"),
+                    }
                 }
             }
         }
@@ -554,14 +583,22 @@ fn run_session(shared: &Mutex<Shared>, input: &Input, session: &mut Session, mut
                 }
                 events.clear();
             }
-            let mut s = shared.lock().unwrap();
-            if let Some((previous, current)) = session.presentation() {
+            if session.presentation().is_some() {
                 session.car_poses(&mut cars);
                 session.npc_poses(&mut npcs);
                 session.ped_poses(&ped_models, &mut peds);
                 session.hand_prop_poses(&mut hand_props);
+                session.prop_poses(&mut props);
+                // Outside the shared lock: the renderer is not held while the tick is recorded.
+                if !neutral {
+                    crate::world_replay::record(session, &cars, &npcs, &peds, &ped_parents, &hand_props, &props);
+                }
+            }
+            let mut s = shared.lock().unwrap();
+            if let Some((previous, current)) = session.presentation() {
                 publish(&mut s.frames, due_at, session.period(), previous, current, &cars, &npcs, &peds, &hand_props);
-                session.prop_poses(&mut s.props);
+                s.props.clear();
+                s.props.extend_from_slice(&props);
             }
             push_hud(&mut s, session.hud_feed());
             s.marker = session.marker_view();

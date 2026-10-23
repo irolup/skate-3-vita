@@ -25,7 +25,8 @@ pub const WORLDS: [&str; 11] = [
     "University",
     "DownTown",
 ];
-/// How many of `WORLDS` are the Course and the parks (the rest are districts).
+/// How many of `WORLDS` are the Course and the parks (the rest are districts; the soak build cycles through them).
+#[cfg_attr(not(feature = "soak"), allow(dead_code))]
 pub const PARKS: usize = 8;
 
 /// Set when ui.pak (the original HUD movie and textures) was mounted.

@@ -160,6 +160,45 @@ fn ped_walks_round_a_resting_prop_and_reaches_its_target() {
     assert!(through, "the control walk crosses the prop");
 }
 
+/// A newspaper box (half extents about 0.25 m) whose use waypoint stands 0.42 m in front of its centre, inside the
+/// box grown by the agent radius (DownTown `EB4A16533EACEC04`, laptop session 2026-10-19: ped #573 pinned 55 s
+/// against the back of the box, 1.045 m from the waypoint, just outside TargetWaypoint's 1.0 m slide).
+fn newspaper_box() -> ObstacleInput {
+    ObstacleInput { id: 7, center: [10.0, 0.5, 5.0], axes: AXES, half_extents: [0.25, 0.5, 0.25], velocity: [0.0; 3], inactive: false, held: false }
+}
+
+#[test]
+fn a_ped_reaches_a_waypoint_in_front_of_its_prop_from_behind() {
+    let m = grid(20, 10, 1.0);
+    let w = [9.58, 0.0, 5.0];
+    // From behind the box, and from pressed against its back (outside the box grown by the agent radius, inside the
+    // detour margin).
+    for start in [[12.0, 0.0, 5.1], [10.61, 0.0, 5.17]] {
+        let mut o = NavObstacles::new(ObstacleParams::default());
+        let mut props = vec![newspaper_box()];
+        let mut nav = PedNav::default();
+        nav.set_route(Some(PedRoute { points: vec![w], looped: false }));
+        let mut bodies = vec![Body { id: 1, pos: start, heading: -std::f32::consts::FRAC_PI_2, nav, state: Locomotion::Idle }];
+        run(&m, &mut o, &mut props, &mut bodies, 60 * 20, |_, bs, o, _| assert!(!inside_any(o, bs[0].pos, 0.0), "walked into the box at {:?}", bs[0].pos));
+        let d = (bodies[0].pos[0] - w[0]).hypot(bodies[0].pos[2] - w[2]);
+        // The nearest free point to the waypoint is 0.19 m from it; the slide (1.0 m) takes the ped the rest.
+        assert!(d < 0.3, "from {start:?} the ped ends {d:.2} m from the waypoint at {:?}", bodies[0].pos);
+    }
+}
+
+#[test]
+fn a_target_inside_a_cut_snaps_out_only_within_the_snap_radius() {
+    let mut o = NavObstacles::new(ObstacleParams::default());
+    o.update(&[newspaper_box()]);
+    // 0.42 m in front of the centre: 0.19 m inside the box grown by 0.35, snapped onto the grown edge.
+    let s = o.snap_out([9.58, 0.0, 5.0], 0.35).expect("within the snap radius");
+    assert!((s[0] - 9.39).abs() < 0.02 && (s[2] - 5.0).abs() < 1e-4, "snapped to {s:?}");
+    // The centre is 0.6 m from the grown edge: farther than the 0.5 m snap, no point.
+    assert!(o.snap_out([10.0, 0.0, 5.0], 0.35).is_none());
+    // A free point stays where it is.
+    assert_eq!(o.snap_out([8.0, 0.0, 5.0], 0.35), Some([8.0, 0.0, 5.0]));
+}
+
 #[test]
 fn a_prop_moved_into_the_path_counts_where_it_lies_now() {
     let m = grid(20, 10, 1.0);
@@ -275,4 +314,25 @@ fn a_standing_skater_is_a_moving_avoider_unless_the_ped_ignores_skaters() {
     assert!(o.step_ok_ignoring([-1.0, 0.0, 0.0], [-0.4, 0.0, 0.0], 0.35, Ignore { id: None, skaters: true }));
     // Mod switch.
     o.set_params(ObstacleParams { skaters: false, ..ObstacleParams::default() });
+}
+
+/// A prop that comes to rest with a ped inside its grown footprint (its own dropped hand prop, laptop 2026-10-19): a step
+/// toward the nearest free point (`snap_out`) is allowed, a step on through the middle is not (the walker then walks
+/// the ped out first, `peds.rs`, b349).
+#[test]
+fn a_ped_inside_a_fresh_cut_can_walk_out_toward_the_nearest_free_point() {
+    let mut o = NavObstacles::new(ObstacleParams::default());
+    // A dropped can: tiny box raised to the 0.2 m minimum half extent, resting at the origin.
+    let can = ObstacleInput { half_extents: [0.04, 0.06, 0.04], ..bin(9, 0.0, 0.0) };
+    assert!(o.update(&[can]));
+    let radius = 0.35;
+    let ped = [0.3, 0.0, 0.1];
+    assert!(o.blocked(ped, radius), "the ped stands inside the grown footprint");
+    let out = o.snap_out(ped, radius + 0.02).expect("a free point within the snap distance");
+    assert!(!o.blocked(out, radius));
+    let dir = [out[0] - ped[0], out[2] - ped[2]];
+    let len = dir[0].hypot(dir[1]);
+    let step = [ped[0] + dir[0] / len * 0.05, 0.0, ped[2] + dir[1] / len * 0.05];
+    assert!(o.step_ok(ped, step, radius), "walking out is allowed");
+    assert!(!o.step_ok(ped, [0.25, 0.0, 0.08], radius), "walking further in is not");
 }

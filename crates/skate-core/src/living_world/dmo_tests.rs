@@ -96,3 +96,25 @@ fn streaming_is_deterministic() {
     };
     assert_eq!(run(), run());
 }
+
+/// A kept live object (moved by the player) is never the eviction front while unkept ones are live (retail's live
+/// score `sub_82C55160` scores it as keep, research b184): the pool still turns over, but not that prop.
+#[test]
+fn a_kept_live_object_is_never_evicted_while_others_can_go() {
+    let s = DmoStreamSettings { cap: 10, ..Default::default() };
+    let many: Vec<_> = (0..40).map(|i| placement(i, 1.0 + i as f32 * 2.0, Some(100))).collect();
+    let mut d = DmoStream::new(many, &s);
+    d.step(&[at(0.0)], &s, true, &NONE);
+    let kept_id = *d.live.iter().next().unwrap();
+    let mut evicted = Vec::new();
+    for _ in 0..30 {
+        for out in d.step_kept(&[at(0.0)], &s, false, &NONE, &|id| id == kept_id) {
+            if let DmoDecision::Evict(id) = out {
+                evicted.push(id);
+            }
+        }
+    }
+    assert!(!evicted.is_empty(), "the full pool still evicts");
+    assert!(!evicted.contains(&kept_id), "the kept prop stays: {evicted:?}");
+    assert!(d.live.contains(&kept_id));
+}

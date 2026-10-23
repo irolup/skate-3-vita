@@ -175,9 +175,19 @@ impl GrindInputState {
         })
     }
 
-    ///82D8A638 resets the manager, not the separately constructed child objects.
     #[cfg(test)]
-    pub fn reset(&mut self) {
+    pub(crate) fn set_lock_for_test(&mut self, engagement_counter: u32, cooldown: u32) {
+        self.engagement_counter = engagement_counter;
+        self.cooldown = cooldown as _;
+    }
+    #[cfg(test)]
+    pub(crate) fn lock_for_test(&self) -> (u32, u32) {
+        (self.engagement_counter, self.cooldown as u32)
+    }
+
+    ///82D8A638 resets the manager, not the separately constructed child objects.
+    ///ResetSystems82DB92D0 calls it last on every teleport / placement (b297).
+    pub(crate) fn reset(&mut self) {
         self.previous_state = 0;
         self.engagement_counter = 0;
         self.cooldown = 0;

@@ -14,7 +14,7 @@ pub fn check(state: &mut Requests, s: &Settings, mode: &Mode, f: &Frame) {
     let g = &s.ground;
     let vehicle = if f.group_8 { g.vehicle_scalar } else { 1.0 };
     let trick = if f.flags_2472 & (1 << 15) != 0 {
-        f32::from_bits(0x3e99_999a)
+        g.trick_scalar
     } else {
         1.0
     };

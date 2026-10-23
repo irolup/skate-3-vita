@@ -161,6 +161,7 @@ pub mod names {
         "WipeoutBackFall", "WipeoutBackGroundCyc", "WipeoutBackGetUp",
         "WipeoutFwdFall", "WipeoutFwdGroundCyc", "WipeoutFwdGetUp",
         "WipeoutLeftFall", "WipeoutLeftGroundCyc", "WipeoutLeftGetUp",
+        "WipeoutBackCrouch", "WipeoutFwdCrouch", "WipeoutLeftCrouch",
         // motiongraph_taunt.
         "Taunt",
         // The plugin states (`super::plugin_motion`): sit, ATM, vending machine, water fountain, newspaper box.
@@ -176,6 +177,8 @@ pub mod names {
         // The idle hand prop actions on the channel (`82E3F1D8` / `82E3F470`, strings `0x82064AA0..0x82064B3C`).
         "HandPropEat", "HandPropDrink", "HandPropReadInto", "HandPropReadCyc", "HandPropReadOut", "HandPropPhoneAnswer",
         "HandPropPhoneTalk", "HandPropPhoneHangup", "HandPropLitter",
+        // The tazer on the channel (DrawTazer / `82E3ED50` / EndTaze, b248).
+        "TazerInto", "TazerCyc", "TazerOut",
     ];
 }
 
@@ -302,6 +305,32 @@ struct ReactionRun {
     steps: Vec<super::skater_contact::ReactionStep>,
     index: usize,
     ground_left: f32,
+    /// The ground time a knock-down re-arms to (the set's `ground_seconds`).
+    ground_seconds: f32,
+    /// Retail's PedestrianColliding knock-down state (`sub_8269DEE0` states 1 / 2, b372); `None` for a stumble or
+    /// a plugin sequence.
+    knockdown: Option<Knockdown>,
+}
+
+/// A knock-down's Colliding state: the stored direction (`s+0x18`), the timer expiries (`s+0x14`, copied to the
+/// contact gate `c+4`), a contact waiting for the expiry (`c+8`) and whether `Recover` was posted (state 2).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Knockdown {
+    direction: super::skater_contact::ReactionDirection,
+    expiries: u8,
+    pending: bool,
+    recovering: bool,
+}
+
+/// What a contact did to a knocked-down ped ([`PedAnimPlayer::knockdown_contact`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum KnockdownContact {
+    /// Not knocked down, or contacts are blocked (too many expiries).
+    Ignored,
+    /// Down: the contact waits for the ground timer's expiry, which then re-arms it (`sub_8269E058`).
+    Pending,
+    /// Getting up: a re-hit from this posture and direction (`sub_8269E170`).
+    ReHit(super::skater_contact::Posture, super::skater_contact::ReactionDirection),
 }
 
 /// Seed label of the animation sub-RNG.
@@ -378,8 +407,59 @@ impl PedAnimPlayer {
         if !self.play(set, first.anim, first.blend, first.mirror, Locomotion::Reaction) {
             return false;
         }
-        self.reaction = Some(ReactionRun { steps, index: 0, ground_left: ground_seconds });
+        self.reaction = Some(ReactionRun { steps, index: 0, ground_left: ground_seconds, ground_seconds, knockdown: None });
         true
+    }
+
+    /// Mark the reaction just started as a knock-down from `direction` (`sub_8269DA00` kind 0): its ground timer,
+    /// contacts and re-hits follow retail's Colliding state machine from here on.
+    pub fn begin_knockdown(&mut self, direction: super::skater_contact::ReactionDirection) {
+        if let Some(r) = self.reaction.as_mut() {
+            r.knockdown = Some(Knockdown { direction, expiries: 0, pending: false, recovering: false });
+        }
+    }
+
+    /// Whether a knock-down is running (the ped is down or getting up).
+    pub fn knocked_down(&self) -> bool {
+        self.reaction.as_ref().is_some_and(|r| r.knockdown.is_some())
+    }
+
+    /// A contact on a knocked-down ped ([code] `sub_82E38FB8` sets `c+8` unless `c+9`; `sub_8269E058` /
+    /// `sub_8269E170` consume it). Down: it waits for the timer's expiry, which then re-arms the timer. Getting up:
+    /// a re-hit whose posture comes from the get-up clip's time (`sub_8269E460`); LyingDown keeps the stored
+    /// direction, Crouched / Standing take `direction` and reset the expiry count.
+    pub fn knockdown_contact(&mut self, set: &PedAnimSet, direction: super::skater_contact::ReactionDirection) -> KnockdownContact {
+        use super::skater_contact::{rehit_steps, Posture};
+        let rules = set.collision;
+        let getup_time = self.current.time;
+        let Some(r) = self.reaction.as_mut() else { return KnockdownContact::Ignored };
+        let Some(k) = r.knockdown.as_mut() else { return KnockdownContact::Ignored };
+        if k.expiries > rules.block_after {
+            return KnockdownContact::Ignored;
+        }
+        if !k.recovering {
+            k.pending = true;
+            return KnockdownContact::Pending;
+        }
+        let posture = rules.posture(getup_time, k.direction);
+        let dir = if posture == Posture::LyingDown { k.direction } else { direction };
+        let mut next = *k;
+        if posture != Posture::LyingDown {
+            next.direction = direction;
+            next.expiries = 0;
+        }
+        next.recovering = false;
+        next.pending = false;
+        let (steps, start) = rehit_steps(posture, dir, &rules);
+        let first = steps[0];
+        if !self.play(set, first.anim, first.blend, first.mirror, Locomotion::Reaction) {
+            return KnockdownContact::Ignored;
+        }
+        self.current.time = start;
+        self.current.previous_time = start;
+        let seconds = rules.ground_seconds;
+        self.reaction = Some(ReactionRun { steps, index: 0, ground_left: seconds, ground_seconds: seconds, knockdown: Some(next) });
+        KnockdownContact::ReHit(posture, dir)
     }
 
     /// Replace the running reaction or plugin sequence with `steps` (a motion-graph transition out of it, e.g. the
@@ -588,13 +668,30 @@ impl PedAnimPlayer {
             }
             Locomotion::Reaction => {
                 // [data] `WillExpire InTime=0.01` ends a clip step; the ground cycle runs until the
-                // AI's `Recover` (the set's ground time); then back to locomotion (idle).
+                // AI's `Recover` (the set's ground time); then back to locomotion (idle). The ground
+                // time counts from the reaction's Begin, not from the cycle (b372: `sub_8269DA00` starts
+                // it with the fall, `sub_8269E058` posts Recover at expiry), so the get-up comes at the
+                // later of the fall's end and `ground_seconds` after the hit.
                 let next = match self.reaction.as_mut() {
-                    Some(r) if r.steps[r.index].cycle => {
+                    Some(r) => {
                         r.ground_left -= dt;
-                        r.ground_left <= 0.0
+                        // A knock-down's expiry (`sub_8269E058`): a waiting contact re-arms the timer (stay down,
+                        // no clip change); otherwise `Recover` is posted and the ground cycle gives way to the get-up.
+                        // Either way the expiry counts toward the contact block.
+                        if let Some(k) = r.knockdown.as_mut().filter(|k| !k.recovering && r.ground_left <= 0.0) {
+                            k.expiries = k.expiries.saturating_add(1);
+                            if std::mem::take(&mut k.pending) {
+                                r.ground_left = r.ground_seconds;
+                            } else {
+                                k.recovering = true;
+                            }
+                        }
+                        match (r.steps[r.index].cycle, r.knockdown) {
+                            (true, Some(k)) => k.recovering,
+                            (true, None) => r.ground_left <= 0.0,
+                            (false, _) => remaining <= 0.01,
+                        }
                     }
-                    Some(_) => remaining <= 0.01,
                     None => true,
                 };
                 if next {

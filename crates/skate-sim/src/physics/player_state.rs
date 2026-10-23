@@ -37,6 +37,10 @@ pub(crate) struct PlayerState {
     initialized: bool,
 }
 impl PlayerState {
+    /// A new actor on a pooled body (b299): the post-input counters a fresh body starts with.
+    pub(crate) fn reset_for_new_actor(&mut self) {
+        self.post = post_input::PostInputState::new();
+    }
     pub fn load(data: &Collections, _mode: &str) -> Result<Self, String> {
         let thresholds = |class| -> Result<TwoStageThresholds, String> {
             Ok(TwoStageThresholds {
@@ -169,7 +173,7 @@ pub(crate) fn resume_after_climb(physics: &mut GamePhysics, skater: &mut SkaterR
             animation_right: frame[0], animation_up: frame[1], velocity: [0.; 4],
         },
         skater.player_input.processed.actor_query_2952 as i32,
-        &super::offboard::contact_toolkit::StaticScene::new(&physics.world)?,
+        &super::offboard::contact_toolkit::StaticScene::new(physics.biped_world())?,
     )?;
 
     Ok(())

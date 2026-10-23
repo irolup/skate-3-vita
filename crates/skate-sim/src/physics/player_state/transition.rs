@@ -72,6 +72,21 @@ pub(super) fn set(
     }
     let board_observation =
         super::super::offboard::board_manager::runtime::observe(physics, skater);
+    // An NPC skater entering a grind or slide: what the grind gate (`82D68FE8`, `scoring.rs`) saw, this tick's AI
+    // record, the processed-input cache, and the line cursor the record's trajectory came from (b294, doc 26e).
+    if let Some(ai) = skater.ai_physics.filter(|_| matches!(requested, PhysicalStateId::SlideGround | PhysicalStateId::GrindBoardslide | PhysicalStateId::GrindFiftyFifty | PhysicalStateId::GrindTipslide | PhysicalStateId::GrindFiveO | PhysicalStateId::GrindBackslash | PhysicalStateId::GrindDarkslide)) {
+        let bit = |v: u32, b: u32| (v >> b) & 1;
+        let gate = skater.player_input.processed.external_physics_1616.flags;
+        let cache = skater.player_input.player.external_physics_cache_1008.flags;
+        let c = ai.cursor;
+        info!(requested = ?requested, external_active = bit(skater.player_input.processed.flags_2472, 29),
+            gate_trajectory = bit(gate, 26), gate_lands_in_grind = bit(gate, 27),
+            record_trajectory = bit(ai.record.flags, 26), record_lands_in_grind = bit(ai.record.flags, 27), fresh = ai.fresh,
+            cache_lands_in_grind = bit(cache, 27),
+            cursor_node = c.map(|c| c.node), frame_in_segment = c.map(|c| c.frame_in_segment), ext_node = c.map(|c| c.ext_node),
+            has_trajectory = c.map(|c| c.has_trajectory), lands_node = c.map(|c| c.lands_node),
+            "NPC_GRIND_ENTRY");
+    }
     let p = &mut skater.player_input.processed;
     info!(current = ?current, requested = ?requested,
         board_controller_state = skater.skateboard_controller.fields.state_448,
@@ -199,6 +214,23 @@ pub(super) fn set(
             super::super::biped_ground::enter(physics, skater)?;
             let drop_board = physics.prop_carry.locomotion().drop_board;
             super::super::biped_ground::ground_board::enter_move_object(physics, skater, drop_board);
+            // 82D442D0's bind (b233): only a record published this tick (flags_2480 bit 0x400000) with a geometry
+            // (+196) and a rates identity (+216) is copied (82762AB0) and bound (82D444A0 full). Else nothing is held
+            // and the skater stays in 502.
+            let words = skater.player_input.processed.grab_records_1888_2176[0];
+            let published = skater.player_input.processed.flags_2480 & 0x0040_0000 != 0;
+            match skater.grab_geometry[0].clone() {
+                Some(geometry) if published && words[49] != 0 && words[54] != 0 => {
+                    if physics.owns_props {
+                        physics.prop_carry.bind_published(skate_core::player::offboard::grab_scene::Record(words, geometry));
+                    }
+                }
+                _ => tracing::info!(
+                    "PROP_GRAB_MISS Move Object enter refused: published={published} geometry={:#x} rates={:#x}",
+                    words[49],
+                    words[54]
+                ),
+            }
             Ok(())
         }
         PhysicalStateId::GroundAnimation => super::super::ground_animation::enter(physics, skater),

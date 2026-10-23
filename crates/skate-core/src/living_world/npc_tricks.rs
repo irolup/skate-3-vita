@@ -26,8 +26,9 @@
 //! (skater vfunc +36) in tick order. Here the draw is `derive(seed, [line, node, frame])`: the same
 //! distribution, but a pure function of the NPC's seed and the slot, so the choice does not depend
 //! on how many other draws came first and a client could check it. `sub_82469A28` also keeps the
-//! recorded trick when its trick attribute record has no family entries; those records are not
-//! decoded, every recorded ollie / flip is taken to have them [inferred].
+//! recorded trick when its trick attribute record has no family entries; the per-category lists are
+//! built from every record (`sub_82DA1BF0`) and all 105 ollie / flip ids have one, so the check
+//! always passes [code + data, research b187].
 
 use crate::scoring::catalog;
 

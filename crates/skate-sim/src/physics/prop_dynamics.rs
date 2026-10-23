@@ -260,6 +260,21 @@ pub(crate) struct PropSolverSettings {
     /// default, kept as a mod option (with the old 0.5 / 30 sleep values it
     /// reproduces the pre-2026-10-08 settling).
     pub rest_snap: bool,
+    /// The bail clamp (retail `82C530F0`, doc 27 "What wakes a resting prop"): when a bailing actor's volume
+    /// touches a prop, the prop's velocity is capped and it is woken, so bailing into a prop does not throw it.
+    pub bail_clamp: bool,
+    /// Linear cap = `bail_linear_factor` x inverse mass, m/s (retail 5.0, `0x821F1790`).
+    pub bail_linear_factor: f32,
+    /// Spin cap = `bail_angular_factor` x inverse mass, rad/s (retail 15.0).
+    pub bail_angular_factor: f32,
+    /// From this mass on (kg) the linear allowance is 0 and the spin is zeroed (retail 200).
+    pub bail_heavy_mass: f32,
+    /// Ball radius blend: radius = blend x (max(cap, |d|) + cap) (retail 0.5).
+    pub bail_blend: f32,
+    /// A prop type of at least this mass (kg) is collision type 12, lighter ones 14 (retail 5.5, `0x822F8C68`, slot 33
+    /// `82C56BA0`; spawns `82C4E940` -> `82E0E338` give the same pair, trace .local/research/prop-types). The on-foot
+    /// walker's queries reject types 13 and 14, so only the heavier props are ground for it.
+    pub walkable_mass: f32,
 }
 
 impl Default for PropSolverSettings {
@@ -271,8 +286,42 @@ impl Default for PropSolverSettings {
             sleep_frames: 2,
             max_sleeps_per_step: 100,
             rest_snap: false,
+            bail_clamp: true,
+            bail_linear_factor: 5.0,
+            bail_angular_factor: 15.0,
+            bail_heavy_mass: 200.0,
+            bail_blend: 0.5,
+            walkable_mass: 5.5,
         }
     }
+}
+
+/// Retail's bail clamp `82C530F0` on one prop: `w` = inverse mass (motion record +0x7C, b209), `d` = the prop's
+/// own velocity as its transform tracker measures it (`[dmo+0xA4]+0x90`, last tick's displacement / dt, written by
+/// `82E0C578` from the DMO update, b210); ours: the prop's velocity before this tick's skater pushes. The linear velocity is pulled into the ball of radius `mag` around `n * mag`
+/// (n = d / |d|, mag = blend x (max(cap, |d|) + cap), cap = factor x w); the spin is capped at the angular factor x w,
+/// or zeroed for a heavy prop (and the linear cap is 0). Returns (linear, angular); `None` for a static body (w = 0).
+pub(crate) fn bail_clamp(s: &PropSolverSettings, w: f32, d: Vector3, linear: Vector3, angular: Vector3) -> Option<(Vector3, Vector3)> {
+    if !(w > 0.0) {
+        return None;
+    }
+    let light = 1.0 / w < s.bail_heavy_mass;
+    let cap = if light { s.bail_linear_factor * w } else { 0.0 };
+    let angular = if light {
+        let limit = s.bail_angular_factor * w;
+        let l = length(angular);
+        if l > limit { scale(angular, limit / l) } else { angular }
+    } else {
+        Vector3::new(0.0, 0.0, 0.0)
+    };
+    let dl = length(d);
+    let n = if dl > 1.5e-5 { scale(d, 1.0 / dl) } else { Vector3::new(0.0, 0.0, 0.0) };
+    let mag = s.bail_blend * (cap.max(dl) + cap);
+    let centre = scale(n, mag);
+    let off = sub(linear, centre);
+    let ol = length(off);
+    let linear = if ol > mag { add(centre, scale(off, if ol > 0.0 { mag / ol } else { 0.0 })) } else { linear };
+    Some((linear, angular))
 }
 
 impl PropTuningTable {
@@ -324,6 +373,37 @@ pub(crate) fn set_prop_grab_enabled(on: bool) {
     PROP_GRAB.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Height of a generated grab spline over the box bottom, m (the authored splines sit at about hand height, ~0.98 m
+/// on the DownTown tables); a lower box is held by its top.
+const GENERATED_GRAB_HEIGHT: f32 = 1.0;
+
+/// Better Object Mover's grab splines for a prop without authored ones: one per vertical box face along its
+/// horizontal edge at [`GENERATED_GRAB_HEIGHT`], approach = the face's outward normal and flags 4, as the authored
+/// splines are laid out (template space, scale divided out: `grab_object_of` multiplies it back in).
+fn generated_grab_splines(b: &PropBody) -> Vec<crate::living_world::vehicles::CarGrabSpline> {
+    let (c, h, s) = ([b.local_center.x, b.local_center.y, b.local_center.z], [b.half_extents.x, b.half_extents.y, b.half_extents.z], [b.axis_scale.x, b.axis_scale.y, b.axis_scale.z]);
+    if h.iter().chain(&s).any(|v| !(v.is_finite() && v.abs() > 1e-4)) {
+        return Vec::new();
+    }
+    let y = (c[1] - h[1] + GENERATED_GRAB_HEIGHT).min(c[1] + h[1]);
+    let unscale = |p: [f32; 3]| [p[0] / s[0], p[1] / s[1], p[2] / s[2]];
+    let mut out = Vec::new();
+    for (axis, along) in [(0, 2), (2, 0)] {
+        for side in [-1.0f32, 1.0] {
+            let mut mid = c;
+            mid[1] = y;
+            mid[axis] += side * h[axis];
+            let (mut a, mut b) = (mid, mid);
+            a[along] -= h[along] * 0.9;
+            b[along] += h[along] * 0.9;
+            let mut direction = [0.0; 3];
+            direction[axis] = side;
+            out.push(crate::living_world::vehicles::CarGrabSpline { points: vec![unscale(a), unscale(a), unscale(b), unscale(b)], direction, flags: 4 });
+        }
+    }
+    out
+}
+
 /// Grab-scene id tag of props (cars use `living_world::vehicles::CAR_GRAB_TAG`, the high bit).
 pub(crate) const PROP_GRAB_TAG: u32 = 0x4000_0000;
 
@@ -331,6 +411,10 @@ pub(crate) struct PropBody {
     /// Index into the collision layer's instance list (and its rebake target).
     instance: usize,
     id: u32,
+    /// Dense grab-scene number (map props in load order, then mid-game bodies in creation order): the grab ids
+    /// pack it as `PROP_GRAB_TAG | slot << 6 | spline`, which the 32-bit map instance ids do not fit (only ids
+    /// below 2^24 did, so the grab scene held 2 of DownTown's 786 props, laptop 2026-10-18).
+    grab_slot: u32,
     /// Box centre and half extents in template space, scale folded in.
     local_center: Vector3,
     half_extents: Vector3,
@@ -355,8 +439,15 @@ pub(crate) struct PropBody {
     type_data: Option<DmoType>,
     /// Resolved tuning of this prop type.
     tuning: PropTuning,
-    /// The template's authored grab splines (template space; `set_grab_splines`).
+    /// The template's authored grab splines (template space; `set_grab_splines`), or with Better Object Mover on and
+    /// none authored, generated ones ([`generated_grab_splines`]).
     grab_splines: Vec<crate::living_world::vehicles::CarGrabSpline>,
+    /// skate_vita (performance): the grab-scene splines [`PropDynamics::grab_object_of`] gives this body, built once
+    /// by `set_grab_splines` (their keys, scaled points and approach depend only on the grab slot, the axis scale and
+    /// the splines, which do not change after that); the grab scene ran them through 3 allocations a spline every tick.
+    grab_scene_splines: Vec<skate_core::player::offboard::grab_scene::Spline>,
+    /// The template has authored grab splines (retail can move it).
+    authored_grab: bool,
     /// Box derived from the render AABB (scale folded in), kept so a
     /// `collision_box` override can be removed again.
     authored_center: Vector3,
@@ -701,6 +792,13 @@ impl PropGroundProbe {
 pub(crate) struct PropDynamics {
     bodies: Vec<PropBody>,
     by_id: std::collections::HashMap<u32, usize>,
+    /// skate_vita (performance): the indices of the bodies streamed in (not `dormant`), ascending. The per-step
+    /// loops that skip dormant bodies walk these instead of every body: DownTown streams ~50 of 786 in, and touching
+    /// the others' bodies (large records) cost the Vita about 1 ms a tick.
+    live: Vec<usize>,
+    /// skate_vita (performance): the map props (every body `new` builds; mid-game bodies are `runtime` and map
+    /// bodies are never removed), for [`Self::dmo_placement_count`], which the census reads every tick.
+    map_bodies: usize,
     simulation: RetailSimulationStep,
     pair: PrimitivePairSettings,
     /// Prop currently carried: exempt from skater pushes and rebake.
@@ -719,6 +817,19 @@ pub(crate) struct PropDynamics {
     move_rules: MoveCommandRules,
     /// Next id [`PropDynamics::next_runtime_id`] tries.
     next_runtime_id: u32,
+    /// Next grab slot ([`PropBody::grab_slot`]) for a body created mid-game.
+    next_grab_slot: u32,
+    /// skate_vita (performance): changes whenever a body's collision type can change (bodies added or removed, the
+    /// tuning table replaced: [`collision_type`] reads the mass and `walkable_mass`).
+    collision_type_epoch: u64,
+    /// skate_vita (performance): changes whenever a body's pose or spawn pose can change (integration, teleport,
+    /// placement, seating, tuning, bodies added or removed): the ped seats on props follow the poses only then.
+    pose_epoch: u64,
+    /// skate_vita (performance): changes with every `set_grab_splines` (the grab-scene splines are rebuilt).
+    grab_generation: u32,
+    /// Better Object Mover (PC overlay, not retail; user 2026-10-20): props without authored grab splines get
+    /// generated ones, so every prop can be moved. Off = retail (only props with authored splines).
+    better_object_mover: bool,
     /// Grind rails per template id, template space (`native-props/<map>.json` `grind_splines`); looked up by
     /// template at query time, so runtime copies of a template carry them too.
     grind_rails: std::collections::BTreeMap<String, std::sync::Arc<[crate::grind_world::props::PropRail]>>,
@@ -727,6 +838,14 @@ pub(crate) struct PropDynamics {
     /// skate_vita (performance): the bodies with grind rails, in id order (the order of
     /// [`Self::rail_poses`]), for the rail queries; kept by [`Self::reorder`] when bodies or rails change.
     rail_bodies: Vec<usize>,
+    /// skate_vita (performance): [`Self::rail_bodies`] that are streamed in (not `dormant`), the same order; the
+    /// rail queries skip the dormant ones without touching them.
+    live_rail_bodies: Vec<usize>,
+    /// Pushers (actor ids, [`LOCAL_PUSHER`] for the local skater) bailing this tick (`set_bailing`): their contacts
+    /// apply the bail clamp.
+    bailing: Vec<u64>,
+    /// Pushers that are not a 75 kg skater (`set_actor_push_mass`): actor id, kg. Peds' body A (10 kg, b342).
+    actor_push_mass: Vec<(u64, f32)>,
 }
 
 /// First id of bodies created mid-game: ids from here up to [`PROP_GRAB_TAG`]
@@ -779,9 +898,9 @@ impl crate::grind_world::RailSource for PropDynamics {
         // skate_vita (performance): the bodies with rails in id order (`rail_poses`' order) tested in place,
         // the distance reject of `PosedRails::append` (same expression) first; upstream built and sorted every
         // prop's posed rails for each query.
-        for &index in &self.rail_bodies {
+        for &index in &self.live_rail_bodies {
             let b = &self.bodies[index];
-            if b.dormant || Some(b.id) == skip {
+            if Some(b.id) == skip {
                 continue;
             }
             let o = b.origin();
@@ -981,15 +1100,26 @@ impl PropDynamics {
         let mut by_id = std::collections::HashMap::new();
         for (index, entry) in instances.iter().enumerate() {
             let object = &objects[entry.object];
-            let Some(body) = Self::build_body(index, entry.id, &object.name, entry.local_points(), object.physics, &object.transform, simulation) else {
+            let Some(mut body) = Self::build_body(index, entry.id, &object.name, entry.local_points(), object.physics, &object.transform, simulation) else {
                 continue;
             };
+            body.grab_slot = bodies.len() as u32;
             bodies.push(body);
             by_id.insert(entry.id, bodies.len() - 1);
         }
+        let next_grab_slot = bodies.len() as u32;
+        let live = (0..bodies.len()).collect();
+        let map_bodies = bodies.len();
         let mut dynamics = Self {
             bodies,
             by_id,
+            live,
+            map_bodies,
+            next_grab_slot,
+            collision_type_epoch: 0,
+            pose_epoch: 0,
+            grab_generation: 0,
+            better_object_mover: false,
             simulation,
             pair: PrimitivePairSettings {
                 padding_a: PropTuning::default().contact_padding,
@@ -1010,6 +1140,9 @@ impl PropDynamics {
             grind_rails: std::collections::BTreeMap::new(),
             grinded: None,
             rail_bodies: Vec::new(),
+            live_rail_bodies: Vec::new(),
+            bailing: Vec::new(),
+            actor_push_mass: Vec::new(),
         };
         dynamics.reorder();
         dynamics
@@ -1019,6 +1152,7 @@ impl PropDynamics {
     fn reorder(&mut self) {
         let mut order: Vec<usize> = (0..self.bodies.len()).filter(|&i| self.rails_of(&self.bodies[i]).is_some()).collect();
         order.sort_by_key(|&i| self.bodies[i].id);
+        self.live_rail_bodies = order.iter().copied().filter(|&i| !self.bodies[i].dormant).collect();
         self.rail_bodies = order;
     }
 
@@ -1061,6 +1195,15 @@ impl PropDynamics {
             return false;
         };
         body.runtime = true;
+        if self.better_object_mover {
+            body.grab_splines = generated_grab_splines(&body);
+        }
+        body.grab_slot = self.next_grab_slot;
+        self.next_grab_slot = self.next_grab_slot.wrapping_add(1);
+        if self.better_object_mover {
+            body.grab_scene_splines = Self::grab_scene_splines_of(&body);
+            self.grab_generation = self.grab_generation.wrapping_add(1);
+        }
         body.type_data = spec.type_data.clone();
         body.rates.linear_velocity = spec.linear_velocity;
         body.rates.angular_velocity = spec.angular_velocity;
@@ -1068,7 +1211,10 @@ impl PropDynamics {
         Self::apply_tuning(&mut body, tuning);
         body.asleep = false;
         self.bodies.push(body);
+        self.collision_type_epoch += 1;
+        self.pose_epoch += 1;
         let index = self.bodies.len() - 1;
+        self.live.push(index);
         self.by_id.insert(id, index);
         self.reorder();
         let inertia = self.body_inertia(index);
@@ -1090,7 +1236,10 @@ impl PropDynamics {
             self.set_held(None);
         }
         let body = self.bodies.remove(index);
+        self.collision_type_epoch += 1;
+        self.pose_epoch += 1;
         self.by_id = self.bodies.iter().enumerate().map(|(i, b)| (b.id, i)).collect();
+        self.live = (0..self.bodies.len()).filter(|&i| !self.bodies[i].dormant).collect();
         self.reorder();
         if self.released.is_some_and(|(r, _)| r == id) {
             self.released = None;
@@ -1177,11 +1326,14 @@ impl PropDynamics {
         Some(PropBody {
             instance,
             id,
+            grab_slot: 0,
             local_center,
             half_extents,
             template: template.to_string(),
             type_data: None,
             grab_splines: Vec::new(),
+            grab_scene_splines: Vec::new(),
+            authored_grab: false,
             tuning: PropTuning::default(),
             authored_center: local_center,
             authored_half_extents: half_extents,
@@ -1329,12 +1481,37 @@ impl PropDynamics {
     /// got splines.
     pub(crate) fn set_grab_splines(&mut self, splines: &std::collections::BTreeMap<String, Vec<crate::living_world::vehicles::CarGrabSpline>>) -> usize {
         let mut count = 0;
+        let better = self.better_object_mover;
         for body in &mut self.bodies {
             let id = body.template.split('/').next().unwrap_or_default();
             body.grab_splines = splines.get(id).cloned().unwrap_or_default();
-            count += usize::from(!body.grab_splines.is_empty());
+            body.authored_grab = !body.grab_splines.is_empty();
+            count += usize::from(body.authored_grab);
+            if better && !body.authored_grab {
+                body.grab_splines = generated_grab_splines(body);
+            }
+            body.grab_scene_splines = Self::grab_scene_splines_of(body);
+            self.grab_generation = self.grab_generation.wrapping_add(1);
         }
         count
+    }
+
+    pub(crate) fn better_object_mover(&self) -> bool {
+        self.better_object_mover
+    }
+
+    /// Better Object Mover on / off: props without authored grab splines get generated ones / lose them. Returns how
+    /// many props have generated splines now.
+    pub(crate) fn set_better_object_mover(&mut self, on: bool) -> usize {
+        self.better_object_mover = on;
+        let mut generated = 0;
+        for body in self.bodies.iter_mut().filter(|b| !b.authored_grab) {
+            body.grab_splines = if on { generated_grab_splines(body) } else { Vec::new() };
+            body.grab_scene_splines = Self::grab_scene_splines_of(body);
+            generated += usize::from(!body.grab_splines.is_empty());
+        }
+        self.grab_generation = self.grab_generation.wrapping_add(1);
+        generated
     }
 
     /// The grind rails per template id (`native-props/<map>.json` `grind_splines`). Returns the props that got
@@ -1350,6 +1527,19 @@ impl PropDynamics {
         self.grinded = id;
     }
 
+    /// The pushers bailing this tick (retail's bail clamp gate; ours: the wipeout state, `board_wiping_out`).
+    pub(crate) fn set_bailing(&mut self, actors: &[u64]) {
+        self.bailing.clear();
+        self.bailing.extend_from_slice(actors);
+    }
+
+    /// The push mass of actors that are not a skater (actor id, kg), for this tick's step; any other actor pushes with
+    /// the prop's `skater_push_mass`.
+    pub(crate) fn set_actor_push_mass(&mut self, actors: &[(u64, f32)]) {
+        self.actor_push_mass.clear();
+        self.actor_push_mass.extend_from_slice(actors);
+    }
+
     fn rails_of(&self, body: &PropBody) -> Option<&std::sync::Arc<[crate::grind_world::props::PropRail]>> {
         self.grind_rails.get(body.template.split('/').next().unwrap_or_default())
     }
@@ -1360,10 +1550,10 @@ impl PropDynamics {
         // skate_vita (performance): the bodies with rails, already in id order (upstream scanned and sorted
         // every body each call).
         let out: Vec<_> = self
-            .rail_bodies
+            .live_rail_bodies
             .iter()
             .map(|&i| &self.bodies[i])
-            .filter(|b| !b.dormant && Some(b.id) != skip)
+            .filter(|b| Some(b.id) != skip)
             .filter_map(|b| {
                 let rails = self.rails_of(b)?.clone();
                 let o = b.origin();
@@ -1377,10 +1567,11 @@ impl PropDynamics {
     /// Every prop with grab splines as a grab-scene object of the world-object provider (scene `+4084`, query mode
     /// bit 0x04; single-player worlds use it, not the DMO provider, b54): template origin and basis as the frame,
     /// points scaled like the body, linear velocity as the record vector, type-2 records. Ids: object
-    /// `PROP_GRAB_TAG | body id`, spline / geometry `PROP_GRAB_TAG | body id << 6 | index`. NOT RETAIL YET: the
-    /// assembly is a stand-in with the object id (the `+172` object is not identified).
+    /// `PROP_GRAB_TAG | grab slot`, spline / geometry `PROP_GRAB_TAG | grab slot << 6 | index`
+    /// ([`Self::prop_of_grab_key`] maps a key back to the prop id). NOT RETAIL YET: the assembly is a stand-in
+    /// with the object id (the `+172` object is not identified).
     pub(crate) fn grab_objects(&self) -> Vec<skate_core::player::offboard::grab_scene::Object> {
-        self.bodies.iter().filter(|b| !b.dormant).filter_map(Self::grab_object_of).collect()
+        self.live.iter().map(|&i| &self.bodies[i]).filter_map(Self::grab_object_of).collect()
     }
 
     /// One prop's grab-scene object (see [`Self::grab_objects`]) from its current pose; `None` without
@@ -1389,43 +1580,102 @@ impl PropDynamics {
         Self::grab_object_of(self.bodies.get(*self.by_id.get(&id)?)?)
     }
 
+    /// The prop id of a grab-scene object or spline key (`PROP_GRAB_TAG | slot << 6 | index`, or the object id
+    /// `PROP_GRAB_TAG | slot` with `spline_key` false); `None` for a key that is not a present prop's.
+    pub(crate) fn prop_of_grab_key(&self, key: u32, spline_key: bool) -> Option<u32> {
+        if key & PROP_GRAB_TAG == 0 {
+            return None;
+        }
+        let slot = if spline_key { (key & !PROP_GRAB_TAG) >> 6 } else { key & !PROP_GRAB_TAG };
+        self.bodies.iter().find(|b| b.grab_slot == slot).map(|b| b.id)
+    }
+
     fn grab_object_of(b: &PropBody) -> Option<skate_core::player::offboard::grab_scene::Object> {
-        use skate_core::player::offboard::grab_scene::{AssemblyData, Descriptor, Geometry, Object, Provider, Spline};
-        (!b.grab_splines.is_empty() && b.id < (1 << 24))
+        use skate_core::player::offboard::grab_scene::{AssemblyData, Object, PartData, Provider, RatesData};
+        (!b.grab_splines.is_empty() && b.grab_slot < (1 << 24))
             .then(|| {
-                let id = PROP_GRAB_TAG | b.id;
+                let id = PROP_GRAB_TAG | b.grab_slot;
                 let o = b.origin();
                 let c = b.rates.basis.columns;
-                let s = b.axis_scale;
                 Object {
                     id,
                     provider: Provider::LivingWorld,
                     disabled: false,
                     assembly_ready: true,
-                    assembly: Some(AssemblyData { identity: id, first_part: None }),
+                    // 82585F58 (b227): the part (assembly+8) is the prop's one body, its rates (part+0x4C) the body's
+                    // rigid body: words 56..65 = its Inertia (inverse tensor, inverse mass, spherical, max linear /
+                    // angular velocity, drags; the tensor's w lane is not read), +144 = angular velocity, +160 =
+                    // centre of mass. Move Object reads +216 only as a null gate (82D442D0 / 82D44A10), so the
+                    // stable prop id serves as part and rates identity.
+                    assembly: Some(AssemblyData {
+                        identity: id,
+                        first_part: Some(PartData {
+                            identity: id,
+                            coefficients_0_to_36: {
+                                let (t, i) = (b.inertia.inverse_tensor, &b.inertia);
+                                [t.x, t.y, t.z, 0.0, i.inverse_mass, i.spherical, i.maximum_linear_velocity, i.maximum_angular_velocity, i.linear_drag, i.angular_drag]
+                            },
+                            rates: Some(RatesData {
+                                identity: id,
+                                vector_48: [b.rates.angular_velocity.x, b.rates.angular_velocity.y, b.rates.angular_velocity.z, 0.0],
+                                transform_position_48: [b.rates.position.x, b.rates.position.y, b.rates.position.z, 0.0],
+                            }),
+                        }),
+                    }),
                     frame: [[c[0][0], c[0][1], c[0][2], 0.0], [c[1][0], c[1][1], c[1][2], 0.0], [c[2][0], c[2][1], c[2][2], 0.0], [o.x, o.y, o.z, 1.0]],
                     object_vector_128: [b.rates.linear_velocity.x, b.rates.linear_velocity.y, b.rates.linear_velocity.z, 0.0],
-                    splines: b
-                        .grab_splines
-                        .iter()
-                        .take(64)
-                        .enumerate()
-                        .map(|(i, g)| {
-                            let key = PROP_GRAB_TAG | (b.id << 6) | i as u32;
-                            Spline {
-                                descriptor: Descriptor { kind: 2, id: key },
-                                geometry: std::sync::Arc::new(Geometry {
-                                    id: key,
-                                    points: g.points.iter().map(|p| [p[0] * s.x, p[1] * s.y, p[2] * s.z, 1.0]).collect(),
-                                    approach_vectors: vec![[g.direction[0], g.direction[1], g.direction[2], 0.0]],
-                                    word_60: g.flags,
-                                }),
-                                word_272: 0,
-                            }
-                        })
-                        .collect(),
+                    // skate_vita (performance): built once (`grab_scene_splines_of`).
+                    splines: b.grab_scene_splines.clone(),
                 }
             })
+    }
+
+    /// skate_vita (performance): every input of [`Self::grab_objects`] that can change, as bits, in its order (each
+    /// object's grab slot, frame, velocities, rigid body position and inertia, and the splines' generation): the same
+    /// signature gives the same objects, so the grab scene needs no refresh.
+    pub(crate) fn grab_signature(&self, out: &mut Vec<u32>) {
+        out.clear();
+        out.push(self.grab_generation);
+        for &i in &self.live {
+            let b = &self.bodies[i];
+            if b.grab_splines.is_empty() || b.grab_slot >= (1 << 24) {
+                continue;
+            }
+            let (o, r, t, n) = (b.origin(), &b.rates, b.inertia.inverse_tensor, &b.inertia);
+            out.push(b.grab_slot);
+            out.extend(
+                [o.x, o.y, o.z, r.linear_velocity.x, r.linear_velocity.y, r.linear_velocity.z, r.angular_velocity.x, r.angular_velocity.y, r.angular_velocity.z, r.position.x, r.position.y, r.position.z]
+                    .into_iter()
+                    .chain(r.basis.columns.into_iter().flatten())
+                    .chain([t.x, t.y, t.z, n.inverse_mass, n.spherical, n.maximum_linear_velocity, n.maximum_angular_velocity, n.linear_drag, n.angular_drag])
+                    .map(f32::to_bits),
+            );
+        }
+    }
+
+    /// The grab-scene splines of a body (upstream's `grab_object_of` spline list, verbatim): keys
+    /// `PROP_GRAB_TAG | grab slot << 6 | index`, the points scaled like the body.
+    fn grab_scene_splines_of(b: &PropBody) -> Vec<skate_core::player::offboard::grab_scene::Spline> {
+        use skate_core::player::offboard::grab_scene::{Descriptor, Geometry, Spline};
+        let s = b.axis_scale;
+        b.grab_splines
+            .iter()
+            .take(64)
+            .enumerate()
+            .map(|(i, g)| {
+                let key = PROP_GRAB_TAG | (b.grab_slot << 6) | i as u32;
+                Spline {
+                    descriptor: Descriptor { kind: 2, id: key },
+                    geometry: std::sync::Arc::new(Geometry {
+                        id: key,
+                        points: g.points.iter().map(|p| [p[0] * s.x, p[1] * s.y, p[2] * s.z, 1.0]).collect(),
+                        approach_vectors: vec![[g.direction[0], g.direction[1], g.direction[2], 0.0]],
+                        word_60: g.flags,
+                    }),
+                    word_272: 0,
+                }
+            })
+            .collect()
     }
 
     /// Vault record name of a body's prop type (diagnostics, mod keys).
@@ -1459,6 +1709,8 @@ impl PropDynamics {
             body.wake();
         }
         self.tuning = table;
+        self.collision_type_epoch += 1;
+        self.pose_epoch += 1;
     }
 
     /// Give one body its prop type's tuning: `collision_box` moves the box
@@ -1543,9 +1795,9 @@ impl PropDynamics {
     /// whether it is carried (retail switches a carried object's obstacle off). Id order.
     pub(crate) fn obstacle_boxes(&self) -> Vec<(u32, Vector3, Basis3, Vector3, Vector3, bool)> {
         let mut out: Vec<_> = self
-            .bodies
+            .live
             .iter()
-            .filter(|b| !b.dormant)
+            .map(|&i| &self.bodies[i])
             .map(|b| (b.id, b.rates.position, b.rates.basis, b.half_extents, b.rates.linear_velocity, self.held == Some(b.id)))
             .collect();
         out.sort_by_key(|b| b.0);
@@ -1553,7 +1805,7 @@ impl PropDynamics {
     }
 
     /// A body's model name for logs ("DMO_DT_BenchFlat_1015"), or "?".
-    fn describe_template(&self, id: u32) -> String {
+    pub(crate) fn describe_template(&self, id: u32) -> String {
         self.template_of(id).map_or("?".to_owned(), |t| t.split_once('/').map_or(t, |x| x.1).split("_0x").next().unwrap_or(t).to_owned())
     }
 
@@ -1581,11 +1833,30 @@ impl PropDynamics {
             let (origin, basis) = self.spawn_pose(id)?;
             self.teleport(id, origin, basis);
         }
-        let body = self.bodies.get_mut(*self.by_id.get(&id)?)?;
+        let index = *self.by_id.get(&id)?;
+        let body = self.bodies.get_mut(index)?;
         if body.dormant == dormant {
             return None;
         }
         body.dormant = dormant;
+        match (dormant, self.live.binary_search(&index)) {
+            (true, Ok(at)) => {
+                self.live.remove(at);
+            }
+            (false, Err(at)) => self.live.insert(at, index),
+            _ => {}
+        }
+        // The rail bodies are in id order.
+        if self.rail_bodies.binary_search_by_key(&id, |&i| self.bodies[i].id).is_ok() {
+            match (dormant, self.live_rail_bodies.binary_search_by_key(&id, |&i| self.bodies[i].id)) {
+                (true, Ok(at)) => {
+                    self.live_rail_bodies.remove(at);
+                }
+                (false, Err(at)) => self.live_rail_bodies.insert(at, index),
+                _ => {}
+            }
+        }
+        let body = &mut self.bodies[index];
         body.asleep = true;
         body.rates.linear_velocity = Vector3::ZERO;
         body.rates.angular_velocity = Vector3::ZERO;
@@ -1599,12 +1870,13 @@ impl PropDynamics {
     /// the type priority (no type data: the `default` record, 100).
     /// skate_vita: how many placements [`Self::dmo_placements`] returns, without building them.
     pub(crate) fn dmo_placement_count(&self) -> usize {
-        self.bodies.iter().filter(|b| !b.runtime).count()
+        debug_assert_eq!(self.map_bodies, self.bodies.iter().filter(|b| !b.runtime).count());
+        self.map_bodies
     }
 
     /// skate_vita: the map props streamed in, for drawing: id, template origin, basis and per-axis scale.
     pub(crate) fn streamed_poses(&self) -> impl Iterator<Item = (u32, Vector3, Basis3, Vector3)> + '_ {
-        self.bodies.iter().filter(|b| !b.dormant && !b.runtime).map(|b| (b.id, b.origin(), b.rates.basis, b.axis_scale))
+        self.live.iter().map(|&i| &self.bodies[i]).filter(|b| !b.runtime).map(|b| (b.id, b.origin(), b.rates.basis, b.axis_scale))
     }
 
     pub(crate) fn dmo_placements(&self) -> Vec<skate_core::living_world::dmo::DmoPlacement> {
@@ -1649,7 +1921,7 @@ impl PropDynamics {
     /// `(id, centre)`.
     pub(crate) fn nearest_body(&self, point: Vector3, radius: f32) -> Option<(u32, Vector3)> {
         let mut best: Option<(u32, Vector3, f32)> = None;
-        for body in self.bodies.iter().filter(|b| !b.dormant) {
+        for body in self.live.iter().map(|&i| &self.bodies[i]) {
             // Local-space point clamped into the box: the gap vector to it is
             // the surface distance (zero when the point is inside).
             let d = sub(point, body.rates.position);
@@ -1920,7 +2192,8 @@ impl PropDynamics {
     fn apply_upright(&mut self, time_step: f32) {
         let settings = self.tuning.upright;
         let replaces = self.move_rules.yaw_replaces_torque;
-        for body in self.bodies.iter_mut().filter(|b| !b.dormant) {
+        for &index in &self.live {
+            let body = &mut self.bodies[index];
             let Some(timer) = body.upright_timer else { continue };
             let timer = timer + settings.tick_seconds;
             body.upright_timer = (timer <= settings.window_seconds).then_some(timer);
@@ -1987,6 +2260,7 @@ impl PropDynamics {
         if !self.carry_to(id, target, max_speed, time_step) {
             return false;
         }
+        self.pose_epoch += 1;
         let body = &mut self.bodies[self.by_id[&id]];
         body.rates.basis = basis;
         body.rates.orientation = quaternion_from_basis(basis);
@@ -2008,6 +2282,7 @@ impl PropDynamics {
     /// instance index so the caller can rebake its triangles.
     pub(crate) fn teleport(&mut self, id: u32, origin: Vector3, basis: Basis3) -> Option<usize> {
         let cool_down = self.step_simulation().cool_down;
+        self.pose_epoch += 1;
         let body = self.bodies.get_mut(*self.by_id.get(&id)?)?;
         body.rates.basis = basis;
         body.rates.orientation = quaternion_from_basis(basis);
@@ -2020,6 +2295,33 @@ impl PropDynamics {
         body.rates.cool_down = cool_down;
         body.asleep = true;
         Some(body.instance)
+    }
+
+    /// skate_vita: see [`Self::pose_epoch`] (the field).
+    pub(crate) fn pose_epoch(&self) -> u64 {
+        self.pose_epoch
+    }
+
+    /// skate_vita: see [`Self::collision_type_epoch`] (the field).
+    pub(crate) fn collision_type_epoch(&self) -> u64 {
+        self.collision_type_epoch
+    }
+
+    /// skate_vita (performance): whether body `id` is in [`Self::moved_ids`] (the same test, for one body).
+    pub(crate) fn is_moved(&self, id: u32) -> bool {
+        self.by_id.get(&id).is_some_and(|&i| Self::moved(&self.bodies[i]))
+    }
+
+    fn moved(b: &PropBody) -> bool {
+        if b.runtime {
+            return false;
+        }
+        let o = b.origin();
+        let d = sub(o, b.spawn_origin);
+        d.x * d.x + d.y * d.y + d.z * d.z > SPAWN_POSE_EPSILON * SPAWN_POSE_EPSILON
+            || b.rates.basis.columns.iter().zip(b.spawn_basis.columns.iter()).any(|(a, s)| {
+                a.iter().zip(s.iter()).any(|(x, y)| (x - y).abs() > SPAWN_POSE_EPSILON)
+            })
     }
 
     /// Ids of bodies whose pose differs from the authored spawn pose, in id order.
@@ -2107,10 +2409,8 @@ impl PropDynamics {
         let reach = skate_core::physics::board_world::query_metadata::Bounds::from_points(
             skater_bounds.iter().chain(&other_bounds).flatten().flat_map(|b| [b.min, b.max]),
         );
-        for index in 0..self.bodies.len() {
-            if self.bodies[index].dormant {
-                continue;
-            }
+        for k in 0..self.live.len() {
+            let index = self.live[k];
             let held = self.is_held(index);
             // Skater push: cheap bounds reject, then the retail pair query.
             // The carried prop is velocity-driven by the carrier; letting the
@@ -2119,6 +2419,8 @@ impl PropDynamics {
                 let body_bounds = self.bodies[index].bounds();
                 let mut overlapping = false;
                 let mut closing = false;
+                let before = self.bodies[index].rates.linear_velocity;
+                let mut bail_touch = false;
                 // The prop under the local skater's grind is not pushed by them (others still can).
                 let spared = self.grinded == Some(self.bodies[index].id);
                 let reachable = reach.is_some_and(|r| body_bounds.overlaps(r));
@@ -2151,7 +2453,8 @@ impl PropDynamics {
                         continue;
                     }
                     let pushes = self.stats.skater_pushes;
-                    let contact = self.push_from_skater(index, volume, &manifold);
+                    let push_mass = self.actor_push_mass.iter().find(|a| a.0 == actor).map(|a| a.1);
+                    let contact = self.push_from_skater(index, volume, &manifold, push_mass);
                     if self.stats.skater_pushes > pushes {
                         self.bodies[index].pushed_by = Some(actor);
                     }
@@ -2159,6 +2462,17 @@ impl PropDynamics {
                         SkaterContact::Closing => closing = true,
                         SkaterContact::OverlapOnly => overlapping = true,
                         SkaterContact::Separate => {}
+                    }
+                    bail_touch |= contact != SkaterContact::Separate && self.bailing.contains(&actor);
+                }
+                // A bailing actor touched it: retail caps the prop's velocity and wakes it (once per prop per tick).
+                let solver = self.tuning.solver;
+                if bail_touch && solver.bail_clamp {
+                    let body = &mut self.bodies[index];
+                    if let Some((linear, angular)) = bail_clamp(&solver, body.inertia.inverse_mass, before, body.rates.linear_velocity, body.rates.angular_velocity) {
+                        body.rates.linear_velocity = linear;
+                        body.rates.angular_velocity = angular;
+                        body.wake();
                     }
                 }
                 // A skater volume parked inside the box (the board under a
@@ -2187,7 +2501,7 @@ impl PropDynamics {
         let solver = self.tuning.solver;
         let simulation = self.step_simulation();
         // Awake bodies in body order (deterministic; plain indices).
-        let awake: Vec<usize> = (0..self.bodies.len()).filter(|&i| !self.bodies[i].asleep && !self.bodies[i].dormant).collect();
+        let awake: Vec<usize> = self.live.iter().copied().filter(|&i| !self.bodies[i].asleep).collect();
         self.stats.awake = awake.len() as u32;
         // Parameter block swap (82C53EF8): a body commanded since its last
         // step runs on the commanded block, otherwise on its free block;
@@ -2210,6 +2524,9 @@ impl PropDynamics {
         let rows = (solver.row_solver && !awake.is_empty()).then(|| self.row_corrections(world, &awake, solver.iterations));
         drop(rows_scope);
         let _integrate = skate_core::profile::scope("z_sp_integrate_rebake");
+        if !awake.is_empty() {
+            self.pose_epoch += 1;
+        }
         let mut sleeps = 0u32;
         for &index in &awake {
             let held = self.is_held(index);
@@ -2291,8 +2608,9 @@ impl PropDynamics {
     /// session loads (after the census's first pass).
     pub(crate) fn prepare_streamed(&mut self, world: &BoardWorld, layer: &mut crate::skate_world::PropCollisionLayer) {
         let mut poses = Vec::new();
-        for index in 0..self.bodies.len() {
-            if self.bodies[index].dormant || self.is_held(index) {
+        for k in 0..self.live.len() {
+            let index = self.live[k];
+            if self.is_held(index) {
                 continue;
             }
             let seated = !self.bodies[index].seated && self.bodies[index].asleep && self.seat(world, index);
@@ -2341,6 +2659,7 @@ impl PropDynamics {
         body.rates.position.y -= drop;
         body.rest_y = body.rates.position.y;
         body.spawn_origin.y -= drop;
+        self.pose_epoch += 1;
         true
     }
 
@@ -2386,6 +2705,7 @@ impl PropDynamics {
         index: usize,
         volume: &BoardWorldVolume,
         manifold: &PrimitiveContactManifold,
+        push_mass: Option<f32>,
     ) -> SkaterContact {
         let tuning = self.bodies[index].tuning;
         // The overlap nudge stops once the volume has sat inside for
@@ -2431,7 +2751,8 @@ impl PropDynamics {
         // (#15 capped only body bumps), so a board held against a prop cannot
         // keep accelerating it either.
         let mass = 1.0 / self.bodies[index].inertia.inverse_mass;
-        let reduced = mass * tuning.skater_push_mass / (tuning.skater_push_mass + mass);
+        let pusher = push_mass.unwrap_or(tuning.skater_push_mass).max(0.0);
+        let reduced = mass * pusher / (pusher + mass).max(1e-6);
         let mut amount = strongest * reduced * tuning.push_transfer;
         let cap = if matches!(
             volume.body,
@@ -2663,8 +2984,9 @@ impl PropDynamics {
             self.resolve_static(index, manifold, material, points as f32, &mut corrections);
         }
         let box_primitive = self.bodies[index].box_primitive();
-        for other in 0..self.bodies.len() {
-            if other == index || self.bodies[other].dormant {
+        for k in 0..self.live.len() {
+            let other = self.live[k];
+            if other == index {
                 continue;
             }
             if !self.bodies[index].bounds().overlaps(self.bodies[other].bounds().expanded(tuning.contact_padding)) {
@@ -2844,6 +3166,7 @@ impl PropDynamics {
 }
 
 /// How one skater volume touched a prop this tick.
+#[derive(Clone, Copy, PartialEq)]
 enum SkaterContact {
     Separate,
     /// Inside the box but not closing on it.
@@ -3629,6 +3952,7 @@ mod tests {
             forward: Vector3::new(0., 0., 1.),
             time_step: simulation().time_step,
             skeleton: None,
+            ground_grab: None,
         }
     }
 
@@ -3825,7 +4149,8 @@ mod tests {
             let (dx, dz) = (end.x - start.x, end.z - start.z);
             let travelled = (dx * dx + dz * dz).sqrt();
             let t = crate::physics::prop_carry::CarryLocomotion::default().move_object;
-            let (ex, ez) = (x * t.side_speed, z * if z > 0.0 { t.push_speed } else { t.pull_speed });
+            // Facing +Z, stick right is the skater's right, -X (the +400 side row, b241; laptop 2026-10-18).
+            let (ex, ez) = (-x * t.side_speed, z * if z > 0.0 { t.push_speed } else { t.pull_speed });
             let expected = (ex * ex + ez * ez).sqrt();
             assert!(travelled > 0.5, "stick ({x:.2}, {z:.2}) did not move the prop: {travelled}");
             let along = (dx * ex + dz * ez) / (travelled * expected);
@@ -3837,6 +4162,72 @@ mod tests {
         }
     }
 
+    /// Better Object Mover: a prop without authored grab splines gets one generated spline per vertical box face (the
+    /// authored layout: outward approach, flags 4) and loses them again when it goes off; a later map load (new
+    /// splines) keeps them while on. Off = retail: no grab object for it.
+    #[test]
+    fn better_object_mover_gives_props_without_grab_splines_generated_ones() {
+        let (_, _, mut dynamics) = fixture([0., REST_Y, 1.2]);
+        assert_eq!(dynamics.set_grab_splines(&std::collections::BTreeMap::new()), 0);
+        assert!(dynamics.grab_object(7).is_none(), "retail: no grab handles, not movable");
+        assert_eq!(dynamics.set_better_object_mover(true), 1);
+        let object = dynamics.grab_object(7).expect("generated grab object");
+        assert_eq!(object.splines.len(), 4);
+        for spline in &object.splines {
+            let a = spline.geometry.approach_vectors[0];
+            assert!((a[0].abs() + a[2].abs() - 1.0).abs() < 1e-6 && a[1] == 0.0, "outward horizontal approach {a:?}");
+            assert_eq!(spline.geometry.word_60, 4);
+        }
+        assert_eq!(dynamics.set_grab_splines(&std::collections::BTreeMap::new()), 0);
+        assert!(dynamics.grab_object(7).is_some(), "kept across a spline reload while on");
+        assert_eq!(dynamics.set_better_object_mover(false), 0);
+        assert!(dynamics.grab_object(7).is_none());
+    }
+
+    /// The carry binds exactly the record the Move Object enter passed (82D442D0, b233): the decision on tick N
+    /// starts nothing, the published record binds on N+1, even when another record of the prop is nearer (the large
+    /// dumpster's bottom edges, b224 / b226).
+    #[test]
+    fn the_carry_binds_the_published_record_at_the_move_object_enter() {
+        let (_, _, mut dynamics) = fixture([0., REST_Y, 1.2]);
+        let mut splines = std::collections::BTreeMap::new();
+        // 0: a bottom edge on the near face (approach straight down); 1: the rim higher up the same face.
+        splines.insert("template".to_owned(), vec![
+            crate::living_world::vehicles::CarGrabSpline { points: vec![[-0.4, -0.5, -0.5], [0.4, -0.5, -0.5]], direction: [0.0, -1.0, 0.0], flags: 0 },
+            crate::living_world::vehicles::CarGrabSpline { points: vec![[-0.4, 0.4, -0.5], [0.4, 0.4, -0.5]], direction: [0.0, 0.0, -1.0], flags: 0 },
+        ]);
+        assert_eq!(dynamics.set_grab_splines(&splines), 1);
+        // 82585F58: the record's part / rates block is filled, so the enter's +216 gate (82D442D0) passes.
+        let object = dynamics.grab_object(7).unwrap();
+        let part = object.assembly.as_ref().and_then(|a| a.first_part.as_ref()).expect("a part");
+        // Grab ids pack the body's grab slot (0: the fixture's first body), not its id (map ids are 32-bit).
+        assert_eq!((part.identity, part.rates.as_ref().map(|r| r.identity)), (PROP_GRAB_TAG, Some(PROP_GRAB_TAG)));
+        assert_eq!(part.coefficients_0_to_36[4], dynamics.bodies[0].inertia.inverse_mass);
+        let key = |i: u32| PROP_GRAB_TAG | i;
+        assert_eq!(dynamics.prop_of_grab_key(key(1), true), Some(7));
+        assert_eq!(dynamics.prop_of_grab_key(PROP_GRAB_TAG, false), Some(7));
+        assert_eq!(dynamics.prop_of_grab_key(1 << 6, true), None, "not a prop key");
+        let records = crate::physics::prop_carry::authored_records(&dynamics, 7, true).unwrap();
+        let rim = records.iter().find(|r| r.0[48] == key(1)).unwrap().clone();
+        assert!(rim.0[49] != 0 && rim.0[54] != 0, "the enter's geometry and rates gate");
+        let at = crate::physics::prop_carry::Carrier {
+            ground_grab: Some(Some((2, key(1)))),
+            ..carrier(skate_core::player::state::PhysicalStateId::BipedGround, 0.)
+        };
+        let mut carry = crate::physics::prop_carry::PropCarry::default();
+        carry.set_authored_records(true);
+        carry.update(&mut dynamics, tick(), at);
+        assert_eq!(carry.held(), None, "tick N: the decision alone starts nothing");
+        carry.bind_published(rim);
+        let at = crate::physics::prop_carry::Carrier { ground_grab: Some(None), state: skate_core::player::state::PhysicalStateId::OffBoardPushing, ..at };
+        carry.update(&mut dynamics, tick(), at);
+        assert_eq!((carry.held(), carry.held_grip().map(|g| g.descriptor)), (Some(7), Some((2, key(1)))), "binds the published rim");
+        // Nothing published: no carry, also with grab held in 502.
+        let mut idle = crate::physics::prop_carry::PropCarry::default();
+        idle.set_authored_records(true);
+        idle.update(&mut dynamics, tick(), at);
+        assert_eq!(idle.held(), None);
+    }
     /// Move Object step 3: a prop with an authored grab spline is carried by
     /// that record (82D444A0 / 82D45D30), not the box stand-in: the grip sits
     /// on the spline, the facing is minus its approach vector, and the grip
@@ -4550,6 +4941,79 @@ mod tests {
         out
     }
 
+    /// Retail's bail clamp `82C530F0` with its defaults: the cap is 5 / mass m/s and 15 / mass rad/s under 200 kg,
+    /// a heavier prop is stopped (b206, b209).
+    #[test]
+    fn bail_clamp_caps_light_props_and_stops_heavy_ones() {
+        let s = PropSolverSettings::default();
+        let v = |x: f32, y: f32, z: f32| Vector3::new(x, y, z);
+        let zero = v(0.0, 0.0, 0.0);
+        // 1 kg at rest (d = 0): the ball is centred on 0 with radius 5, so 10 m/s becomes 5 m/s; spin 30 -> 15.
+        let (l, a) = bail_clamp(&s, 1.0, zero, v(10.0, 0.0, 0.0), v(0.0, 30.0, 0.0)).unwrap();
+        assert!((l.x - 5.0).abs() < 1e-5 && l.y.abs() < 1e-6 && (a.y - 15.0).abs() < 1e-4, "{l:?} {a:?}");
+        // 20 kg: 0.25 m/s, 0.75 rad/s.
+        let (l, a) = bail_clamp(&s, 1.0 / 20.0, zero, v(0.0, 0.0, 3.0), v(2.0, 0.0, 0.0)).unwrap();
+        assert!((length(l) - 0.25).abs() < 1e-5 && (length(a) - 0.75).abs() < 1e-5);
+        // Already inside the ball: unchanged.
+        let (l, _) = bail_clamp(&s, 1.0 / 20.0, zero, v(0.1, 0.0, 0.0), zero).unwrap();
+        assert!((l.x - 0.1).abs() < 1e-6);
+        // Moving along d: up to |d| + cap ahead (ball of radius mag around n * mag).
+        let (l, _) = bail_clamp(&s, 1.0 / 20.0, v(2.0, 0.0, 0.0), v(9.0, 0.0, 0.0), zero).unwrap();
+        assert!((l.x - 2.25).abs() < 1e-5, "{l:?}");
+        // 300 kg: stopped, spin zeroed.
+        let (l, a) = bail_clamp(&s, 1.0 / 300.0, zero, v(1.0, 0.0, 0.0), v(0.0, 1.0, 0.0)).unwrap();
+        assert!(length(l) < 1e-6 && length(a) < 1e-6);
+        // A static body is left alone.
+        assert!(bail_clamp(&s, 0.0, zero, v(1.0, 0.0, 0.0), zero).is_none());
+    }
+
+    /// A bailing pusher's contacts clamp the prop: the bin barely moves, while the same run without the bail
+    /// knocks it ahead.
+    #[test]
+    fn a_bailing_pusher_does_not_throw_a_bin() {
+        let half = [0.3, 0.45, 0.3];
+        let rest = super::super::ground::HEIGHT + 0.45;
+        let pushed = {
+            let (world, mut layer, mut dynamics) = box_fixture([0., rest, 0.], half);
+            npc_run(&mut dynamics, &world, &mut layer, -3.0, 5.0, 120, true)
+        };
+        let (world, mut layer, mut dynamics) = box_fixture([0., rest, 0.], half);
+        dynamics.set_bailing(&[crate::living_world::npc_skaters::PROXY_ID_TAG | NPC.to_u64()]);
+        let bailed = npc_run(&mut dynamics, &world, &mut layer, -3.0, 5.0, 120, true);
+        let (free, clamped) = (pushed.last().unwrap().0, bailed.last().unwrap().0);
+        assert!(free > 1.0 && clamped < free * 0.5, "free push {free:.2} m, bail-clamped {clamped:.2} m");
+        let speed = length(dynamics.bodies[0].rates.linear_velocity);
+        let mass = 1.0 / dynamics.bodies[0].inertia.inverse_mass;
+        assert!(speed <= 2.0 * 5.0 / mass + 1e-3, "speed {speed} for {mass} kg");
+    }
+
+    /// A bin slid toward a standing ped stops short of it: the ped's body A (group 9, 10 kg) is a pusher with its own
+    /// mass, so the prop no longer passes through peds (b342 section 7).
+    #[test]
+    fn a_sliding_bin_stops_against_a_peds_body_a() {
+        use crate::living_world::ped_body::{body_a_id, body_a_volume, PedProxy};
+        let half = [0.3, 0.45, 0.3];
+        let rest = super::super::ground::HEIGHT + 0.45;
+        let ped_x = 1.2;
+        let run = |ped: bool| {
+            let (world, mut layer, mut dynamics) = box_fixture([0., rest, 0.], half);
+            dynamics.bodies[0].rates.linear_velocity = Vector3::new(4.0, 0.0, 0.0);
+            dynamics.bodies[0].wake();
+            let proxy = PedProxy::default();
+            let id = body_a_id(3);
+            dynamics.set_actor_push_mass(&[(id, proxy.mass)]);
+            let feet = glam::Vec3::new(ped_x, super::super::ground::HEIGHT, 0.0);
+            let volumes = if ped { vec![(id, body_a_volume(feet, glam::Vec3::ZERO, &proxy))] } else { Vec::new() };
+            for _ in 0..90 {
+                dynamics.step_with_actors(&world, &mut layer, &[], &volumes);
+            }
+            dynamics.bodies[0].rates.position.x
+        };
+        let (free, blocked) = (run(false), run(true));
+        assert!(free > ped_x, "without the ped the bin slides past it: x {free:.2}");
+        assert!(blocked < ped_x - 0.3 && blocked < free, "the ped stops the bin: x {blocked:.2} (free {free:.2})");
+    }
+
     /// A bin-sized prop resting on an NPC skater's line is knocked ahead of it (the player's push
     /// rule), the NPC owns the moved prop, and the bin never ends behind the NPC's board.
     #[test]
@@ -4710,6 +5174,7 @@ mod tests {
             forward: Vector3::new(0., 0., 1.),
             time_step: dt,
             skeleton: None,
+            ground_grab: None,
         };
         carry.update(&mut dynamics, tick(), at);
         assert_eq!(carry.held(), Some(id), "grab failed");
@@ -4774,6 +5239,7 @@ mod tests {
             forward: Vector3::new(0., 0., 1.),
             time_step: dt,
             skeleton: None,
+            ground_grab: None,
         };
         carry.update(&mut dynamics, tick(), at);
         assert_eq!(carry.held(), Some(id), "grab failed");
@@ -4904,6 +5370,7 @@ mod tests {
             forward: Vector3::new(0., 0., -1.),
             time_step: dt,
             skeleton: None,
+            ground_grab: None,
         };
         carry.update(&mut dynamics, tick(), at);
         assert_eq!(carry.held(), Some(id), "grab failed");
@@ -4948,6 +5415,7 @@ mod tests {
                 forward: Vector3::new(0., 0., 1.),
                 time_step: dt,
                 skeleton: None,
+                ground_grab: None,
             };
             carry.update(&mut dynamics, tick(), at);
             assert_eq!(carry.held(), Some(id), "{name}: grab failed");
@@ -5351,6 +5819,10 @@ mod tests {
     #[test]
     #[ignore]
     fn downtown_dragged_props_rest_on_the_floor() {
+        // skate_vita: the interim carry this test was written for (upstream runs it with prop grab off, the switch's
+        // default); a test that turned the switch on before it made the carry use the authored records, under which
+        // newspaper box 2198011218 sinks in upstream too (`fad5aae`).
+        set_prop_grab_enabled(false);
         let root = std::path::PathBuf::from(std::env::var_os("SKATE3_ASSET_ROOT").expect("set SKATE3_ASSET_ROOT"));
         let map_path = std::path::PathBuf::from(std::env::var_os("SKATE3_MAP").expect("set SKATE3_MAP"));
         let map = skate_data::skate_map::SkateMap::parse(&std::fs::read(&map_path).unwrap()).unwrap();
@@ -5374,6 +5846,7 @@ mod tests {
                 forward,
                 time_step: dt,
                 skeleton: None,
+                ground_grab: None,
             };
             use skate_core::player::state::PhysicalStateId::{BipedGround, OffBoardPushing};
             let mut carry = crate::physics::prop_carry::PropCarry::default();
@@ -5413,5 +5886,56 @@ mod tests {
             }
         }
         assert!(failures.is_empty(), "props sank: {failures:?}");
+    }
+}
+
+/// Retail collision types of DMO query meshes (the query mesh's rejection flag is `1 << type`; b221-b223 and the trace
+/// in .local/research/prop-types): a held prop (a ped's hand prop switches on pickup, slot 32 `82C56B00`).
+pub(crate) const HELD_COLLISION_TYPE: u32 = 13;
+/// A prop at least `walkable_mass` heavy.
+pub(crate) const HEAVY_COLLISION_TYPE: u32 = 12;
+/// A lighter prop.
+pub(crate) const LIGHT_COLLISION_TYPE: u32 = 14;
+
+/// The collision type of a prop of `mass` kg (13 while held). NOT RETAIL YET for the player's own grab: the ped's
+/// pickup switches to 13 in the trace; that the player's grab does too is not traced.
+pub(crate) fn collision_type(mass: f32, held: bool, walkable_mass: f32) -> u32 {
+    if held {
+        HELD_COLLISION_TYPE
+    } else if mass >= walkable_mass {
+        HEAVY_COLLISION_TYPE
+    } else {
+        LIGHT_COLLISION_TYPE
+    }
+}
+
+impl PropDynamics {
+    /// Each body's collision instance and retail collision type (template mass, not a carry's effective mass).
+    pub(crate) fn for_each_collision_type(&self, held: Option<u32>, mut f: impl FnMut(usize, u32)) {
+        let walkable = self.tuning.solver.walkable_mass;
+        for body in &self.bodies {
+            let w = body.authored_inertia.inverse_mass;
+            let mass = if w > 0.0 { 1.0 / w } else { f32::INFINITY };
+            f(body.instance, collision_type(mass, held == Some(body.id), walkable));
+        }
+    }
+}
+
+#[cfg(test)]
+mod collision_type_tests {
+    use super::*;
+
+    #[test]
+    fn props_get_retails_collision_types_by_mass() {
+        // b223: the flat bench is 50 kg, the cone 1.75 kg; 5.5 kg itself is heavy (`>=`).
+        assert_eq!(collision_type(50.0, false, 5.5), HEAVY_COLLISION_TYPE);
+        assert_eq!(collision_type(1.75, false, 5.5), LIGHT_COLLISION_TYPE);
+        assert_eq!(collision_type(5.5, false, 5.5), HEAVY_COLLISION_TYPE);
+        assert_eq!(collision_type(50.0, true, 5.5), HELD_COLLISION_TYPE);
+        // The walker's mask (0x6000) skips 13 and 14, so only the heavy type is ground for it.
+        let mask = skate_core::player::offboard::air_selector::MESH_REJECT_MASK;
+        assert_eq!(mask & (1 << HEAVY_COLLISION_TYPE), 0);
+        assert_ne!(mask & (1 << LIGHT_COLLISION_TYPE), 0);
+        assert_ne!(mask & (1 << HELD_COLLISION_TYPE), 0);
     }
 }

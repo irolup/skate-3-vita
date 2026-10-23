@@ -44,6 +44,8 @@ pub(super) fn load(data: &Collections) -> Result<(Settings, [Mode; 5]), String> 
                 balance_total: f("Wipeout_GroundBalanceTotal")?,
                 balance_min_speed: f("Wipeout_GroundBalanceMinSpeed")?,
                 balance_base: f("Wipeout_GroundBalanceBase")?,
+                // 82D8F9E0 code constant (no vault field): the side-on mid-trick factor, mod-tunable.
+                trick_scalar: f32::from_bits(0x3e99_999a),
             },
             air: AirSettings {
                 xz_trick: f("Wipeout_AirXZTrick")?,

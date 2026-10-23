@@ -1,6 +1,16 @@
 // skate vita world: vertex colour faded into the sky colour by fog.
 uniform float3 fogColor;
 
-float4 main(float4 vColor : COLOR, float vFog : TEXCOORD0) : COLOR {
-	return float4(lerp(fogColor, vColor.rgb, vFog), 1.0f);
+// The colour grade (retail post FX colour matrix, `skate_core::colour_matrix`): near and far 3x4 rows, blended by
+// the vertex's depth weight; identity unless a record (the zombie cheat) is on.
+uniform float4 grade[6];
+float3 graded(float3 c, float w) {
+	float4 x = float4(c, 1.0f);
+	float3 n = float3(dot(grade[0], x), dot(grade[1], x), dot(grade[2], x));
+	float3 f = float3(dot(grade[3], x), dot(grade[4], x), dot(grade[5], x));
+	return lerp(n, f, w);
+}
+
+float4 main(float4 vColor : COLOR, float2 vFog : TEXCOORD0) : COLOR {
+	return float4(graded(lerp(fogColor, vColor.rgb, vFog.x), vFog.y), 1.0f);
 }

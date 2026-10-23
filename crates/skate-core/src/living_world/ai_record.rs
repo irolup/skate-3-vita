@@ -160,20 +160,23 @@ pub fn with_trajectory(record: &mut ExternalPhysicsInput, jump: &super::replay::
     }
 }
 
-/// The take-off node the record's trajectory comes from: the first node from `from` on that
-/// carries a recorded trajectory, looking over ground nodes only (once the line is airborne the
-/// jump has started). Retail reads the PathController's current ext entry (`pc+692`, its cursor
-/// is not decoded); the selector's accept rule (2 m of the recorded start) guards the choice.
-pub fn upcoming_trajectory(line: &super::replay::ReplayLine, from: u32) -> Option<(u32, &super::replay::ReplayJump)> {
-    for (i, n) in line.nodes.iter().enumerate().skip(from as usize) {
-        if let Some(j) = n.jump.and_then(|j| line.jumps.get(j as usize)).filter(|j| j.flags & EXT_HAS_TRAJECTORY != 0) {
-            return Some((i as u32, j));
-        }
-        if n.flags & super::replay::node_flags::AIRBORNE != 0 {
-            return None;
-        }
+/// The node whose ext the record reads (`sub_8246DA18`, `pc+692`): the cursor's node while its
+/// segment fraction is below 0.5, else the next node; the last node reads its own (b294).
+pub fn trajectory_node(line: &super::replay::ReplayLine, node: u32, frame_in_segment: u32) -> u32 {
+    if node as usize + 1 >= line.nodes.len() {
+        return node;
     }
-    None
+    let seg = line.segment_frames(node);
+    if seg > 0 && frame_in_segment as f32 / seg as f32 >= 0.5 { node + 1 } else { node }
+}
+
+/// The record's trajectory this tick: the ext of [`trajectory_node`], only with HasTrajectory
+/// (ext byte `+0x27` bit 0). Between jumps there is none, and the gate reads the cached previous
+/// jump (`publication.rs`), as retail does. Bit 27 comes from `lands_in_grind(line, max(node - 1, 0))`
+/// with the cursor's node (`pc+704`), not the ext's.
+pub fn current_trajectory(line: &super::replay::ReplayLine, node: u32, frame_in_segment: u32) -> Option<&super::replay::ReplayJump> {
+    let n = line.nodes.get(trajectory_node(line, node, frame_in_segment) as usize)?;
+    n.jump.and_then(|j| line.jumps.get(j as usize)).filter(|j| j.flags & EXT_HAS_TRAJECTORY != 0)
 }
 
 /// `sub_824551C0(path, node)`: whether the recorded jump after `from` lands in a grind or slide.
@@ -291,10 +294,17 @@ mod tests {
         assert_eq!(f(8), [-1.0; 4]);
         assert_eq!(f(9)[..3], [0.0, 0.1, 0.0]);
         assert_eq!(r.flags, base | FLAG_TRAJECTORY | FLAG_LANDS_IN_GRIND);
-        // The take-off ahead of the cursor, none once airborne.
+        // Only the cursor's nearest node (the next one from half the segment on), none between
+        // jumps, the last node its own (b294, `sub_8246DA18` reads `pc+692`).
         let l2 = line(&[(0, 0, 4, None), (0, 0, 4, Some(0)), (0, nf::AIRBORNE, 4, None), (0, 0, 4, Some(0))]);
-        assert_eq!(upcoming_trajectory(&l2, 0).map(|t| t.0), Some(1));
-        assert_eq!(upcoming_trajectory(&l2, 2).map(|t| t.0), None);
+        assert!(current_trajectory(&l2, 0, 0).is_none());
+        assert!(current_trajectory(&l2, 0, 1).is_none());
+        assert_eq!(trajectory_node(&l2, 0, 2), 1);
+        assert!(current_trajectory(&l2, 0, 2).is_some());
+        assert!(current_trajectory(&l2, 1, 1).is_some());
+        assert!(current_trajectory(&l2, 2, 0).is_none());
+        assert_eq!(trajectory_node(&l2, 3, 0), 3);
+        assert!(current_trajectory(&l2, 3, 0).is_some());
         // A slot without HasTrajectory adds nothing.
         let mut plain = build(&LineTarget { position: [0.0; 3], frame: IDENTITY, step: [0.0, 0.0, 0.1] }, [0.0, 0.0, 1.0], &SteerState::default());
         let before = plain.clone();

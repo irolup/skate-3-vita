@@ -62,6 +62,15 @@ pub(super) fn load_collision_settings(data: &Collections) -> Result<CollisionSet
 /// `collision` borrows the completed canonical Frame and real Skeleton16336 /
 /// SkeletonCollision4072/4056; there is no pre-solve/default observation path.
 pub(crate) fn post(skater: &mut SkaterRuntime, collision: CollisionInput<'_>) {
+    // PLAYER_PED_CONTACT (research b247, user ask: log the player's decision): on a tick with a ped contact, the
+    // on-foot check's inputs against its limits and what it decided, so a hit that did NOT bail says why.
+    let ped = skater.ped_hits.first().map(|h| (h, "skeleton"));
+    let ped = ped.map(|((id, _, closing), by)| {
+        let e = collision.shared.pose_error;
+        let disp = (e[0] * e[0] + e[1] * e[1] + e[2] * e[2]).sqrt();
+        let serial = crate::living_world::ped_body::proxy_serial(*id).unwrap_or(0);
+        (serial, id & 3, by, closing[0], disp, collision.shared.maximum_pose_error, skater.wipeout.state.reasons)
+    });
     let p = &skater.player_input.processed;
     let owner = &mut skater.biped_ground;
     core::post_physics(
@@ -77,6 +86,16 @@ pub(crate) fn post(skater: &mut SkaterRuntime, collision: CollisionInput<'_>) {
             ground_kind_356: owner.contact.kind_164,
         },
     );
+    if let Some((serial, part, by, closing, disp, squash, before)) = ped {
+        let s = &owner.collision_settings;
+        let now = &skater.wipeout.state.reasons;
+        let new: Vec<usize> = (0..now.len()).filter(|&r| now[r] && !before[r]).collect();
+        let decision = if new.is_empty() { "shove".to_owned() } else { format!("bail{new:?}") };
+        tracing::info!(
+            "PLAYER_PED_CONTACT state=on_foot ped=#{serial} part={part} by={by} part_speed={closing:.2} disp={disp:.3} disp_limit={:.2} squash={squash:.3} squash_limit={:.2} decision={decision}",
+            s.maximum_displacement, s.maximum_squash
+        );
+    }
 }
 
 /// No output is silently dropped: the full packet includes State36/40/86,

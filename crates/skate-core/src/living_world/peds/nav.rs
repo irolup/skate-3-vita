@@ -140,6 +140,20 @@ fn closest_on_segment(p: Vec3, a: Vec3, b: Vec3) -> (Vec3, f32) {
     (q, d[0] * d[0] + d[1] * d[1])
 }
 
+fn dist2_3d(a: Vec3, b: Vec3) -> f32 {
+    let d = [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+    d[0] * d[0] + d[1] * d[1] + d[2] * d[2]
+}
+
+/// The closest point of segment `a`-`b` to `p` in 3D, and its squared distance.
+fn closest_on_segment_3d(p: Vec3, a: Vec3, b: Vec3) -> (Vec3, f32) {
+    let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    let len = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
+    let t = if len > 0.0 { (((p[0] - a[0]) * ab[0] + (p[1] - a[1]) * ab[1] + (p[2] - a[2]) * ab[2]) / len).clamp(0.0, 1.0) } else { 0.0 };
+    let q = [a[0] + ab[0] * t, a[1] + ab[1] * t, a[2] + ab[2] * t];
+    (q, dist2_3d(p, q))
+}
+
 #[derive(Clone, Copy, PartialEq)]
 struct Open {
     f: f32,
@@ -401,6 +415,103 @@ impl NavMesh {
         best.map(|(_, q)| NavPoint { poly, position: q })
     }
 
+    /// The point nearest to `p` (3D) on the polygons reachable from `from`, within `max_dist`: retail's path goal
+    /// search (`82933E18` -> `82933A48`, best distance starts at `0x822F9310` ~9.2e18 and the query range is
+    /// `0x8206D108` FLT_MAX, so unbounded; only the start's region set, no area test; the closest point of each
+    /// polygon by `8292F9F0`; b277). Inside a polygon's outline the point is its surface under `p` [ours: vertical,
+    /// retail projects onto the plane]. Ties go to the lower polygon index (deterministic).
+    pub fn locate_nearest(&self, p: Vec3, from: u32, max_dist: f32) -> Option<NavPoint> {
+        if from as usize >= self.polys.len() {
+            return None;
+        }
+        let mut best: Option<(f32, NavPoint)> = None;
+        for k in 0..self.polys.len() as u32 {
+            if !self.reachable(from, k) {
+                continue;
+            }
+            let q = if self.contains_xz(k, p[0], p[2]) {
+                [p[0], self.height_at(k, p[0], p[2]), p[2]]
+            } else {
+                let verts = &self.polys[k as usize].verts;
+                let n = verts.len();
+                let mut edge: Option<(f32, Vec3)> = None;
+                for e in 0..n {
+                    let (q, d2) = closest_on_segment_3d(p, verts[e], verts[(e + 1) % n]);
+                    if edge.is_none_or(|(b, _)| d2 < b) {
+                        edge = Some((d2, q));
+                    }
+                }
+                let Some((_, q)) = edge else { continue };
+                q
+            };
+            let d2 = dist2_3d(p, q);
+            if d2.sqrt() <= max_dist && best.is_none_or(|(b, _)| d2 < b) {
+                best = Some((d2, NavPoint { poly: k, position: q }));
+            }
+        }
+        best.map(|(_, at)| at)
+    }
+
+    /// The nearest walkable polygon point to `p` (3D), any component, within `max_dist`: retail's path start search
+    /// (`82933848` -> `829338B0`: range FLT_MAX, best distance from ~9.2e18, the closest point of each candidate by
+    /// `8292F9F0`; b324), for a start [`Self::locate`] refuses (more than 0.5 m off the mesh). Inside a polygon's outline
+    /// the point is its surface under `p`, else its nearest edge point. Searched ring by ring over the grid from `p`'s
+    /// cell, stopping once no further ring can hold a nearer point; ties go to the lower polygon index.
+    pub fn locate_start_nearest(&self, p: Vec3, max_dist: f32) -> Option<NavPoint> {
+        let (ci, cj) = ((p[0] / self.cell).floor() as i32, (p[2] / self.cell).floor() as i32);
+        // Rings beyond every grid cell hold nothing.
+        let far = self.grid.keys().map(|&(i, j)| (i - ci).abs().max((j - cj).abs())).max()?;
+        let mut best: Option<(f32, u32, Vec3)> = None;
+        for ring in 0..=far {
+            // Every point in ring `ring` is at least (ring - 1) cells away horizontally.
+            let near = (ring - 1).max(0) as f32 * self.cell;
+            if near > max_dist || best.is_some_and(|(d2, _, _)| near * near > d2) {
+                break;
+            }
+            for i in ci - ring..=ci + ring {
+                for j in cj - ring..=cj + ring {
+                    if (i - ci).abs() != ring && (j - cj).abs() != ring {
+                        continue;
+                    }
+                    for &k in self.grid.get(&(i, j)).map_or(&[][..], |v| v.as_slice()) {
+                        let Some(q) = self.closest_point(k, p) else { continue };
+                        let d2 = dist2_3d(p, q);
+                        if d2.sqrt() <= max_dist && best.is_none_or(|(b, bk, _)| d2 < b || (d2 == b && k < bk)) {
+                            best = Some((d2, k, q));
+                        }
+                    }
+                }
+            }
+        }
+        best.map(|(_, poly, position)| NavPoint { poly, position })
+    }
+
+    /// The point of walkable polygon `k` nearest to `p` as the start search measures it (`8292F9F0`): inside its
+    /// outline the surface under `p`, else its nearest edge point (3D). `None` for a blocked or empty polygon.
+    pub(crate) fn closest_point(&self, k: u32, p: Vec3) -> Option<Vec3> {
+        let poly = &self.polys[k as usize];
+        if !self.rules.walkable(poly.area) {
+            return None;
+        }
+        if self.contains_xz(k, p[0], p[2]) {
+            return Some([p[0], self.height_at(k, p[0], p[2]), p[2]]);
+        }
+        let n = poly.verts.len();
+        let mut edge: Option<(f32, Vec3)> = None;
+        for e in 0..n {
+            let (q, d2) = closest_on_segment_3d(p, poly.verts[e], poly.verts[(e + 1) % n]);
+            if edge.is_none_or(|(b, _)| d2 < b) {
+                edge = Some((d2, q));
+            }
+        }
+        edge.map(|(_, q)| q)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn polys_len(&self) -> usize {
+        self.polys.len()
+    }
+
     /// Move from `from` toward `to` over the surface: only polygons linked to `from.poly`
     /// (directly or through linked neighbours near the move) can take the step, so a step never
     /// jumps onto an unconnected layer (a wall top or planter island above the ped), and a step
@@ -557,48 +668,80 @@ impl NavMesh {
         if from.poly == to.poly {
             return Some(vec![to.position]);
         }
-        let n = self.polys.len();
-        let mut g = vec![f32::INFINITY; n];
-        let mut came: Vec<Option<(u32, u8)>> = vec![None; n];
-        let mut entry = vec![from.position; n];
-        let mut heap = BinaryHeap::new();
-        g[from.poly as usize] = 0.0;
-        heap.push(Open { f: dist_xz(from.position, to.position), poly: from.poly });
-        let mut expansions = 0;
-        let mut found = false;
-        while let Some(Open { poly, .. }) = heap.pop() {
-            if poly == to.poly {
-                found = true;
-                break;
+        // skate_vita (performance): the search's per-polygon arrays are kept between searches and stamped with the
+        // search's number, so a search no longer allocates and fills three arrays the size of the mesh (DownTown:
+        // 36k polygons; the chase re-plans every think). An unstamped polygon reads as the fresh arrays' values
+        // (cost infinite, no parent, entry at `from`): the same search, the same path.
+        SEARCH.with(|cell| {
+            let mut scratch = cell.borrow_mut();
+            let Scratch { stamp, g, came, entry, heap, search } = &mut *scratch;
+            let n = self.polys.len();
+            if stamp.len() != n {
+                *stamp = vec![0; n];
+                g.resize(n, f32::INFINITY);
+                came.resize(n, None);
+                entry.resize(n, [0.0; 3]);
             }
-            expansions += 1;
-            if expansions > self.rules.max_expansions {
-                return None;
+            *search = search.wrapping_add(1);
+            if *search == 0 {
+                stamp.fill(0);
+                *search = 1;
             }
-            let p = &self.polys[poly as usize];
-            for &(e, q) in &self.edge_links[poly as usize] {
-                let e = e as usize;
-                let (a, b) = self.portal(poly, e, q);
-                let mid = [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5, (a[2] + b[2]) * 0.5];
-                let step = dist_xz(entry[poly as usize], mid) * self.rules.cost(p.area);
-                let tentative = g[poly as usize] + step;
-                if tentative < g[q as usize] {
-                    g[q as usize] = tentative;
-                    came[q as usize] = Some((poly, e as u8));
-                    entry[q as usize] = mid;
-                    heap.push(Open { f: tentative + dist_xz(mid, to.position), poly: q });
+            let id = *search;
+            heap.clear();
+            let touch = |i: usize, stamp: &mut [u32], g: &mut [f32], came: &mut [Option<(u32, u8)>], entry: &mut [Vec3]| {
+                if stamp[i] != id {
+                    stamp[i] = id;
+                    g[i] = f32::INFINITY;
+                    came[i] = None;
+                    entry[i] = from.position;
+                }
+            };
+            touch(from.poly as usize, stamp, g, came, entry);
+            g[from.poly as usize] = 0.0;
+            heap.push(Open { f: dist_xz(from.position, to.position), poly: from.poly });
+            let mut expansions = 0;
+            let mut found = false;
+            while let Some(Open { poly, .. }) = heap.pop() {
+                if poly == to.poly {
+                    found = true;
+                    break;
+                }
+                expansions += 1;
+                if expansions > self.rules.max_expansions {
+                    return None;
+                }
+                let p = &self.polys[poly as usize];
+                for &(e, q) in &self.edge_links[poly as usize] {
+                    let e = e as usize;
+                    touch(q as usize, stamp, g, came, entry);
+                    let (a, b) = self.portal(poly, e, q);
+                    let mid = [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5, (a[2] + b[2]) * 0.5];
+                    let step = dist_xz(entry[poly as usize], mid) * self.rules.cost(p.area);
+                    let tentative = g[poly as usize] + step;
+                    if tentative < g[q as usize] {
+                        g[q as usize] = tentative;
+                        came[q as usize] = Some((poly, e as u8));
+                        entry[q as usize] = mid;
+                        heap.push(Open { f: tentative + dist_xz(mid, to.position), poly: q });
+                    }
                 }
             }
-        }
-        if !found {
-            return None;
-        }
-        let mut chain = Vec::new();
-        let mut at = to.poly;
-        while let Some((prev, e)) = came[at as usize] {
-            chain.push((prev, e as usize, at));
-            at = prev;
-        }
+            if !found {
+                return None;
+            }
+            let mut chain = Vec::new();
+            let mut at = to.poly;
+            while let Some((prev, e)) = came[at as usize].filter(|_| stamp[at as usize] == id) {
+                chain.push((prev, e as usize, at));
+                at = prev;
+            }
+            Some(self.path_from_chain(from, to, chain))
+        })
+    }
+
+    /// The corners along a chain of (polygon, edge, next polygon) found by [`Self::find_path`].
+    fn path_from_chain(&self, from: NavPoint, to: NavPoint, mut chain: Vec<(u32, usize, u32)>) -> Vec<Vec3> {
         chain.reverse();
         let portals: Vec<(Vec3, Vec3)> = chain
             .iter()
@@ -611,8 +754,23 @@ impl NavMesh {
                 if cross2(sub2(a, c), dir) <= cross2(sub2(b, c), dir) { (a, b) } else { (b, a) }
             })
             .collect();
-        Some(funnel(from.position, to.position, &portals))
+        funnel(from.position, to.position, &portals)
     }
+}
+
+/// [`NavMesh::find_path`]'s arrays, kept per thread between searches (stamped with the search number).
+#[derive(Default)]
+struct Scratch {
+    stamp: Vec<u32>,
+    g: Vec<f32>,
+    came: Vec<Option<(u32, u8)>>,
+    entry: Vec<Vec3>,
+    heap: BinaryHeap<Open>,
+    search: u32,
+}
+
+thread_local! {
+    static SEARCH: std::cell::RefCell<Scratch> = std::cell::RefCell::new(Scratch::default());
 }
 
 /// The simple stupid funnel over (left, right) portals in xz; returns the corners after `start`.

@@ -37,7 +37,7 @@ mod solve;
 pub(crate) mod solid_contacts;
 pub(crate) mod network;
 pub(crate) use skater::SkaterRuntime;
-pub(crate) use skater::AiPhysicsSource;
+pub(crate) use skater::{AiPhysicsSource, AiRecordCursor};
 pub(crate) use skater::Takedown;
 pub(crate) use offboard::mod_solid_ground::VEHICLE_GROUP;
 pub(crate) use input_phase::facing_from_visual;
@@ -86,6 +86,12 @@ mod landing_quality;
 mod offboard;
 mod player_input;
 mod player_state;
+/// skate-game's grab visualizer (`SKATE_VISUALIZE_GRABS`, a PC viewer aid drawn with Bevy gizmos): off here.
+pub(crate) mod grab_view {
+    pub(crate) fn logging() -> bool {
+        false
+    }
+}
 pub(crate) mod prop_carry;
 pub(crate) mod prop_dynamics;
 pub(crate) mod prop_layout;
@@ -140,6 +146,10 @@ pub(crate) struct GamePhysics {
     /// id. Rewritten each tick before the solve by `living_world::npc_skaters::push_proxies`
     /// (NPC skater body + board, doc 26 fix 19); empty when nothing fills it.
     pub(crate) actor_prop_volumes: Vec<(u64, BoardWorldVolume)>,
+    /// Near peds' body A for the dynamic prop step: (body A id, volume, push mass kg), sorted by id. Rewritten each
+    /// tick by `living_world::ped_body::push_ped_proxies` (b342); its own list, so the NPC proxy system clearing
+    /// [`Self::actor_prop_volumes`] cannot drop it.
+    pub(crate) ped_prop_volumes: Vec<(u64, BoardWorldVolume, f32)>,
     pub(crate) network_active: bool,
     pub(crate) network_contacts: usize,
     clock: clock::SimulationClock,
@@ -185,6 +195,12 @@ pub(crate) struct GamePhysics {
     /// NPC skater's context does not: the props step once per tick, the NPCs push them through
     /// [`Self::actor_prop_volumes`].
     owns_props: bool,
+    /// skate_vita (performance): the held prop and the props' collision-type epoch the layer's collision types were
+    /// last written for (`step_props`).
+    collision_types_applied: Option<(Option<u32>, u64)>,
+    /// skate_vita (performance): the props' grab signature the grab scene was last refreshed for, and a scratch
+    /// (`refresh_grab_props`).
+    grab_signature: (Vec<u32>, Vec<u32>),
 }
 
 /// The parts of [`GamePhysics`] each simulated skater owns (doc 26, "Simulated NPC skaters"):
@@ -337,6 +353,10 @@ mod exchange_tests {
 }
 
 impl GamePhysics {
+    /// The setup collections every skater part loads from (read once per world).
+    pub(crate) fn collections(&self) -> &Collections {
+        &self.collections
+    }
     /// This tick's traffic cars in the grab scene (`living_world::vehicles::push_vehicle_grab_splines`).
     pub(crate) fn set_car_rails(&mut self, rails: crate::grind_world::props::PropRailPoses) {
         self.car_rails = rails;
@@ -348,12 +368,27 @@ impl GamePhysics {
     /// Move Object reads the authored record (doc 26i "Move Object step 2"); off, the scene holds no props.
     pub(crate) fn refresh_grab_props(&mut self) -> Result<(), String> {
         if !prop_dynamics::prop_grab_enabled() {
+            self.grab_signature.0.clear();
             // Switched off in the PC overlay: the props leave the scene once.
             return if self.offboard_grab_scene.has_props() { shared_mut(&mut self.offboard_grab_scene).set_props(Vec::new()) } else { Ok(()) };
         }
         let _grab = skate_core::profile::scope("z_grab_props");
+        // skate_vita (performance, exact): the same signature builds the same objects (the registry already holds
+        // them); upstream rebuilt them every tick.
+        let (signature, scratch) = &mut self.grab_signature;
+        match self.prop_dynamics.as_ref() {
+            Some(d) => d.grab_signature(scratch),
+            None => scratch.clear(),
+        }
+        if !signature.is_empty() && signature == scratch {
+            return Ok(());
+        }
+        let build = skate_core::profile::scope("z_grab_build");
         let props = self.prop_dynamics.as_ref().map(|d| d.grab_objects()).unwrap_or_default();
-        shared_mut(&mut self.offboard_grab_scene).set_props(props)
+        drop(build);
+        shared_mut(&mut self.offboard_grab_scene).set_props(props)?;
+        std::mem::swap(&mut self.grab_signature.0, &mut self.grab_signature.1);
+        Ok(())
     }
     pub(crate) fn set_gesture_preferences(&mut self, gestures: Option<[u32; 4]>) {
         self.animation_profile.gesture_selections = Some(gestures.filter(|g| g.iter().all(|v| *v < 37)).unwrap_or([0, 1, 2, 3]));
@@ -385,6 +420,11 @@ impl GamePhysics {
     pub(crate) fn set_external_queries(&mut self, queries: Option<std::sync::Arc<dyn skate_core::physics::board_world::ExternalQueries>>) {
         self.world.set_external_queries(queries);
     }
+    /// The static world's shared geometry (see `WorldHandle::geometry`).
+    pub(crate) fn world_geometry(&self) -> std::sync::Arc<BoardWorld> {
+        self.world.geometry()
+    }
+
     pub(crate) fn world(&self) -> &BoardWorld {
         &self.world
     }
@@ -408,6 +448,11 @@ impl GamePhysics {
     /// triangles in the window); None for whole worlds.
     pub fn window_stats(&self) -> Option<(u32, f32, f32, usize)> {
         self.window.as_ref().map(|w| (w.builds, w.last_ms, w.max_ms, w.triangles))
+    }
+
+    /// What the on-foot queries see: the map and the prop world (`offboard::BipedWorld`).
+    pub(crate) fn biped_world(&self) -> offboard::BipedWorld<'_> {
+        offboard::BipedWorld { map: &self.world, props: self.prop_layer.as_ref().map(crate::skate_world::PropCollisionLayer::world) }
     }
 
     pub(crate) fn prop_world(&self) -> Option<&BoardWorld> {
@@ -453,7 +498,32 @@ impl GamePhysics {
         else {
             return;
         };
-        dynamics.step_with_actors(&self.world, layer, volumes, &self.actor_prop_volumes);
+        // The bail clamp's gate: the local skater in a wipeout (retail's actor byte is not decoded; b208).
+        dynamics.set_bailing(if self.board_wiping_out { &[prop_dynamics::LOCAL_PUSHER] } else { &[] });
+        // Peds' body A after the skaters (b342): it pushes with its own mass.
+        let masses: Vec<(u64, f32)> = self.ped_prop_volumes.iter().map(|(id, _, mass)| (*id, *mass)).collect();
+        dynamics.set_actor_push_mass(&masses);
+        if self.ped_prop_volumes.is_empty() {
+            dynamics.step_with_actors(&self.world, layer, volumes, &self.actor_prop_volumes);
+        } else {
+            let mut others = self.actor_prop_volumes.clone();
+            others.extend(self.ped_prop_volumes.iter().map(|(id, v, _)| (*id, *v)));
+            dynamics.step_with_actors(&self.world, layer, volumes, &others);
+        }
+        // Each prop's retail collision type on its query meshes (heavy 12 / light 14 / held 13), which the on-foot
+        // walker's queries filter.
+        // skate_vita (performance, exact): a pass writes nothing unless a body's type or an instance's meshes changed
+        // since the last one (the held prop, the bodies or their tuning: `collision_type_epoch`; a slot taken or an
+        // instance added: `collision_types_stale`); upstream walked every body every tick (0.6 ms on the Vita).
+        let _types = skate_core::profile::scope("z_sp_collision_types");
+        let key = (self.prop_carry.held(), dynamics.collision_type_epoch());
+        if layer.collision_types_stale() || self.collision_types_applied != Some(key) {
+            dynamics.for_each_collision_type(self.prop_carry.held(), |instance, collision_type| {
+                layer.set_collision_type(instance, collision_type);
+            });
+            layer.clear_collision_types_stale();
+            self.collision_types_applied = Some(key);
+        }
     }
 
     /// Reset ONE object (retail cMsgResetDMO, doc 27 "Object Dropper and reset"): the phone's
@@ -735,6 +805,9 @@ impl GamePhysics {
             settings.step.simulation,
             BoardMotion::Active,
         );
+        // The skate.Park layout the map was loaded with (park_layout.rs): fixed pieces in the static world and rails.
+        // skate_vita: NOT YET with a collision window (a streamed district); no Vita path attaches a layout yet.
+        let pieces = map.and_then(|map| crate::park_layout::load_pieces(asset_root, map));
         let mut window = None;
         let world = match map {
             Some(map) => match (crate::collision_window::configured(), map.extensions.iter().find(|e| &e.tag == b"RWCM")) {
@@ -753,17 +826,17 @@ impl GamePhysics {
                             window = Some(w);
                             world
                         }
-                        None => crate::skate_world::collision_world(map, settings.floor_material)?,
+                        None => crate::skate_world::collision_world_with(map, settings.floor_material, pieces.as_ref())?,
                     }
                 }
-                _ => crate::skate_world::collision_world(map, settings.floor_material)?,
+                _ => crate::skate_world::collision_world_with(map, settings.floor_material, pieces.as_ref())?,
             },
             None => terrain.world(settings.floor_material),
         };
         let prop_layer = map.and_then(|map| {
-            crate::skate_world::load_prop_layer(
+            crate::skate_world::load_map_prop_layer(
                 asset_root,
-                &map.name,
+                map,
                 settings.floor_material,
                 prop_dynamics::prop_simulation(settings.step.simulation),
             )
@@ -775,8 +848,10 @@ impl GamePhysics {
         // Phase 4: apply the saved layout sidecar over the authored poses.
         let mut prop_carry = prop_carry::PropCarry::default();
         if let (Some(map), Some(layer), Some(dynamics)) = (map, prop_layer.as_mut(), prop_dynamics.as_mut()) {
-            let path = prop_layout::path(asset_root, &map.name);
-            if let Some(layout) = prop_layout::load(&path, &map.name) {
+            // A skate.Park layout's movable pieces keep their own saved poses (keyed by the layout; ours).
+            let (_, _, name) = crate::skate_world::prop_files(asset_root, map);
+            let path = prop_layout::path(asset_root, &name);
+            if let Some(layout) = prop_layout::load(&path, &name) {
                 for pose in layout.values() {
                     let origin = Vector3::new(pose.origin[0], pose.origin[1], pose.origin[2]);
                     let basis = skate_core::math::Basis3 { columns: pose.basis };
@@ -794,7 +869,10 @@ impl GamePhysics {
         prop_carry.set_base_tuning(settings.move_object);
         let grind_world = std::sync::Arc::new(if map.is_none() && terrain == ground::Terrain::Course {
             crate::grind_world::StaticProvider::authored(&crate::grind_world::test_rails())?
-        } else { crate::grind_world::StaticProvider::new(map)? });
+        } else {
+            let provider = crate::grind_world::StaticProvider::new(map)?;
+            match &pieces { Some(pieces) => provider.with_pieces(&pieces.rails)?, None => provider }
+        });
         if let Some(map) = map {
             eprintln!(
                 "SKATE_GRIND_READY splines={} primitives={}",
@@ -816,6 +894,7 @@ impl GamePhysics {
             network_proxies: network::Proxies::default(),
             npc_sim_proxy_mark: None,
             actor_prop_volumes: Vec::new(),
+            ped_prop_volumes: Vec::new(),
             network_active: false,
             network_contacts: 0,
             clock: clock::SimulationClock::default(),
@@ -842,6 +921,8 @@ impl GamePhysics {
             board_wiping_out: false,
             collections: std::sync::Arc::new(data),
             owns_props: true,
+            collision_types_applied: None,
+            grab_signature: (Vec::new(), Vec::new()),
             initial_skater_settings,
             parked_grab_scene: None,
         })
@@ -859,6 +940,7 @@ impl GamePhysics {
             network_proxies: self.network_proxies.clone(),
             npc_sim_proxy_mark: None,
             actor_prop_volumes: self.actor_prop_volumes.clone(),
+            ped_prop_volumes: self.ped_prop_volumes.clone(),
             network_active: self.network_active,
             network_contacts: 0,
             clock: parts.clock,
@@ -886,6 +968,8 @@ impl GamePhysics {
             board_wiping_out: false,
             collections: std::sync::Arc::clone(&self.collections),
             owns_props: false,
+            collision_types_applied: None,
+            grab_signature: (Vec::new(), Vec::new()),
             parked_grab_scene: Some(std::sync::Arc::new(offboard::grab_scene::Registry::new(&self.world, Vec::new(), Vec::new())?)),
         })
     }
@@ -895,6 +979,7 @@ impl GamePhysics {
     pub(crate) fn sync_npc_worker(&self, worker: &mut GamePhysics) {
         worker.network_proxies.clone_from(&self.network_proxies);
         worker.actor_prop_volumes.clone_from(&self.actor_prop_volumes);
+        worker.ped_prop_volumes.clone_from(&self.ped_prop_volumes);
         worker.network_active = self.network_active;
         worker.world.reshare(&self.world);
         worker.prop_layer = self.prop_layer.as_ref().map(crate::skate_world::PropCollisionLayer::share);
@@ -1010,11 +1095,27 @@ impl GamePhysics {
         [v.x, v.y, v.z]
     }
 
+    /// A context's effective board forward (`riding.motion.effective_basis` column 2, as the animation phase reads
+    /// it; diagnostics).
+    pub(crate) fn context_effective_forward(context: &SkaterPhysicsContext) -> [f32; 3] {
+        context.riding.motion.effective_basis.columns[2]
+    }
+
     /// Every part of a context's board at `velocity` (`82C04168`, the AI spawn push).
     pub(crate) fn set_context_velocity(context: &mut SkaterPhysicsContext, velocity: [f32; 3]) {
         for body in context.board.bodies_mut() {
             body.rates.linear_velocity = Vector3::new(velocity[0], velocity[1], velocity[2]);
         }
+    }
+
+    /// An AI spawn push: [`Self::set_context_velocity`], and the acceleration sampler's previous velocities take the
+    /// pushed value, so the push itself reads as no acceleration. Outcome-matched: retail's spawn-placed skaters ride
+    /// off and do their recorded tricks; with the one-step velocity jump read as acceleration, every placed NPC played
+    /// the non-interruptable `RidingIdle.Bumped` clip for ~0.6 s and a recorded trick inside it never played (b194).
+    pub(crate) fn push_context_velocity(context: &mut SkaterPhysicsContext, velocity: [f32; 3]) {
+        Self::set_context_velocity(context, velocity);
+        let v = Vector3::new(velocity[0], velocity[1], velocity[2]);
+        context.riding.ground.previous_velocities.fill(v);
     }
 
     pub(crate) fn swap_skater_context(&mut self, context: &mut SkaterPhysicsContext) {

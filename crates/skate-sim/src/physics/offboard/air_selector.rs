@@ -42,7 +42,7 @@ impl AirSelector {
     ///82D6CA58 submits; results stay staged until consume_launch at native Sync.
     pub(crate) fn launch(
         &mut self,
-        world: &BoardWorld,
+        world: super::BipedWorld<'_>,
         packet: Packet,
         gravity: Vector,
         context: Context,
@@ -70,7 +70,7 @@ impl AirSelector {
     ///providers; static metadata remains mandatory and is never fabricated.
     pub(crate) fn consume_launch(
         &mut self,
-        world: &BoardWorld,
+        world: super::BipedWorld<'_>,
         vehicles: &[(usize, crate::dynamics::SolidBody)],
         context: Context,
         deck_half_wheelbase: f32,
@@ -136,7 +136,7 @@ impl AirSelector {
     ///query slot0, so the later requery replaces that slot before consumption.
     pub(crate) fn requery(
         &mut self,
-        world: &BoardWorld,
+        world: super::BipedWorld<'_>,
         context: Context,
         flags_2472: u32,
         flags_2488: u32,
@@ -179,7 +179,7 @@ impl AirSelector {
     ///a synthetic readiness condition for the synchronous world backend.
     pub(crate) fn consume(
         &mut self,
-        world: &BoardWorld,
+        world: super::BipedWorld<'_>,
         vehicles: &[(usize, crate::dynamics::SolidBody)],
         context: Context,
         deck_half_wheelbase: f32,

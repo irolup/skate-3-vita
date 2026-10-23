@@ -31,20 +31,9 @@ pub(crate) fn sync(state: &mut State, owner: &mut Owner, settings: BoardSettings
         }
         return;
     }
-    let bounds = board_bounds(p.frame, settings.offset_32, settings.extent_16);
     if owner.flags_12836 & 0x40 != 0 {
         if let Some(candidate) = owner.best(p.position) {
-            let inner = board_bounds(
-                p.frame,
-                settings.offset_32,
-                settings.extent_0.map(|v| v * f32::from_bits(0x3f733333)),
-            );
-            state.flags_144_to_150[0] = grab_scene::qualify(
-                &candidate,
-                p.bone,
-                inner,
-                limits(settings.margin_444, settings.angle_452, settings.angle_436),
-            );
+            state.flags_144_to_150[0] = qualifies(&candidate, settings, &p);
             if state.flags_144_to_150[0] {
                 let key = candidate.descriptor();
                 state.counter_152 = key.kind;
@@ -53,15 +42,7 @@ pub(crate) fn sync(state: &mut State, owner: &mut Owner, settings: BoardSettings
         }
     }
     //Query always submits, even when the previous result was rejected.
-    owner.query(Query {
-        position: p.position,
-        sort_position: p.position,
-        bounds,
-        limits: limits(settings.margin_444, settings.angle_456, settings.angle_440),
-        mode: 4,
-        capacity: 5,
-        context: p.context,
-    });
+    owner.query(query(settings, &p));
     if state.flags_144_to_150[0] {
         //82585DD8 descriptor initialization followed by827602E0 actual data request.
         owner.request_primary(Descriptor {
@@ -71,6 +52,40 @@ pub(crate) fn sync(state: &mut State, owner: &mut Owner, settings: BoardSettings
     } else {
         owner.request_interactable(p.frame, p.context);
     }
+}
+/// The 82D74200 query the decision submits (mode 4, capacity 5, the outer box).
+fn query(settings: BoardSettings, p: &Input) -> Query {
+    Query {
+        position: p.position,
+        sort_position: p.position,
+        bounds: board_bounds(p.frame, settings.offset_32, settings.extent_16),
+        limits: limits(settings.margin_444, settings.angle_456, settings.angle_440),
+        mode: 4,
+        capacity: 5,
+        context: p.context,
+    }
+}
+/// 82E08DB8 at bone 23 with the inner box (extent_0 * 0.95).
+fn qualifies(candidate: &grab_scene::Record, settings: BoardSettings, p: &Input) -> bool {
+    let inner = board_bounds(
+        p.frame,
+        settings.offset_32,
+        settings.extent_0.map(|v| v * f32::from_bits(0x3f733333)),
+    );
+    grab_scene::qualify(candidate, p.bone, inner, limits(settings.margin_444, settings.angle_452, settings.angle_436))
+}
+/// The decision's query and pick without the grab input or the three validation lines, for the grab visualizer
+/// (`grab_view`): the records in range and the one this decision would qualify. Reads only.
+pub(crate) fn preview(
+    scene: &crate::physics::offboard::grab_scene::Scene<'_>,
+    settings: BoardSettings,
+    p: &Input,
+) -> Result<(Vec<grab_scene::Record>, Option<Descriptor>), String> {
+    let records = scene.query(&query(settings, p))?;
+    let ready = super::grab_runtime::best_of(&records, p.position)
+        .filter(|c| qualifies(c, settings, p))
+        .map(|c| c.descriptor());
+    Ok((records, ready))
 }
 fn limits(margin: f32, a: f32, b: f32) -> BoardLimits {
     let radians = f32::from_bits(0x3c8efa35);

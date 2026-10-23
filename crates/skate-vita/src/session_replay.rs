@@ -23,6 +23,8 @@ pub struct Frame {
     /// The session's camera-cut counter at this tick: a change means no interpolation.
     pub cuts: u64,
     pub riding: skate_sim::AudioRiding,
+    /// The session tick this frame is (the world replay's clock); `u64::MAX` for a loaded replay (no world).
+    pub tick: u64,
 }
 
 pub struct Recorder {
@@ -81,7 +83,7 @@ impl Recorder {
     }
 
     /// Appends a tick: `current` is the snapshot just produced.
-    pub fn push(&mut self, current: &Snapshot, cuts: u64, period: f32) {
+    pub fn push(&mut self, current: &Snapshot, cuts: u64, period: f32, tick: u64) {
         if self.nbones != current.bones.len() || self.bones.is_empty() {
             self.nbones = current.bones.len();
             self.bones = vec![Mat4::IDENTITY; CAPACITY * self.nbones];
@@ -91,7 +93,7 @@ impl Recorder {
         }
         self.period = period;
         let riding = self.newest().map(|f| f.riding).unwrap_or_default();
-        let frame = Frame { root: current.root, camera: current.camera, fov: current.fov, cuts, riding };
+        let frame = Frame { root: current.root, camera: current.camera, fov: current.fov, cuts, riding, tick };
         let slot = if self.len < CAPACITY {
             let slot = self.physical(self.len);
             self.len += 1;
@@ -137,6 +139,26 @@ impl Recorder {
         to.bones.extend_from_slice(&self.bones[slot * self.nbones..(slot + 1) * self.nbones]);
     }
 
+    /// The world replay's time at position `pos` (in ticks): None for a loaded replay or a camera cut between the
+    /// two frames (the newer one shows, as in [`Self::pair`]).
+    pub fn world_time(&self, pos: f32) -> Option<f64> {
+        let last = self.len.checked_sub(1)?;
+        let i = (pos.max(0.0) as usize).min(last);
+        let j = (i + 1).min(last);
+        let (a, b) = (self.frame(i), self.frame(j));
+        if a.tick == u64::MAX || b.tick == u64::MAX {
+            return None;
+        }
+        let alpha = if a.cuts != b.cuts {
+            1.0
+        } else if i == j {
+            0.0
+        } else {
+            (pos.max(0.0) - i as f32).clamp(0.0, 1.0)
+        };
+        Some((a.tick as f64 + f64::from(alpha) * (b.tick as f64 - a.tick as f64)) * f64::from(self.period))
+    }
+
     /// The pair to draw at position `pos` (in ticks) and the blend between them.
     pub fn pair(&self, pos: f32, a: &mut Snapshot, b: &mut Snapshot) -> f32 {
         let last = self.len - 1;
@@ -154,10 +176,22 @@ impl Recorder {
     }
 }
 
+/// A saved clip speed: percent (10..=100), or P1's earlier setting 1..=5 (25 %, 50 %, then normal and the fast ones,
+/// which retail does not have).
+fn saved_speed(b: u8) -> u8 {
+    match b {
+        0 => SPEED_MAX,
+        1 => 30,
+        2 => 50,
+        3..=5 => SPEED_MAX,
+        v => (v.clamp(SPEED_MIN, SPEED_MAX) + SPEED_STEP / 2) / SPEED_STEP * SPEED_STEP,
+    }
+}
+
 /// Called by the sim thread after each tick.
 pub fn record(session: &Session) {
     if let Some((_, current)) = session.presentation() {
-        RECORDER.lock().unwrap().push(current, session.presentation_cuts(), session.period().as_secs_f32());
+        RECORDER.lock().unwrap().push(current, session.presentation_cuts(), session.period().as_secs_f32(), session.ticks());
     }
 }
 
@@ -175,8 +209,10 @@ pub fn clear() {
 const WIND: f32 = 8.0;
 /// A stick past this (of 0..1) is a deliberate push.
 const DEAD: f32 = 0.25;
-/// The speed settings 1..=5 of the effects menu, as playback factors.
-const SPEEDS: [f32; 5] = [0.25, 0.5, 1.0, 2.0, 4.0];
+/// Retail's clip speed (research b398, b461): 10 % to 100 % in steps of 10 (slow motion only), 100 % by default.
+const SPEED_STEP: u8 = 10;
+const SPEED_MIN: u8 = 10;
+const SPEED_MAX: u8 = 100;
 /// Camera shake levels (off, low, medium, high): metres of offset.
 const SHAKE: [f32; 4] = [0.0, 0.01, 0.025, 0.05];
 /// The effects menu entries in the screen's order (`ReplayEditor.mAdvancedList`, `kEdit*`).
@@ -209,14 +245,14 @@ pub enum Mode {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ClipFx {
     pub camera: ClipCamera,
-    /// The speed setting (1..=5, 3 is normal) and the shake level (0..=3).
-    pub speed_setting: u8,
+    /// The speed in percent (10..=100, steps of 10) and the shake level (0..=3).
+    pub speed: u8,
     pub shake: u8,
 }
 
 impl Default for ClipFx {
     fn default() -> Self {
-        Self { camera: ClipCamera::game(), speed_setting: 3, shake: 0 }
+        Self { camera: ClipCamera::game(), speed: SPEED_MAX, shake: 0 }
     }
 }
 
@@ -253,6 +289,9 @@ pub struct Playback {
     pub clips: Vec<ClipFx>,
     /// The clip the effects menu edits, and its highlighted entry.
     pub edit_clip: usize,
+    /// The effects menu's live speed and shake (retail `82508930` loads them when the menu opens; Left / Right step only
+    /// these): written into the clip by the commit (B, or A leaving a camera edit, `82507438`).
+    live: (u8, u8),
     pub selection: usize,
     /// The editor panel is hidden (the picture only).
     pub hidden: bool,
@@ -329,6 +368,7 @@ impl Playback {
             markers,
             clips,
             edit_clip: 0,
+            live: (SPEED_MAX, 0),
             selection: EDIT_GAME,
             hidden: false,
             finish: None,
@@ -392,7 +432,48 @@ impl Playback {
     }
 
     pub fn speed(&self) -> f32 {
-        self.playing_fx().map_or(1.0, |f| SPEEDS[usize::from(f.speed_setting.clamp(1, 5)) - 1])
+        let speed = match self.mode {
+            Mode::Effects | Mode::Camera(..) => Some(self.live.0),
+            _ => self.playing_fx().map(|f| f.speed),
+        };
+        f32::from(speed.unwrap_or(SPEED_MAX).clamp(SPEED_MIN, SPEED_MAX)) / 100.0
+    }
+
+    /// The effects menu's values loaded from the clip it edits (the menu opens).
+    fn load_live(&mut self) {
+        let fx = self.edit_fx();
+        self.live = (fx.speed, fx.shake);
+    }
+
+    /// The commit (`82507438`, base game): the live speed and shake into the clip under the playhead, unless a clip
+    /// marker is under it. Ours: with no markers yet the clip is the whole replay and the commit lands there (retail
+    /// loses a commit on a lane without keys, b465, medium-high confidence; user decision 2026-10-22).
+    fn commit_live(&mut self) {
+        if self.over() == Over::Marker {
+            return;
+        }
+        let index = self.edit_clip.min(self.clips.len() - 1);
+        (self.clips[index].speed, self.clips[index].shake) = self.live;
+    }
+
+    /// The encoded length (retail `8250B590`, b472): per clip, its 30 fps frames inside the In and Out points divided
+    /// by its speed, truncated, summed; seconds = trunc(sum / 30 + 0.5).
+    pub fn encoded_seconds(&self, rec: &Recorder) -> u32 {
+        let b = self.boundaries();
+        let frames: u32 = (0..self.clips.len())
+            .map(|i| {
+                let (from, to) = (b[i].max(self.start), b[i + 1].min(self.end));
+                let speed = if Some(i) == self.editing_clip() { self.live.0 } else { self.clips[i].speed };
+                let f = ((to - from).max(0.0) * rec.period * 30.0) / (f32::from(speed.clamp(SPEED_MIN, SPEED_MAX)) * 0.01);
+                f as u32
+            })
+            .sum();
+        (frames as f32 / 30.0 + 0.5) as u32
+    }
+
+    /// The clip whose live values show (the effects menu or a camera edit open).
+    fn editing_clip(&self) -> Option<usize> {
+        matches!(self.mode, Mode::Effects | Mode::Camera(..)).then(|| self.edit_clip.min(self.clips.len() - 1))
     }
 
     /// The zoom text of the camera edit screens.
@@ -414,6 +495,75 @@ impl Playback {
             Mode::Camera(Kind::Tripod, true) => 13.0,
             Mode::Camera(Kind::Free, true) => 14.0,
         }
+    }
+
+    /// What the retail replay screen on the menu stage shows this frame (skate-ui `replay_menu_host`): the
+    /// playhead, the mode, the timeline's clips and keys, the effects values, and the help (`help` open, its page
+    /// turns since the replay opened).
+    pub fn screen_feed(&self, rec: &Recorder, help: bool, help_turns: u32) -> skate_ui::fe::replay_menu_host::ReplayScreenFeed {
+        use skate_ui::fe::replay_menu_host::{mode, Over as ScreenOver, ReplayScreenFeed};
+        let last = (rec.len() - 1).max(1) as f32;
+        let (markers, camera_keys) = self.marker_fractions(rec);
+        let mut keys = markers;
+        keys.extend(camera_keys);
+        keys.sort_by(f32::total_cmp);
+        // The band's camera types: 0 Follow, 1 Tripod, 2 Free, 3 Game.
+        let code = |kind: Kind| match kind {
+            Kind::Follow => 0,
+            Kind::Tripod => 1,
+            Kind::Free => 2,
+            Kind::Game => 3,
+        };
+        let fx = self.edit_fx();
+        // 30 fps frames of the recording (the heads' unit, b472).
+        let frames = |ticks: f32| (ticks * rec.period * 30.0).round().max(0.0) as u32;
+        ReplayScreenFeed {
+            active: true,
+            instant: self.mode == Mode::Scrub,
+            position: f64::from(self.pos / last),
+            playing: !self.paused,
+            panel: !self.hidden,
+            length_seconds: if self.mode == Mode::Scrub { self.clip_seconds(rec).round().max(0.0) as u32 } else { self.encoded_seconds(rec) },
+            length_valid: true,
+            help,
+            help_mode: self.help_mode(),
+            help_turns,
+            mode: match self.mode {
+                Mode::Scrub => mode::INSTANT,
+                Mode::Main => mode::TIMELINE,
+                Mode::Effects => mode::EFFECTS,
+                Mode::Camera(..) => mode::CAMERA,
+            },
+            camera_state: if matches!(self.mode, Mode::Camera(..)) { self.screen_state() as i32 } else { 0 },
+            camera_row: self.selection as u32,
+            keys,
+            segments: self.zones(rec).into_iter().map(|(start, _, kind, _)| (start, code(kind))).collect(),
+            heads: (frames(self.start), frames(self.end)),
+            head_fractions: (f64::from(self.start / last), f64::from(self.end / last)),
+            row: self.selection as u32,
+            speed: i32::from(if self.editing_clip().is_some() { self.live.0 } else { fx.speed }),
+            shake: i32::from(if self.editing_clip().is_some() { self.live.1 } else { fx.shake }),
+            zoom: self.zoom_text(),
+            over: match self.over() {
+                Over::Clip => ScreenOver::Clip,
+                Over::Marker => ScreenOver::Marker,
+                Over::Key => ScreenOver::Key,
+            },
+        }
+    }
+
+    /// The kind of camera this frame shows when it is ours to keep out of walls (`replay_camera::constrain`): the clip's
+    /// or the edited camera, or the instant replay's orbit (as a Follow); None for the camera of play as recorded (it
+    /// collided when it was played).
+    pub fn constrained_kind(&self) -> Option<Kind> {
+        let Some(fx) = self.playing_fx() else {
+            return (self.orbit != [0.0; 2]).then_some(Kind::Follow);
+        };
+        let kind = match (&self.editing, self.mode) {
+            (Some(_), Mode::Camera(kind, _)) => kind,
+            _ => fx.camera.kind,
+        };
+        (kind != Kind::Game).then_some(kind)
     }
 
     /// The help pages (`replay_help.k*Mode`) of the mode.
@@ -454,7 +604,8 @@ impl Playback {
             _ => (fx.camera.kind, fx.camera.at(tick as f32)),
         };
         (snap.camera, snap.fov) = replay_camera::eval(kind, &cam, skater, behind, (snap.camera, snap.fov));
-        let amount = SHAKE[usize::from(fx.shake.min(3))];
+        let shake = if self.editing_clip().is_some() { self.live.1 } else { fx.shake };
+        let amount = SHAKE[usize::from(shake.min(3))];
         if amount > 0.0 {
             // Smooth, deterministic noise of the frame, so rewinding repeats it.
             let t = tick as f32 * 0.35;
@@ -601,6 +752,7 @@ impl Playback {
                         Over::Clip => {
                             self.edit_clip = self.clip_at(self.pos);
                             self.mode = Mode::Effects;
+                            self.load_live();
                         }
                     }
                 }
@@ -643,14 +795,17 @@ impl Playback {
                 // LB held: the left stick drags the In point, the right stick the Out point.
                 if held & xbox::LEFT_SHOULDER != 0 {
                     let rate = |x: f32| x.signum() * (x.abs() - DEAD).max(0.0).powi(2) * 1.5 * last * dt;
-                    let first = self.markers.first().copied().unwrap_or(self.end);
-                    let lastm = self.markers.last().copied().unwrap_or(self.start);
+                    // Each head stays OVER from its neighbour as it is now: the Out point reads the In point
+                    // already moved, so both sticks together cannot cross them (the device crashed on In
+                    // past Out).
                     if c.left[0].abs() > DEAD {
-                        self.start = (self.start + rate(c.left[0])).clamp(0.0, first - OVER);
+                        let first = self.markers.first().copied().unwrap_or(self.end);
+                        self.start = (self.start + rate(c.left[0])).clamp(0.0, (first - OVER).max(0.0));
                         marker_moved = true;
                     }
                     if c.right[0].abs() > DEAD {
-                        self.end = (self.end + rate(c.right[0])).clamp(lastm + OVER, last);
+                        let lastm = self.markers.last().copied().unwrap_or(self.start);
+                        self.end = (self.end + rate(c.right[0])).clamp((lastm + OVER).min(last), last);
                         marker_moved = true;
                     }
                 }
@@ -662,18 +817,18 @@ impl Playback {
                 if pressed & xbox::DPAD_DOWN != 0 {
                     self.selection = (self.selection + 1) % EDIT_ENTRIES;
                 }
-                let step = i8::from(pressed & xbox::DPAD_RIGHT != 0) - i8::from(pressed & xbox::DPAD_LEFT != 0);
-                let index = self.edit_clip.min(self.clips.len() - 1);
-                let fx = &mut self.clips[index];
+                // Left / Right step only the live values (`8250ADF8` / `8250AB28`); B commits them.
+                let step = i16::from(pressed & xbox::DPAD_RIGHT != 0) - i16::from(pressed & xbox::DPAD_LEFT != 0);
+                let live = &mut self.live;
                 match self.selection {
-                    EDIT_SPEED => fx.speed_setting = (fx.speed_setting as i8 + step).clamp(1, 5) as u8,
-                    EDIT_SHAKE => fx.shake = (fx.shake as i8 + step).clamp(0, 3) as u8,
+                    EDIT_SPEED => live.0 = (i16::from(live.0) + step * i16::from(SPEED_STEP)).clamp(i16::from(SPEED_MIN), i16::from(SPEED_MAX)) as u8,
+                    EDIT_SHAKE => live.1 = (i16::from(live.1) + step).clamp(0, 3) as u8,
                     _ => {}
                 }
                 if pressed & xbox::A != 0 {
                     match self.selection {
-                        EDIT_SPEED => fx.speed_setting = if fx.speed_setting >= 5 { 1 } else { fx.speed_setting + 1 },
-                        EDIT_SHAKE => fx.shake = (fx.shake + 1) % 4,
+                        EDIT_SPEED => live.0 = if live.0 >= SPEED_MAX { SPEED_MIN } else { live.0 + SPEED_STEP },
+                        EDIT_SHAKE => live.1 = (live.1 + 1) % 4,
                         EDIT_FOLLOW => self.start_camera(rec, Kind::Follow, false),
                         EDIT_TRIPOD => self.start_camera(rec, Kind::Tripod, false),
                         EDIT_GAME => self.start_camera(rec, Kind::Game, false),
@@ -683,6 +838,7 @@ impl Playback {
                         _ => self.start_camera(rec, Kind::Free, true),
                     }
                 } else if pressed & xbox::B != 0 {
+                    self.commit_live();
                     self.mode = Mode::Main;
                 }
             }
@@ -715,6 +871,7 @@ impl Playback {
                         clip.set_key(pos, edit.cam, OVER);
                         self.editing = None;
                         self.mode = Mode::Main;
+                        self.commit_live();
                     } else if pressed & xbox::B != 0 {
                         *clip = edit.before.clone();
                         self.editing = None;
@@ -724,6 +881,7 @@ impl Playback {
                     self.clips[index].camera = ClipCamera { kind, advanced: false, cam: edit.cam, keys: Vec::new() };
                     self.editing = None;
                     self.mode = Mode::Main;
+                    self.commit_live();
                 } else if pressed & xbox::B != 0 {
                     self.clips[index].camera = edit.before.clone();
                     self.editing = None;
@@ -850,7 +1008,7 @@ fn layout_tag() -> u64 {
 
 fn put_clip(out: &mut Vec<u8>, fx: &ClipFx, shift: f32) {
     let c = &fx.camera;
-    out.extend_from_slice(&[c.kind.code(), u8::from(c.advanced), fx.speed_setting, fx.shake]);
+    out.extend_from_slice(&[c.kind.code(), u8::from(c.advanced), fx.speed, fx.shake]);
     put_f32s(out, c.cam.to_array());
     out.extend_from_slice(&(c.keys.len() as u32).to_le_bytes());
     for (t, cam) in &c.keys {
@@ -1046,7 +1204,7 @@ pub fn load(name: &str) -> Result<(String, Vec<f32>, Vec<ClipFx>), String> {
         let keys = (0..r.u32()?.min(1024))
             .map(|_| -> Result<(f32, Cam), String> { Ok((r.f32()?, Cam::from_array(r.f32s()?))) })
             .collect::<Result<Vec<_>, _>>()?;
-        clips.push(ClipFx { camera: ClipCamera { kind, advanced: b[1] != 0, cam, keys }, speed_setting: b[2].clamp(1, 5), shake: b[3].min(3) });
+        clips.push(ClipFx { camera: ClipCamera { kind, advanced: b[1] != 0, cam, keys }, speed: saved_speed(b[2]), shake: b[3].min(3) });
     }
     let mut rec = RECORDER.lock().unwrap();
     rec.reset(nbones, period);
@@ -1063,7 +1221,7 @@ pub fn load(name: &str) -> Result<(String, Vec<f32>, Vec<ClipFx>), String> {
         for _ in 0..nbones {
             bones.push(Mat4::from_cols_array(&r.f32s()?));
         }
-        rec.push_frame(Frame { root, camera, fov, cuts, riding }, &bones);
+        rec.push_frame(Frame { root, camera, fov, cuts, riding, tick: u64::MAX }, &bones);
     }
     Ok((world, markers, clips))
 }
@@ -1078,11 +1236,74 @@ mod tests {
         Snapshot { root: t, bones: vec![Mat4::from_translation(Vec3::splat(x)); bones], camera: t, fov: 1.0 }
     }
 
+    /// LB with both sticks pushing the In and Out points together: they stop OVER apart, never cross (the device
+    /// crashed on the playhead's clamp with In past Out).
+    #[test]
+    fn the_heads_never_cross() {
+        let mut r = Recorder::new();
+        for i in 0..601 {
+            r.push(&snap(1, i as f32), 0, 1.0 / 60.0, i as u64);
+        }
+        let mut pb = Playback::with(0.0, 600.0, Vec::new(), vec![ClipFx::default()]);
+        pb.mode = Mode::Main;
+        (pb.start, pb.end) = (295.0, 305.0);
+        let lb = vita_platform::controls::xbox::LEFT_SHOULDER;
+        for _ in 0..30 {
+            pb.update(&r, 1.0 / 60.0, &Controls { held: lb, pressed: 0, lt: false, rt: false, left: [1.0, 0.0], right: [-1.0, 0.0] });
+            assert!(pb.end - pb.start >= OVER - 1e-3, "{} .. {}", pb.start, pb.end);
+        }
+    }
+
+    /// Retail's effects rules (b461 to b472): Left / Right change only the live values, B commits them into the clip
+    /// under the playhead (not over a marker; with no marker the whole replay, ours), and the encoded length counts
+    /// each clip's frames at its speed.
+    #[test]
+    fn effects_land_on_commit_and_the_length_counts_slow_motion() {
+        let mut r = Recorder::new();
+        for i in 0..601 {
+            r.push(&snap(1, i as f32), 0, 1.0 / 60.0, i as u64);
+        }
+        let mut pb = Playback::with(0.0, 600.0, Vec::new(), vec![ClipFx::default()]);
+        pb.mode = Mode::Main;
+        pb.paused = true;
+        let press = |pb: &mut Playback, button: u16| {
+            pb.update(&r, 1.0 / 60.0, &Controls { held: button, pressed: button, lt: false, rt: false, left: [0.0; 2], right: [0.0; 2] });
+        };
+        assert_eq!(pb.encoded_seconds(&r), 10);
+        // A: the effects menu; to the speed row, Left five times: 50 % live, the clip untouched until B.
+        press(&mut pb, vita_platform::controls::xbox::A);
+        assert_eq!(pb.mode, Mode::Effects);
+        pb.selection = EDIT_SPEED;
+        for _ in 0..5 {
+            press(&mut pb, vita_platform::controls::xbox::DPAD_LEFT);
+        }
+        assert_eq!((pb.live.0, pb.clips[0].speed), (50, 100));
+        assert_eq!(pb.encoded_seconds(&r), 20, "the live speed counts while the menu is open");
+        press(&mut pb, vita_platform::controls::xbox::B);
+        assert_eq!((pb.mode, pb.clips[0].speed), (Mode::Main, 50), "no marker yet: the whole replay");
+        assert_eq!(pb.encoded_seconds(&r), 20);
+        // Over a marker the commit does nothing.
+        pb.markers = vec![300.0];
+        pb.clips.push(ClipFx::default());
+        pb.pos = 300.0;
+        pb.edit_clip = 1;
+        pb.mode = Mode::Effects;
+        pb.load_live();
+        pb.live.0 = 10;
+        pb.commit_live();
+        assert_eq!(pb.clips[1].speed, 100);
+        // Halves of 5 s: 50 % counts 10 s, 100 % 5 s.
+        pb.mode = Mode::Main;
+        assert_eq!(pb.encoded_seconds(&r), 15);
+        // Saved replays from before keep a sensible speed.
+        assert_eq!([1, 2, 3, 5, 0, 40, 47, 200].map(saved_speed), [30, 50, 100, 100, 100, 40, 50, 100]);
+    }
+
     #[test]
     fn ring_keeps_the_newest_frames_in_order() {
         let mut r = Recorder::new();
         for i in 0..CAPACITY + 10 {
-            r.push(&snap(3, i as f32), 0, 1.0 / 60.0);
+            r.push(&snap(3, i as f32), 0, 1.0 / 60.0, i as u64);
         }
         assert_eq!(r.len(), CAPACITY);
         let (mut a, mut b) = (snap(3, 0.0), snap(3, 0.0));
@@ -1098,8 +1319,8 @@ mod tests {
     #[test]
     fn a_cut_between_frames_does_not_blend() {
         let mut r = Recorder::new();
-        r.push(&snap(2, 0.0), 0, 1.0 / 60.0);
-        r.push(&snap(2, 100.0), 1, 1.0 / 60.0);
+        r.push(&snap(2, 0.0), 0, 1.0 / 60.0, 0);
+        r.push(&snap(2, 100.0), 1, 1.0 / 60.0, 1);
         let (mut a, mut b) = (snap(2, 0.0), snap(2, 0.0));
         let alpha = r.pair(0.3, &mut a, &mut b);
         assert_eq!(alpha, 1.0);

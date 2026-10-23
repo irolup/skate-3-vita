@@ -6,7 +6,17 @@ uniform float scale;
 uniform float3 horizon;
 uniform float cutoff;
 
-float4 main(float2 vUv : TEXCOORD0, float2 vLightmapUv : TEXCOORD1, float vFog : TEXCOORD2) : COLOR {
+// The colour grade (retail post FX colour matrix, `skate_core::colour_matrix`): near and far 3x4 rows, blended by
+// the vertex's depth weight; identity unless a record (the zombie cheat) is on.
+uniform float4 grade[6];
+float3 graded(float3 c, float w) {
+	float4 x = float4(c, 1.0f);
+	float3 n = float3(dot(grade[0], x), dot(grade[1], x), dot(grade[2], x));
+	float3 f = float3(dot(grade[3], x), dot(grade[4], x), dot(grade[5], x));
+	return lerp(n, f, w);
+}
+
+float4 main(float2 vUv : TEXCOORD0, float2 vLightmapUv : TEXCOORD1, float2 vFog : TEXCOORD2) : COLOR {
 	float4 a = tex2D(albedo, vUv) * tint;
 	if (a.a < cutoff)
 		discard;
@@ -15,5 +25,5 @@ float4 main(float2 vUv : TEXCOORD0, float2 vLightmapUv : TEXCOORD1, float vFog :
 	float3 t = saturate(1.0f - x);
 	float3 tm = max(x * 0.25f + 0.75f, 1.0f) - t * t;
 	float3 c = saturate(sqrt(max(tm * 0.5f, 0.0f)) * 1.41f);
-	return float4(lerp(horizon, c, vFog), 1.0f);
+	return float4(graded(lerp(horizon, c, vFog.x), vFog.y), 1.0f);
 }

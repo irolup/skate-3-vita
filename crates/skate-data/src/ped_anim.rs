@@ -179,6 +179,12 @@ fn pair(v: &Value) -> Option<[f32; 2]> {
     Some([v["f32_0"].as_f64()? as f32, v["f32_4"].as_f64()? as f32])
 }
 
+/// A `recovery_intervals*` struct (`lying_down_until`, `crouched_until`) by its export name or raw hash key.
+fn intervals(fields: &Value, name: &str, hash: &str) -> Option<[f32; 2]> {
+    let v = fields.get(name).or_else(|| fields.get(hash))?;
+    Some([v.get("lying_down_until")?.as_f64()? as f32, v.get("crouched_until")?.as_f64()? as f32])
+}
+
 /// One remap value: a clip name, a list of names, a `tAnimAttributes` struct or a list of them.
 fn remap(v: &Value, unresolved: &mut usize) -> Vec<RemapClip> {
     match v {
@@ -271,6 +277,22 @@ impl PedTables {
                 ],
                 can_knock_down: f.get("Hash_5B92564B352A9FAA").and_then(Value::as_bool).unwrap_or(d.can_knock_down),
                 ground_seconds: num("ground_seconds", "Hash_AD3C483F0C9DAD67").unwrap_or(d.ground_seconds),
+                // `sub_8269E460`'s interval pairs (b372 / b373): named structs in the export, raw hashes accepted.
+                recovery_front: intervals(f, "recovery_intervals_b", "Hash_E37F00409DEAB4D2").unwrap_or(d.recovery_front),
+                recovery_back: intervals(f, "recovery_intervals", "Hash_74C0B72217A7704E").unwrap_or(d.recovery_back),
+                recovery_side: intervals(f, "recovery_intervals_left", "Hash_0162B7A9B0C086EE").unwrap_or(d.recovery_side),
+                // `Wipeout{Back,Fwd,Left}GroundRestartTime` (knockdown.xml frame offset tags), keyed by the logical
+                // name's hash.
+                ground_restart: ["WipeoutBackGroundRestartTime", "WipeoutFwdGroundRestartTime", "WipeoutLeftGroundRestartTime"]
+                    .map(|n| crate::attrib_hash::numeric_name(n))
+                    .iter()
+                    .zip(d.ground_restart)
+                    .map(|(k, dv)| f.get(k.as_str()).and_then(Value::as_f64).map_or(dv, |v| v as f32))
+                    .collect::<Vec<_>>()
+                    .try_into()
+                    .unwrap_or(d.ground_restart),
+                // Ours (retail's `c+4 > 5` is a code constant): a mod may set it per set.
+                block_after: f.get("block_after").and_then(Value::as_u64).map_or(d.block_after, |v| v.min(255) as u8),
             };
             t.anim_sets.insert(k.clone(), set);
         }

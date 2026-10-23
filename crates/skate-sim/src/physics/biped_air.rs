@@ -37,7 +37,7 @@ pub(crate) fn consume_selector(
     skater
         .offboard_air_selector
         .consume(
-            &physics.world,
+            physics.biped_world(),
             &physics.network_proxies.solids,
             context,
             clearance,

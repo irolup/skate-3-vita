@@ -355,6 +355,22 @@ impl BoardWorld {
             .ok_or("Canonical world has no authored query metadata")
     }
 
+    /// Sets the rejection flags of every query mesh that lies inside `range` (one prop instance's own meshes; a
+    /// mesh reaching outside it is left alone). Returns whether any mesh changed. Flags only filter queries, so the
+    /// query index stays as it is.
+    pub fn set_rejection_flags(&mut self, range: std::ops::Range<usize>, flags: u32) -> bool {
+        let Some(metadata) = &mut self.query_metadata else { return false };
+        let mut changed = false;
+        for mesh in &mut metadata.meshes {
+            let r = &mesh.triangle_range;
+            if range.start <= r.start && r.end <= range.end && !r.is_empty() && mesh.rejection_flags != flags {
+                mesh.rejection_flags = flags;
+                changed = true;
+            }
+        }
+        changed
+    }
+
     pub fn set_external_queries(&mut self, queries: Option<std::sync::Arc<dyn ExternalQueries>>) {
         self.external = queries;
     }
@@ -535,12 +551,14 @@ impl BoardWorld {
         // the union test below come from the per-mesh hierarchy (triangle_index.rs):
         // the same indices in the same order as scanning the candidate ranges.
         let union_hits = match (&self.query_metadata, bounds) {
-            (Some(_), Some(union)) => self.candidate_meshes(bounds).map(|meshes| {
-                let mut out = Vec::new();
-                for mesh in meshes {
-                    self.triangle_index.query(mesh, union, &self.triangle_bounds, &mut out);
-                }
-                out
+            (Some(_), Some(union)) => self.with_candidate_meshes(bounds, |meshes| {
+                meshes.map(|meshes| {
+                    let mut out = Vec::new();
+                    for &mesh in meshes {
+                        self.triangle_index.query(mesh, union, &self.triangle_bounds, &mut out);
+                    }
+                    out
+                })
             }),
             _ => None,
         };

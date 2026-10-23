@@ -27,6 +27,12 @@ pub struct ControllerBSettings {
     /// Plan acceptance with waypoints: the last waypoint to the node (`0x82257218` 2.0 h, `0x8225721C` 1.0 v).
     pub plan_path_h: f32,
     pub plan_path_v: f32,
+    /// How far the path service may snap an off-mesh target onto the mesh (retail: unbounded, `82933A48`; b277). The
+    /// plan acceptance above still rejects a far snap; a mod can cap the search here.
+    pub goal_locate_radius: f32,
+    /// How far the path service may snap an off-mesh start (the skater) onto the mesh when no polygon is under it
+    /// (retail: unbounded, `829338B0`; b324). A mod can cap it (0.5 = the peds' snap, the pre-2026-10-19 behaviour).
+    pub start_locate_radius: f32,
     /// Plan acceptance without waypoints: the skater to the node (`0x82257224` 1.5 h, `0x82257220` 3.0 v).
     pub plan_direct_h: f32,
     pub plan_direct_v: f32,
@@ -75,6 +81,8 @@ impl Default for ControllerBSettings {
         Self {
             plan_path_h: 2.0,
             plan_path_v: 1.0,
+            goal_locate_radius: f32::MAX,
+            start_locate_radius: f32::MAX,
             plan_direct_h: 1.5,
             plan_direct_v: 3.0,
             arrive_h: 2.4,
@@ -117,8 +125,10 @@ pub struct PathElement {
 
 /// The path service behind the plan (`829277C0`, path object `828AAE90`).
 pub trait PathService {
-    /// A path from `from` to `to`: `None` = no path, an empty list = go straight.
-    fn solve(&self, from: [f32; 3], to: [f32; 3]) -> Option<Vec<PathElement>>;
+    /// A path from `from` to `to`: `None` = no path, an empty list = go straight. An off-mesh `from` snaps to the
+    /// nearest walkable point within `start_radius`, an off-mesh `to` to the nearest reachable point within
+    /// `goal_radius`, where the path ends.
+    fn solve(&self, from: [f32; 3], to: [f32; 3], goal_radius: f32, start_radius: f32) -> Option<Vec<PathElement>>;
     /// The per-tick re-solve of a held path; false forces a re-plan.
     fn still_valid(&self, _path: &[PathElement], _from: [f32; 3]) -> bool {
         true
@@ -132,7 +142,7 @@ pub trait PathService {
 pub struct DirectPath;
 
 impl PathService for DirectPath {
-    fn solve(&self, _from: [f32; 3], _to: [f32; 3]) -> Option<Vec<PathElement>> {
+    fn solve(&self, _from: [f32; 3], _to: [f32; 3], _goal_radius: f32, _start_radius: f32) -> Option<Vec<PathElement>> {
         Some(Vec::new())
     }
 }
@@ -141,10 +151,15 @@ impl PathService for DirectPath {
 /// the goal included, becomes one element with entry = exit = the corner [inference: retail's 56-byte elements carry
 /// two points per portal; ours are the funnel's corners], so a reachable goal always has a last waypoint for the
 /// 2.0 h / 1.0 v acceptance. The mesh is static, so a held path stays valid (retail re-checks its element references
-/// each tick, `829277C0`).
+/// each tick, `829277C0`). The goal is the nearest point the start can reach (retail `82928618`, b277). The start is
+/// the peds' point query, else the nearest walkable polygon at any distance (retail `82933848` -> `829338B0`: range
+/// `0x8206D108` FLT_MAX, best distance from `0x822F9310`; b324): a skater stalled on a grind block or inside an
+/// obstacle's navmesh cut is 0.65 to 2.6 m off the mesh (laptop 2026-10-19, nodes 69 / 36 / 29 / 23), which the
+/// peds' 0.5 m snap refused, so every walk-back there failed with "no plan".
 impl PathService for super::peds::NavMesh {
-    fn solve(&self, from: [f32; 3], to: [f32; 3]) -> Option<Vec<PathElement>> {
-        let (a, b) = (self.locate(from)?, self.locate(to)?);
+    fn solve(&self, from: [f32; 3], to: [f32; 3], goal_radius: f32, start_radius: f32) -> Option<Vec<PathElement>> {
+        let a = self.locate(from).or_else(|| self.locate_start_nearest(from, start_radius))?;
+        let b = self.locate_nearest(to, a.poly, goal_radius)?;
         let corners = self.find_path(a, b)?;
         Some(corners.into_iter().map(|c| PathElement { entry: c, exit: c }).collect())
     }
@@ -372,7 +387,7 @@ impl ControllerB {
     fn plan(&mut self, s: &ControllerBSettings, paths: &dyn PathService, position: [f32; 3]) -> bool {
         self.path.clear();
         self.waypoint = 0;
-        let Some(path) = paths.solve(position, self.target) else { return false };
+        let Some(path) = paths.solve(position, self.target, s.goal_locate_radius, s.start_locate_radius) else { return false };
         let ok = match path.last() {
             Some(last) => within(sub(self.target, last.entry), s.plan_path_h, s.plan_path_v),
             None => within(sub(self.target, position), s.plan_direct_h, s.plan_direct_v),
@@ -517,7 +532,7 @@ mod tests {
     /// A path with the goal as its only corner (what the navmesh returns on open ground).
     struct Corner;
     impl PathService for Corner {
-        fn solve(&self, _from: [f32; 3], to: [f32; 3]) -> Option<Vec<PathElement>> {
+        fn solve(&self, _from: [f32; 3], to: [f32; 3], _goal_radius: f32, _start_radius: f32) -> Option<Vec<PathElement>> {
             Some(vec![PathElement { entry: to, exit: to }])
         }
     }

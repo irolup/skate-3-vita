@@ -144,8 +144,8 @@ pub enum FacingRule {
     /// nodes ([code] controller `+208`, `sub_8246D560` -> `sub_8245A088` -> `sub_82454CD0` ->
     /// `sub_82454B28`), turned 180 deg about its up axis while the cursor's latched
     /// [`LineCursor::flip`] is set ([code] `sub_8246B358`: rows 0 and 2 of `+208` negated while
-    /// controller `+927`). The flip is latched only when the skater enters riding
-    /// ([code] `sub_8246A700`, rising edge of `+928`) and held across branches and chains.
+    /// controller `+927`). The flip is latched only at takeoff ([code] `sub_8246A700`, rising
+    /// edge of `+928`, the airborne byte) and held across landings, branches and chains.
     /// The default (`riding_entry`): a body drawn against its travel on the ground is drawn riding
     /// fakie ([`LineCursor::fakie`], the stock fakie channel), as retail draws it.
     #[default]
@@ -411,6 +411,22 @@ pub fn path_frame(node: &ReplayNode) -> [f32; 4] {
     if node.flags & node_flags::BOARD_FLIPPED != 0 { turn_about_up(q) } else { q }
 }
 
+/// The raw recorded pose at line position (node, t), t in [0, 1] along node -> node + 1: the steering target retail
+/// builds from cursor B (`sub_8246DE38`, b110 2.7): position and path frame interpolated, the segment's per-frame
+/// displacement (the next node's `step`). The last node gives its own pose.
+pub fn line_target_at(line: &ReplayLine, at: (u32, f32)) -> Option<super::ai_record::LineTarget> {
+    let a = line.nodes.get(at.0 as usize)?;
+    Some(match line.nodes.get(at.0 as usize + 1) {
+        Some(b) => segment_target(a, b, at.1.clamp(0.0, 1.0)),
+        None => segment_target(a, a, 0.0),
+    })
+}
+
+fn segment_target(a: &ReplayNode, b: &ReplayNode, t: f32) -> super::ai_record::LineTarget {
+    let position = core::array::from_fn(|k| a.position[k] + (b.position[k] - a.position[k]) * t);
+    super::ai_record::LineTarget { position, frame: nlerp(path_frame(a), path_frame(b), t), step: b.step }
+}
+
 /// The node world frame retail spawns the character with ([code] `sub_82453C58`, called by the
 /// spawn `sub_8245C548` before `sub_8245DA78`): the recorded skater frame on off-board nodes
 /// (flags bit 0x08), the path frame ([`path_frame`]) on every other node.
@@ -418,16 +434,23 @@ pub fn node_world_frame(node: &ReplayNode) -> [f32; 4] {
     if node.flags & node_flags::OFF_BOARD != 0 { decode_orientation(node.skater) } else { path_frame(node) }
 }
 
-/// Whether a node counts as riding for the flip latch: neither airborne nor off board.
-/// Retail latches on the rising edge of controller `+928` = the skater state object's `+438`,
-/// which [code] `sub_82DB6EC0` sets while the player state id is in `200..300` (inferred: riding
-/// on the board; the state ids behind it are not decoded). The replay tier has no player state,
-/// so this maps it to the recorded node flags: landing (airborne -> grounded) and getting back on
-/// the board (off board -> on board) are the riding entries. NOT RETAIL YET in that mapping
-/// (ground tricks count as riding here; whether retail's grind / manual states are in 200..299
-/// is not read).
+/// Whether a node counts as riding on the board: neither airborne nor off board (the physical
+/// category of [`LineCursor`]'s fakie rule, and the ground-spawn stand-in of the flip latch).
 pub fn node_riding(flags: u8) -> bool {
     flags & (node_flags::AIRBORNE | node_flags::OFF_BOARD) == 0
+}
+
+/// Whether a node counts as airborne for the flip latch. Retail latches on the rising edge of
+/// controller `+928` = the skater state object's `+438`, which [code] `sub_82DB6EC0` (store at
+/// 0x82DB7654) sets while the player state id is in `200..300` and the wheel count is 0: in the
+/// air on the board (b119, b354; ground, grinds, wipeout and off board give 0). The replay tier
+/// has no player state, so this maps it to the recorded node flags. [data, b355] AIRBORNE marks
+/// free flight on the disc lines (median -12.5 m/s^2 over 12,049 runs; every grind start is on
+/// the ground; a grind or manual ending in the air ends inside the run); OFF_BOARD must win (756
+/// nodes carry both, retail's `+438` is 0 off the board). TU3 has no live recorder, so what the
+/// dev recorder tested is unknown.
+pub fn node_airborne(flags: u8) -> bool {
+    flags & node_flags::AIRBORNE != 0 && flags & node_flags::OFF_BOARD == 0
 }
 
 /// Retail flip test ([code] `sub_8246A700`): the recorded skater frame of the current node faces
@@ -936,13 +959,14 @@ pub struct LineCursor {
     pub keep_facing: bool,
     /// Retail's latched switch / fakie flip (controller `+927`, [`FacingRule::RidingEntry`]): the
     /// drawn skater is the recorded skater frame turned 180 deg about up while set. Latched by
-    /// [`flip_test`] only when the skater enters riding ([`node_riding`]: spawn, landing, back on
-    /// the board), held across branches and chains. A pure function of the lines, the spawn and
-    /// the branch records (deterministic; a snapshot carries it as a plain bool).
+    /// [`flip_test`] only at takeoff ([`node_airborne`] rising, [code] `sub_8246A700`; also a spawn
+    /// in the air, and a spawn riding as a stand-in: retail holds 0 there until the first takeoff),
+    /// held across landings, branches and chains. A pure function of the lines, the spawn and the
+    /// branch records (deterministic; a snapshot carries it as a plain bool).
     pub flip: bool,
-    /// Whether the current node counted as riding at the last step (the latch's edge detector,
+    /// Whether the current node counted as airborne at the last step (the latch's edge detector,
     /// controller `+928`).
-    pub riding: bool,
+    pub airborne: bool,
     /// How the body is drawn (host and client set it from [`ChainConfig::facing_rule`]).
     pub facing_rule: FacingRule,
     /// Retail's riding-fakie bit of the drawn body (SkaterAnim flags `0x20000000`, set by the
@@ -980,15 +1004,16 @@ pub enum Decider<'a> {
 
 impl LineCursor {
     pub fn new(line: [u8; 16], node: u32) -> Self {
-        Self { line, node, frame_in_segment: 0, frames: 0, finished: false, trick_open: false, trick: -1, history: [None; PHASE_HISTORY], phase: None, phase_since: 0, previous_phase: None, previous_since: 0, switch: None, switch_blend_seconds: SWITCH_BLEND_SECONDS, facing_flipped: false, keep_facing: false, flip: false, riding: false, facing_rule: FacingRule::RidingEntry, fakie: false, fakie_since: 0, fakie_previous_since: 0, fakie_clock: Default::default(), fakie_settings: retail::FAKIE }
+        Self { line, node, frame_in_segment: 0, frames: 0, finished: false, trick_open: false, trick: -1, history: [None; PHASE_HISTORY], phase: None, phase_since: 0, previous_phase: None, previous_since: 0, switch: None, switch_blend_seconds: SWITCH_BLEND_SECONDS, facing_flipped: false, keep_facing: false, flip: false, airborne: false, facing_rule: FacingRule::RidingEntry, fakie: false, fakie_since: 0, fakie_previous_since: 0, fakie_clock: Default::default(), fakie_settings: retail::FAKIE }
     }
 
     /// Spawn on a line at a node (retail spawns at node 0, `sub_8245DA78`).
     ///
     /// Retail places the character with the node world frame ([code] `sub_8245C548` ->
-    /// `sub_82453C58` -> `sub_8245DA78`, [`node_world_frame`]); when the spawn node is riding, the
+    /// `sub_82453C58` -> `sub_8245DA78`, [`node_world_frame`]); when the spawn node is airborne, the
     /// first controller update sees `+928` rise and latches the flip against that frame
-    /// ([`flip_test`]): set when the recorded skater frame faces away from the path frame.
+    /// ([`flip_test`]): set when the recorded skater frame faces away from the path frame. A
+    /// riding spawn latches the same test as a stand-in (retail: 0 until the first takeoff).
     pub fn spawn(lines: &dyn LineSource, line: [u8; 16], node: u32) -> Self {
         let mut c = Self::new(line, node);
         if let Some(l) = lines.line(&line) {
@@ -996,8 +1021,11 @@ impl LineCursor {
             c.phase = l.nodes.get(node as usize).map(|n| ReplayPhase::of(n.flags, c.trick_open));
             c.history[0] = c.phase.map(|phase| PhaseEntry { phase, since: 0, trick: c.trick });
             if let Some(n) = l.nodes.get(node as usize) {
-                c.riding = node_riding(n.flags);
-                c.flip = c.riding && flip_test(n, node_world_frame(n));
+                // In the air: retail's first update sees the rising edge against the spawn frame.
+                // Riding: a labelled stand-in (retail holds 0 until the first takeoff, which tests
+                // the same frames then); off board: nothing latched.
+                c.airborne = node_airborne(n.flags);
+                c.flip = (c.airborne || node_riding(n.flags)) && flip_test(n, node_world_frame(n));
             }
         } else {
             c.finished = true;
@@ -1028,8 +1056,8 @@ impl LineCursor {
             return;
         };
         // The character's forward before this frame (the drawn skater), for the flip latch; only
-        // needed while not riding (a rising edge can follow).
-        let before = (!self.riding).then(|| self.drawn_skater(line, 0.0));
+        // needed while not airborne (a rising edge can follow).
+        let before = (!self.airborne).then(|| self.drawn_skater(line, 0.0));
         if self.node as usize + 1 >= line.nodes.len() {
             // On the last node (spawned there, or a mirrored record not yet seen): look for the
             // next line once more, else the line is over.
@@ -1073,7 +1101,13 @@ impl LineCursor {
                         },
                         Decider::Stay => Some(recorded),
                     };
-                    self.trick_open = true;
+                    // A recorded trick the choice dropped (-1) starts nothing (`sub_8246A2E0`: grab / fingerflip /
+                    // boneless slots without the profile's slot-trick flag; research b187, b159): no trick phase, so
+                    // the puppet does not fall back to a trick pose. A span without a trick slot keeps its phase
+                    // (open: b187 did not settle it).
+                    if recorded < 0 || chosen.is_none_or(|t| t >= 0) {
+                        self.trick_open = true;
+                    }
                     if let Some(t) = chosen {
                         self.trick = t;
                         if matches!(decider, Decider::Decide(_)) {
@@ -1124,15 +1158,15 @@ impl LineCursor {
             }
         }
         if let Some(n) = line.nodes.get(self.node as usize) {
-            // Retail flip latch (`sub_8246A700`): only on entering riding, against the
-            // character's forward; held otherwise (also across the switches above).
-            let riding = node_riding(n.flags);
-            if riding && !self.riding {
+            // Retail flip latch (`sub_8246A700`): only at takeoff, against the character's
+            // forward; held otherwise (landings and the switches above included, b354).
+            let airborne = node_airborne(n.flags);
+            if airborne && !self.airborne {
                 if let Some(q) = before {
                     self.flip = flip_test(n, q);
                 }
             }
-            self.riding = riding;
+            self.airborne = airborne;
             let phase = ReplayPhase::of(n.flags, self.trick_open);
             if self.phase != Some(phase) {
                 if let Some(old) = self.phase {
@@ -1313,11 +1347,11 @@ impl LineCursor {
         match self.facing_rule {
             FacingRule::RidingEntry => {
                 // [code] `sub_8246ACF0` calls the flip-applying target steer (`sub_8246B358`) only
-                // while the state object's `+438` (riding) is set; otherwise it sends
+                // while the state object's `+438` (airborne, b354) is set; otherwise it sends
                 // `sub_82471070` with controller `+824` and the flip is not applied. Off-board
-                // nodes therefore show the recorded frame as recorded (walking forward). In the
-                // air retail's physics body keeps the heading it took off with; the puppet keeps
-                // the flip there (NOT RETAIL YET: no air physics in the replay tier).
+                // nodes therefore show the recorded frame as recorded (walking forward). On the
+                // ground the puppet keeps the flip as a stand-in (retail's ground target is the
+                // path frame, b353; no ground physics in the replay tier).
                 let off = |k: usize| line.nodes.get(k).is_some_and(|n| n.flags & node_flags::OFF_BOARD != 0);
                 if !self.flip {
                     target_skater(line, i, j, t)
@@ -1368,12 +1402,10 @@ impl LineCursor {
         let i = self.node as usize;
         let a = line.nodes.get(i)?;
         let seg = line.segment_frames(self.node);
-        let (b, t) = match line.nodes.get(i + 1) {
-            Some(b) if seg > 0 && !self.finished => (b, (self.frame_in_segment as f32 / seg as f32).min(1.0)),
-            _ => (a, 0.0),
-        };
-        let position = core::array::from_fn(|k| a.position[k] + (b.position[k] - a.position[k]) * t);
-        Some(super::ai_record::LineTarget { position, frame: nlerp(path_frame(a), path_frame(b), t), step: b.step })
+        match line.nodes.get(i + 1) {
+            Some(_) if seg > 0 && !self.finished => line_target_at(line, (self.node, self.frame_in_segment as f32 / seg as f32)),
+            _ => Some(segment_target(a, a, 0.0)),
+        }
     }
 
     pub fn sample(&self, lines: &dyn LineSource, alpha: f32) -> Option<ReplaySample> {

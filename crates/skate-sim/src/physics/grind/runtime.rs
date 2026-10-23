@@ -20,6 +20,14 @@ pub(crate) struct Runtime {
 }
 impl Runtime {
     pub(crate) fn adopt_mode_settings(&mut self, other: Self) { self.settings = other.settings; }
+    /// A new actor on a pooled body (b299): the fixed-seed orientation stream and the per-actor grind words a fresh
+    /// body starts with; the grind state instances stay for the placement's Exit / Enter.
+    pub(crate) fn reset_for_new_actor(&mut self) {
+        self.orientation_random = super::rng::OrientationRandom::new();
+        self.chromosome = grind_chromosome::Chromosome::uninitialized();
+        self.pending_wipeout_impulse = None;
+        self.manager = None;
+    }
     pub fn load(data: &Collections) -> Result<Self, String> {
         Ok(Self {
             states: [State::new(); 6],

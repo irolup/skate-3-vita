@@ -13,8 +13,8 @@
 //! localization id (`ID_TRICK_FLIP_KICKFLIP`) and the clip names agree after dropping
 //! underscores, for the flips (ollie or nollie clips) and the grinds (front-side clips,
 //! used for the back-side grinds too); other tricks have no gesture clip.
-use crate::apt_scene::{self, Draw, Shapes};
-use crate::apt_vm::{ObjectKind, Value, Vm};
+use crate::fe::apt_scene::{self, Draw, Shapes};
+use crate::fe::apt_vm::{ObjectKind, Value, Vm};
 use crate::menu_runtime::{MenuRuntime, Natives};
 
 pub struct Host {

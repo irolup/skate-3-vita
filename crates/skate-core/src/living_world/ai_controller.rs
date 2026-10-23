@@ -48,6 +48,8 @@ pub struct ControllerSettings {
     /// as progress when the distance to A shrank by more than `stuck_start_approach` (`0x8208EA80` 0.03 m).
     pub stuck_start_fraction: f32,
     pub stuck_start_approach: f32,
+    /// The stage 2 re-snap's skip-ahead budget in summed node frames (`sub_8246D168`, 240).
+    pub resnap_frames: u32,
 }
 
 impl Default for ControllerSettings {
@@ -55,6 +57,7 @@ impl Default for ControllerSettings {
         Self {
             reposition_ahead: 5, reposition_past: 2, remembered_window: 20, reposition_interval: 60, wipe_out: 1.0, safe_jump_frames: 45, safe_flag_frames: 15, safe_slope: 1.0, safe_run: 3,
             stuck_limits: [30, 30, 2, 180, 30, 3], stuck_clear_ticks: 25, stuck_clear_distance: 5.0, stuck_hold_ticks: 180, stuck_gate_ticks: 120, stuck_start_fraction: 0.001, stuck_start_approach: 0.03,
+            resnap_frames: 240,
         }
     }
 }
@@ -368,10 +371,10 @@ pub fn stuck_action(state: &mut ControllerState, s: &ControllerSettings, online:
 }
 
 /// `sub_8246D168`'s node: when the line climbs steeper than `safe_slope` (1.0) from `search` to `search + 2`, the
-/// first node after `search + 2` lower than `search`, within 240 summed node frames (node byte `+36` = our `frames`,
+/// first node after `search + 2` lower than `search`, within `resnap_frames` (240) summed node frames (node byte `+36` = our `frames`,
 /// `skate-data` `aipath.rs`: 4 s of 60 Hz recording); otherwise (or none found) the node nearest `pos` over the line.
 pub fn resnap_node(line: &super::replay::ReplayLine, s: &ControllerSettings, search: u32, pos: super::Vec3) -> u32 {
-    const BUDGET: u32 = 240;
+    let budget = s.resnap_frames;
     let nodes = &line.nodes;
     let i = search as usize;
     if i + 2 < nodes.len() {
@@ -382,7 +385,7 @@ pub fn resnap_node(line: &super::replay::ReplayLine, s: &ControllerSettings, sea
             let mut sum = 0u32;
             for (j, n) in nodes.iter().enumerate().skip(i + 1) {
                 sum += u32::from(n.frames);
-                if sum > BUDGET {
+                if sum > budget {
                     break;
                 }
                 if j > i + 2 && n.position[1] < a[1] {

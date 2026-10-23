@@ -763,6 +763,8 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "skate-core",
+ "skate-data",
 ]
 
 [[package]]
@@ -771,6 +773,7 @@ version = "0.1.0"
 dependencies = [
  "game-audio",
  "glam 0.30.10",
+ "png 0.17.16",
  "serde",
  "serde_json",
  "skate-audio",

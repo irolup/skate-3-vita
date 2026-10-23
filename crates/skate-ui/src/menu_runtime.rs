@@ -5,10 +5,8 @@
 //! classes), `attachMovie` / `removeMovieClip`, clip construction events and the class
 //! constructors in Flash's order. The game's side of the screens (the data model the
 //! scripts ask for, e.g. `coremenu.GetNumMenus`) is a `Natives` implementation.
-use crate::apt_attach;
-use crate::apt_movie::{CONSTRUCTOR, Movie};
-use crate::apt_vm::{Host, ObjectKind, Value, Vm};
-use std::collections::BTreeMap;
+use crate::fe::apt_movie::{Movie, Pending, CLASS_CONSTRUCTOR};
+use crate::fe::apt_vm::{Host, ObjectKind, Value, Vm};
 
 /// The game's native objects for a screen: which global objects exist and what their
 /// methods answer.
@@ -25,7 +23,6 @@ pub trait Natives {
 
 pub struct Bindings<N: Natives> {
     pub movie: Movie,
-    pub exports: BTreeMap<String, i32>,
     pub natives: N,
     random: u32,
 }
@@ -60,13 +57,32 @@ impl<N: Natives> Host for Bindings<N> {
                 }
                 return Ok(Value::Undefined);
             }
-            match method {
-                "attachMovie" => return apt_attach::attach_movie(&mut self.movie, vm, &self.exports, object, &args),
-                "removeMovieClip" => {
-                    apt_attach::remove_movie_clip(&mut self.movie, vm, object)?;
+            if method == "attachMovie" {
+                // (linkage, new name, depth[, init object]); the new subtree's class constructors run inside the call,
+                // nested clips first (as the front-end stage, `apt_stage`).
+                let linkage = args.first().map(Value::text).unwrap_or_default();
+                let name = args.get(1).map(Value::text).unwrap_or_default();
+                let depth = args.get(2).map_or(0, crate::fe::apt_vm::to_integer);
+                let init = match args.get(3) {
+                    Some(Value::Object(o)) => Some(*o),
+                    _ => None,
+                };
+                let before = self.movie.immediate.len();
+                let Some(child) = self.movie.attach(vm, object, &linkage, &name, depth, init)? else {
                     return Ok(Value::Undefined);
+                };
+                let queued: Vec<Pending> = self.movie.immediate.drain(before.min(self.movie.immediate.len())..).collect();
+                let (mut ctors, rest): (Vec<Pending>, Vec<Pending>) = queued.into_iter().partition(|p| p.event == CLASS_CONSTRUCTOR);
+                self.movie.immediate.extend(rest);
+                ctors.sort_by_key(|p| p.object == child);
+                let ctors: Vec<(usize, usize)> = ctors
+                    .iter()
+                    .filter_map(|p| Some((p.object, *self.movie.classes.get(&self.movie.instances.get(&p.object)?.character)?)))
+                    .collect();
+                for (clip, class) in ctors {
+                    vm.call_function(class, clip, vec![], self)?;
                 }
-                _ => {}
+                return Ok(Value::Object(child));
             }
         }
         // Arrays are plain objects with numeric keys and a `length`.
@@ -91,7 +107,7 @@ impl<N: Natives> Host for Bindings<N> {
                     }
                     let key = (length as usize - 1).to_string();
                     let value = vm.get(object, &key);
-                    vm.objects[object].fields.remove(&key);
+                    vm.objects[object].fields.remove(key.as_str());
                     vm.set(object, "length", Value::Number(length - 1.0))?;
                     return Ok(value);
                 }
@@ -108,8 +124,8 @@ impl<N: Natives> Host for Bindings<N> {
                 let Some(Value::Object(class)) = args.get(1) else {
                     return Err("registerClass: class".into());
                 };
-                let character = *self.exports.get(&linkage).ok_or_else(|| format!("registerClass: unknown linkage {linkage:?}"))?;
-                self.movie.class_for.insert(character, *class);
+                let character = *self.movie.linkage.get(&linkage).ok_or_else(|| format!("registerClass: unknown linkage {linkage:?}"))?;
+                self.movie.classes.insert(character, *class);
                 Ok(Value::Bool(true))
             }
             ("Math", "floor") => Ok(Value::Number(args.first().ok_or("Math.floor argument")?.number().floor())),
@@ -150,14 +166,17 @@ impl<N: Natives> MenuRuntime<N> {
         for (name, value) in natives.constants() {
             vm.set(vm.global, name, value)?;
         }
-        let exports: BTreeMap<String, i32> = json
-            .get("exports")
-            .and_then(|e| e.as_object())
-            .map(|o| o.iter().filter_map(|(k, v)| v.as_i64().map(|v| (k.clone(), v as i32))).collect())
-            .unwrap_or_default();
         let mut movie = Movie::load(json)?;
-        movie.max_instances = 16_384;
-        let mut bindings = Bindings { movie, exports, natives, random: 0x9e37_79b9 };
+        // The linked screen's export table (`tools/link_ui_screen.py`): linkage name -> character, for registerClass and
+        // attachMovie.
+        if let Some(exports) = json.get("exports").and_then(|e| e.as_object()) {
+            for (name, character) in exports {
+                if let Some(character) = character.as_i64() {
+                    movie.linkage.insert(name.clone(), character as i32);
+                }
+            }
+        }
+        let mut bindings = Bindings { movie, natives, random: 0x9e37_79b9 };
         let initial: Vec<_> = bindings
             .movie
             .characters
@@ -194,20 +213,16 @@ impl<N: Natives> MenuRuntime<N> {
     /// Runs the queued frame actions, clip construction events and class constructors.
     pub fn drain(&mut self) -> Result<(), String> {
         let mut calls = 0;
-        while let Some((object, offset)) = self.bindings.movie.pending.pop_front() {
+        while let Some(Pending { object, offset, event }) = self.bindings.movie.next_action() {
             calls += 1;
             if calls > 4096 {
                 return Err("front-end frame action limit".into());
             }
             let Some(instance) = self.bindings.movie.instances.get(&object) else { continue };
-            if offset == CONSTRUCTOR {
-                let character = instance.character;
-                let Some(&class) = self.bindings.movie.class_for.get(&character) else { continue };
+            if event == CLASS_CONSTRUCTOR {
                 // `class.apply(clip)`: run the class function with the clip as `this`.
-                self.vm.set(object, "__constructor__", Value::Object(class))?;
-                let result = self.vm.call_method(object, "__constructor__", Vec::new(), &mut self.bindings);
-                self.vm.objects[object].fields.remove("__constructor__");
-                result?;
+                let Some(&class) = self.bindings.movie.classes.get(&instance.character) else { continue };
+                self.vm.call_function(class, object, vec![], &mut self.bindings)?;
                 continue;
             }
             let code = self

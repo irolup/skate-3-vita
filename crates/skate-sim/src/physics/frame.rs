@@ -114,6 +114,10 @@ pub(super) fn advance(
         skater.centre_of_mass_filter.reset();
         skater.animation_feedback.reset();
         player_state::enter_after_teleport(physics, skater)?;
+        // A pooled body's new-actor reset of the trajectory selector (b299), now that the old state has exited (b310).
+        if std::mem::take(&mut skater.trajectory_reset_pending) {
+            skater.trajectory.reset_for_new_actor();
+        }
         super::offboard::board_manager::runtime::finish_teleport(physics, skater);
         //82DB8E40 calls SetUpNormal after pose reset, state100 and board reset.
         skater.wipeout_state.ragdoll.restore_normal(
@@ -168,6 +172,7 @@ pub(super) fn advance(
     drop(stage);
     let stage = tracing::info_span!("s15_state_update").entered();
     player_state::pre_state(physics, skater)?;
+    // Only this step's on-foot walker reports ped bodies it ran into (BipedGround below).
     match skater.player_state.current() {
         skate_core::player::state::PhysicalStateId::RevertGround => super::revert_state::update(physics,skater)?,
         skate_core::player::state::PhysicalStateId::HandPlant => super::handplant::update(physics,skater)?,
@@ -220,7 +225,7 @@ pub(super) fn advance(
             skater.offboard_contact.submit(
                 input,
                 skater.player_input.processed.actor_query_2952 as i32,
-                &super::offboard::contact_toolkit::StaticScene::new(&physics.world)?,
+                &super::offboard::contact_toolkit::StaticScene::new(physics.biped_world())?,
             )?;
             super::biped_ground::submit_geometry(physics, skater)?;
         }

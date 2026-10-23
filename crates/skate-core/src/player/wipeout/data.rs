@@ -72,6 +72,10 @@ pub struct GroundSettings {
     pub balance_total: f32,
     pub balance_min_speed: f32,
     pub balance_base: f32,
+    /// The contact / displacement limits' factor while the board is side-on mid-trick (flags_2472 bit 15, set by
+    /// 82BD8CB0 when |board X.y| > 0.71): retail 0.3, a code constant in 82D8F9E0 (`0x3E99999A`, research b185 /
+    /// b448). Here as tuning so a mod can change it; the retail value is the default.
+    pub trick_scalar: f32,
 }
 pub struct AirSettings {
     pub xz_trick: f32,

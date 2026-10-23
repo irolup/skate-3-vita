@@ -49,6 +49,10 @@ pub(crate) struct HandPropRecord {
     pub glb: Option<String>,
     pub rotation_degrees: Vec3,
     pub offset: Vec3,
+    /// The model's attach locator in its own (glb) space: the point retail puts at the record's offset, so the grip
+    /// lands on the hand rather than the model origin. From `hand_props.json` `attach` (setup,
+    /// `dynamic_props.template_attach`); identity when absent (a mod model, or an older install).
+    pub attach: Mat4,
     pub carry_channel: Option<String>,
     pub disposable: bool,
     pub can_sit: bool,
@@ -56,10 +60,12 @@ pub(crate) struct HandPropRecord {
 }
 
 impl HandPropRecord {
-    /// The prop's frame in the hand bone's frame.
+    /// The prop's frame in the hand bone's frame, as retail `82E3E1B0` composes it: T(offset) * R * inverse(P).
+    /// R turns the record's degrees into Rz * Ry * Rx (research b204: rows [cy cz, cy sz, -sy], ...), so the order
+    /// is ZYX, not XYZ; P is the template's attach locator (`template+0x78`, written by `82C4E128`, b204 / b205).
     pub fn local(&self) -> Mat4 {
         let r = self.rotation_degrees * (std::f32::consts::PI / 180.0);
-        Mat4::from_translation(self.offset) * Mat4::from_quat(Quat::from_euler(EulerRot::XYZ, r.x, r.y, r.z))
+        Mat4::from_translation(self.offset) * Mat4::from_quat(Quat::from_euler(EulerRot::ZYX, r.z, r.y, r.x)) * self.attach.inverse()
     }
 }
 
@@ -82,24 +88,53 @@ fn vec3(v: Option<&Value>) -> Vec3 {
     Vec3::new(f("x"), f("y"), f("z"))
 }
 
+/// A 4x4 row-vector matrix as setup writes it (rows = basis vectors, translation last), as a glam matrix; `None`
+/// unless it is 16 finite numbers with an invertible rotation.
+fn attach_matrix(v: &Value) -> Option<Mat4> {
+    let rows = v.as_array().filter(|r| r.len() == 4)?;
+    let mut cols = [0.0_f32; 16];
+    for (i, row) in rows.iter().enumerate() {
+        let row = row.as_array().filter(|r| r.len() == 4)?;
+        for (j, x) in row.iter().enumerate() {
+            cols[i * 4 + j] = x.as_f64()? as f32;
+        }
+    }
+    let m = Mat4::from_cols_array(&cols);
+    (m.is_finite() && m.determinant().abs() > 1e-6).then_some(m)
+}
+
 impl HandPropData {
     /// From `private/living_world/tables.json` (inheritance already merged by the exporter) and `hand_props.json`.
     pub fn load(root: &Path) -> Result<Self, String> {
+        Self::load_with(root, None)
+    }
+
+    /// [`Self::load`] with `tables.json` already parsed (`None`: read and parse it here).
+    pub fn load_with(root: &Path, parsed: Option<&Value>) -> Result<Self, String> {
         // skate_vita: through `skate_data::vfs`; the packs carry the peds' classes in `ped_tables.json`.
         let read = |p: &str| -> Result<Value, String> { serde_json::from_slice(&skate_data::vfs::read(&root.join(p)).map_err(|e| format!("{p}: {e}"))?).map_err(|e| format!("{p}: {e}")) };
-        let tables = read("private/living_world/ped_tables.json").or_else(|_| read("private/living_world/tables.json"))?;
+        let own;
+        let tables: &Value = match parsed {
+            Some(v) => v,
+            None => {
+                own = read("private/living_world/ped_tables.json").or_else(|_| read("private/living_world/tables.json"))?;
+                &own
+            }
+        };
         let records = tables.pointer("/classes/livingworld_handprops").and_then(Value::as_object).ok_or("tables.json has no livingworld_handprops")?;
         let models = read("private/living_world/hand_props.json").ok();
         let mut props = BTreeMap::new();
         for (key, record) in records {
             let fields = record.get("fields");
             let file = models.as_ref().and_then(|m| m.pointer(&format!("/props/{key}/file"))).and_then(Value::as_str);
+            let attach = models.as_ref().and_then(|m| m.pointer(&format!("/props/{key}/attach"))).and_then(attach_matrix);
             props.insert(
                 key.clone(),
                 HandPropRecord {
                     glb: file.map(|f| format!("private/living_world/{f}")),
                     rotation_degrees: vec3(fields.and_then(|f| f.get(ROTATION_FIELD))),
                     offset: vec3(fields.and_then(|f| f.get(OFFSET_FIELD))),
+                    attach: attach.unwrap_or(Mat4::IDENTITY),
                     carry_channel: fields.and_then(|f| f.get(CHANNEL_FIELD)).and_then(Value::as_str).map(str::to_string),
                     disposable: flag(fields, DISPOSABLE_FIELD),
                     can_sit: flag(fields, CAN_SIT_FIELD),
@@ -185,6 +220,12 @@ pub(crate) fn sync_hand_props(peds: &mut super::peds::PedState, settings: &super
     let super::peds::PedState { data, index, released, hand_triangles, .. } = peds;
     for e in index.values_mut() {
         let super::peds::PedEntity { ped, body, mind, held, linked, shown, .. } = e;
+        // The tazer's clip-driven states (`82E3ED50`): drawn near the draw clip's end, put away (and the "tazr" prop
+        // deleted) near the holster clip's end.
+        if mind.brain.tazer_state.is_some_and(|s| s == 1 || s == 3) {
+            let left = body.player.channel_remaining(&*data);
+            mind.brain.update_tazer_clip(&settings.ped_brain.values, body.plugin_motion.tazer_played, left);
+        }
         if let Some(h) = held.clone() {
             // The world frame is needed by a throw's release only (`update_hand_prop_release` reads it then).
             let at = mind.brain.hand_prop.throw.and_then(|_| held_world(data, body, *shown, h.local)).map(|m| m.w_axis.truncate().to_array());
@@ -354,4 +395,51 @@ fn release(physics: &mut crate::physics::GamePhysics, held: &HeldHandProp, world
         angular_velocity: skate_core::math::Vector3::ZERO,
     };
     physics.spawn_runtime_prop(&spec, 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn record_offset_is_translation_then_rotation() {
+        let r = HandPropRecord { rotation_degrees: Vec3::new(90.0, 0.0, 0.0), offset: Vec3::new(0.01, 0.0, 0.01), ..Default::default() };
+        let m = r.local();
+        assert!(m.w_axis.truncate().distance(Vec3::new(0.01, 0.0, 0.01)) < 1e-6);
+        // +Y of the prop turns to +Z of the hand under 90 degrees about X.
+        assert!(m.transform_vector3(Vec3::Y).distance(Vec3::Z) < 1e-6);
+    }
+
+    /// Retail `82E3E1B0` builds the rotation as Rz * Ry * Rx; its first basis row is [cy cz, cy sz, -sy] (b204).
+    #[test]
+    fn record_rotation_is_rz_ry_rx_like_retail() {
+        // The stock cellphone's angles (15, -10, 15 degrees): with two or more non-zero axes the order matters.
+        let d = Vec3::new(15.0, -10.0, 15.0);
+        let r = HandPropRecord { rotation_degrees: d, ..Default::default() }.local();
+        let (x, y, z) = (d.x.to_radians(), d.y.to_radians(), d.z.to_radians());
+        let row0 = Vec3::new(y.cos() * z.cos(), y.cos() * z.sin(), -y.sin());
+        assert!(r.transform_vector3(Vec3::X).distance(row0) < 1e-5, "{:?} vs {row0:?}", r.transform_vector3(Vec3::X));
+        let rzyx = Mat4::from_rotation_z(z) * Mat4::from_rotation_y(y) * Mat4::from_rotation_x(x);
+        assert!(r.abs_diff_eq(rzyx, 1e-5));
+    }
+
+    /// Retail places the attach locator P, not the model origin, at the record's offset: World = H * T * R * inv(P).
+    #[test]
+    fn attach_locator_lands_on_the_offset() {
+        // A briefcase-like locator as setup writes it (row vectors): handle 0.343 m up, turned 90 degrees.
+        let rows = serde_json::json!([[0.0, -1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [-1.0, 0.0, 0.0, 0.0], [0.0, 0.343, 0.0, 1.0]]);
+        let attach = attach_matrix(&rows).unwrap();
+        assert!(attach.w_axis.truncate().distance(Vec3::new(0.0, 0.343, 0.0)) < 1e-6);
+        assert!(attach.transform_vector3(Vec3::X).distance(Vec3::new(0.0, -1.0, 0.0)) < 1e-6, "row 0 is the image of +x");
+        let r = HandPropRecord { rotation_degrees: Vec3::new(15.0, -10.0, 15.0), offset: Vec3::new(0.01, 0.005, 0.0), attach, ..Default::default() };
+        let m = r.local();
+        // The handle lands on the offset, with the locator's frame turned by R.
+        assert!(m.transform_point3(Vec3::new(0.0, 0.343, 0.0)).distance(r.offset) < 1e-5);
+        let rot = Mat4::from_quat(Quat::from_euler(EulerRot::ZYX, 15f32.to_radians(), (-10f32).to_radians(), 15f32.to_radians()));
+        assert!((m * attach).abs_diff_eq(Mat4::from_translation(r.offset) * rot, 1e-5));
+        // Missing or broken: identity (the model origin, as before).
+        assert_eq!(HandPropRecord::default().attach, Mat4::IDENTITY);
+        assert!(attach_matrix(&serde_json::json!([[0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]])).is_none());
+        assert!(attach_matrix(&serde_json::json!(null)).is_none());
+    }
 }

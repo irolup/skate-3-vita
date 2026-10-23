@@ -188,6 +188,8 @@ pub struct Scene {
     skater: Option<SkaterGpu>,
     /// The loaded retail park; the Course is drawn when there is none.
     park_gpu: Option<ParkGpu>,
+    /// R2: the Trick Guide's demo set (drawn instead of the world by `draw_demo` while the guide is open).
+    demo_gpu: Option<ParkGpu>,
     /// A campaign district: tiles streamed in while skating; drawn instead of a park.
     district: Option<crate::district::DistrictGpu>,
     /// Draws submitted / culled in the last frame.
@@ -211,6 +213,38 @@ pub struct Scene {
     ped: SkinProgram,
     ped_paint: GLint,
     ped_fade: GLint,
+    /// The colour grade the programs have (uploaded again when it changes).
+    grade: Grade,
+    grade_dirty: bool,
+}
+
+/// The colour grade (retail post FX colour matrix, `skate_core::colour_matrix::build`; research b100 / b101): near and
+/// far 3x4 rows, weighted linearly in view depth between the record's distances (full near up to `distance_near`,
+/// full far from `distance_far`). Retail applies it in its tone pass over the frame; here each world shader applies it
+/// last (the same for opaque draws; alpha blends of affine maps commute), so the HUD and the menus stay ungraded.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Grade {
+    pub near: [[f32; 4]; 3],
+    pub far: [[f32; 4]; 3],
+    pub distance_near: f32,
+    pub distance_far: f32,
+}
+
+impl Grade {
+    pub const IDENTITY: Self = Self {
+        near: [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]],
+        far: [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]],
+        distance_near: 50.0,
+        distance_far: 100.0,
+    };
+
+    /// The far band on a colour (the sky, behind everything).
+    fn far(&self, rgb: [f32; 3]) -> [f32; 3] {
+        std::array::from_fn(|i| {
+            let r = self.far[i];
+            (r[0] * rgb[0] + r[1] * rgb[1] + r[2] * rgb[2] + r[3]).clamp(0.0, 1.0)
+        })
+    }
 }
 
 /// One ped to draw this frame.
@@ -353,6 +387,7 @@ impl Scene {
                 white,
                 skater: None,
                 park_gpu: None,
+                demo_gpu: None,
                 district: None,
                 last_draws: (0, 0),
                 props: None,
@@ -368,6 +403,8 @@ impl Scene {
                 ped,
                 ped_paint,
                 ped_fade,
+                grade: Grade::IDENTITY,
+                grade_dirty: true,
             }
         }
     }
@@ -574,22 +611,51 @@ impl Scene {
     /// and the park is drawn once all of them are in.
     pub fn load_park(&mut self, park: ParkRender) {
         self.unload_park();
+        self.park_gpu = Some(park_gpu(park));
+    }
+
+    /// R2: the Trick Guide's demo set (a small park render: its textures upload now, the screen is black then).
+    pub fn load_demo(&mut self, set: ParkRender) {
+        self.unload_demo();
+        let mut gpu = park_gpu(set);
+        for (slot, texture) in gpu.textures.iter_mut().zip(gpu.pending.iter_mut()) {
+            if let Some(texture) = texture.take() {
+                *slot = upload_texture(&texture);
+            }
+        }
+        gpu.uploaded = gpu.pending.len();
+        self.demo_gpu = Some(gpu);
+    }
+
+    pub fn unload_demo(&mut self) {
+        if let Some(p) = self.demo_gpu.take() {
+            delete_park(p);
+        }
+    }
+
+    pub fn demo_loaded(&self) -> bool {
+        self.demo_gpu.is_some()
+    }
+
+    /// Clears and draws the Trick Guide demo: its set and the skater (`frame.palette`), nothing of the world.
+    pub fn draw_demo(&mut self, frame: &Frame) {
+        self.upload_grade();
+        let Some(set) = &self.demo_gpu else { return };
         unsafe {
-            let vbo = buffer(GL_ARRAY_BUFFER, &park.vertex_data);
-            let index_bytes: Vec<u8> = park.indices.iter().flat_map(|i| i.to_le_bytes()).collect();
-            let ibo = buffer(GL_ELEMENT_ARRAY_BUFFER, &index_bytes);
-            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
-            let draws = park.draws.iter().map(park_draw).collect();
-            self.park_gpu = Some(ParkGpu {
-                vbo,
-                ibo,
-                textures: vec![0; park.textures.len()],
-                pending: park.textures.into_iter().map(Some).collect(),
-                uploaded: 0,
-                draws,
-                horizon: park.horizon.map(|c| c.max(0.0).powf(1.0 / 2.2)),
-                scale: KD * park.exposure,
-            });
+            glClearColor(set.horizon[0], set.horizon[1], set.horizon[2], 1.0);
+            glClearDepthf(1.0);
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+            glEnable(GL_DEPTH_TEST);
+            glDepthFunc(GL_LEQUAL);
+            glDepthMask(GL_TRUE);
+            glDisable(GL_BLEND);
+            glFrontFace(GL_CCW);
+            glCullFace(GL_BACK);
+            let vp = frame.view_proj.to_cols_array();
+            self.last_draws = draw_park(set, self.white, &self.park, &self.park_mask, frame, &vp);
+            if self.skater.is_some() {
+                self.draw_skin(frame.palette, 1.0, &vp);
+            }
         }
     }
 
@@ -684,18 +750,53 @@ impl Scene {
     /// Frees the loaded park (back to the Course).
     pub fn unload_park(&mut self) {
         if let Some(p) = self.park_gpu.take() {
-            unsafe {
-                glDeleteBuffers(1, &p.vbo);
-                glDeleteBuffers(1, &p.ibo);
-                let uploaded: Vec<GLuint> = p.textures.iter().copied().filter(|&t| t != 0).collect();
-                glDeleteTextures(uploaded.len() as GLsizei, uploaded.as_ptr());
+            delete_park(p);
+        }
+    }
+
+    /// The colour grade from now on (`Grade::IDENTITY`: none).
+    pub fn set_grade(&mut self, grade: Grade) {
+        if grade != self.grade {
+            self.grade = grade;
+            self.grade_dirty = true;
+        }
+    }
+
+    /// Uploads the grade to every world program when it changed (a program keeps its uniforms).
+    fn upload_grade(&mut self) {
+        if !std::mem::take(&mut self.grade_dirty) {
+            return;
+        }
+        let g = &self.grade;
+        let rows: Vec<f32> = g.near.iter().chain(&g.far).flatten().copied().collect();
+        let depth = [g.distance_near, 1.0 / (g.distance_far - g.distance_near).max(1e-3)];
+        let programs = [
+            &self.world.program,
+            &self.skin.program,
+            &self.skin_mask.program,
+            &self.park.program,
+            &self.park_mask.program,
+            &self.prop.program,
+            &self.prop_mask.program,
+            &self.car.program,
+            &self.car_glass.program,
+            &self.skin_fade.program,
+            &self.ped.program,
+        ];
+        unsafe {
+            for p in programs {
+                glUseProgram(p.id);
+                glUniform4fv(p.uniform(c"grade"), 6, rows.as_ptr());
+                glUniform2f(p.uniform(c"gradeDepth"), depth[0], depth[1]);
             }
         }
     }
 
     /// Clears and draws the 3D scene (the UI and the swap come after).
     pub fn draw(&mut self, frame: &Frame) {
+        self.upload_grade();
         let sky = self.district.as_ref().map(|d| d.horizon()).or(self.park_gpu.as_ref().map(|p| p.horizon)).unwrap_or(SKY);
+        let sky = self.grade.far(sky);
         unsafe {
             glClearColor(sky[0], sky[1], sky[2], 1.0);
             glClearDepthf(1.0);
@@ -1169,5 +1270,35 @@ unsafe fn free_ped_gpu(c: &PedGpu) {
         glDeleteBuffers(1, &c.vbo);
         glDeleteBuffers(1, &c.ibo);
         glDeleteTextures(c.textures.len() as GLsizei, c.textures.as_ptr());
+    }
+}
+
+/// A park render's buffers, its textures queued (`upload_pending`).
+fn park_gpu(park: ParkRender) -> ParkGpu {
+    unsafe {
+        let vbo = buffer(GL_ARRAY_BUFFER, &park.vertex_data);
+        let index_bytes: Vec<u8> = park.indices.iter().flat_map(|i| i.to_le_bytes()).collect();
+        let ibo = buffer(GL_ELEMENT_ARRAY_BUFFER, &index_bytes);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+        let draws = park.draws.iter().map(park_draw).collect();
+        ParkGpu {
+            vbo,
+            ibo,
+            textures: vec![0; park.textures.len()],
+            pending: park.textures.into_iter().map(Some).collect(),
+            uploaded: 0,
+            draws,
+            horizon: park.horizon.map(|c| c.max(0.0).powf(1.0 / 2.2)),
+            scale: KD * park.exposure,
+        }
+    }
+}
+
+fn delete_park(p: ParkGpu) {
+    unsafe {
+        glDeleteBuffers(1, &p.vbo);
+        glDeleteBuffers(1, &p.ibo);
+        let uploaded: Vec<GLuint> = p.textures.iter().copied().filter(|&t| t != 0).collect();
+        glDeleteTextures(uploaded.len() as GLsizei, uploaded.as_ptr());
     }
 }

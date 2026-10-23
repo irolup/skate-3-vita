@@ -943,3 +943,23 @@ fn draw_distance_keeps_the_fade_before_the_cull_at_every_step() {
         assert!(s.skaters.spawn_outer < s.skaters.cull, "{m}x skaters spawn inside the cull");
     }
 }
+
+#[test]
+fn a_new_world_continues_the_serials_so_ids_never_repeat_in_a_session() {
+    let map = map();
+    let obs = [still(0.0, 0.0)];
+    let inputs = offline(&obs, &map);
+    let mut first = LivingWorld::new(config(), 42);
+    let old: Vec<u32> = spawns(&first.step(&inputs), Kind::Pedestrian).iter().map(|s| s.id.serial).collect();
+    assert!(!old.is_empty());
+    first.reset_world();
+    // The map change builds a new world; without the carry its serials restart at 1.
+    let mut second = LivingWorld::new(config(), 42);
+    second.continue_serials_from(&first);
+    let new: Vec<u32> = spawns(&second.step(&inputs), Kind::Pedestrian).iter().map(|s| s.id.serial).collect();
+    assert_eq!(new.len(), old.len());
+    let max_old = *old.iter().max().unwrap();
+    assert!(new.iter().all(|s| *s > max_old), "{new:?} repeats {old:?}");
+    // A fresh world (the first map) still starts at 1.
+    assert_eq!(spawns(&LivingWorld::new(config(), 42).step(&inputs), Kind::Pedestrian)[0].id.serial, 1);
+}

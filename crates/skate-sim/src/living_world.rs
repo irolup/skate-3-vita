@@ -193,7 +193,15 @@ pub(crate) mod dmo_stream {
         let held = physics.prop_carry.held();
         let layout: std::collections::BTreeSet<u32> = physics.prop_carry.layout().keys().copied().collect();
         let Some(stream) = st.stream.as_mut() else { return };
-        let decisions = stream.step(&views, &core, fill, &|id| held == Some(id) || layout.contains(&id));
+        // Kept (never the eviction front): a prop moved off its authored spawn pose. NOT RETAIL YET: retail's keep comes
+        // from the object's own state (`sub_82C485C0` DMO+0x1170 bit 0x20, `sub_82C56AE8` state word DMO+0x112C == 1;
+        // research b184); "moved" is our reading of it until a trace settles it. Before 2026-10-17 any prop could be the
+        // front, so a prop the player had knocked was evicted and came back at its authored pose about 27 times a second
+        // in DownTown (laptop session 14:36: 21,037 evictions vs 353 culls).
+        // skate_vita (performance): upstream builds the moved set over every body each pass; the census asks only about
+        // the live and spawning ones (`PropDynamics::is_moved`, the same test).
+        let dynamics = physics.prop_dynamics();
+        let decisions = stream.step_kept(&views, &core, fill, &|id| held == Some(id) || layout.contains(&id), &|id| dynamics.is_some_and(|d| d.is_moved(id)));
         if decisions.is_empty() && !fill {
             return;
         }
@@ -295,6 +303,9 @@ pub struct LivingWorldSettings {
     pub free_play: Option<skate_core::living_world::FreePlay>,
     /// The zombie cheat (peds without cap, no traffic, no NPC skaters).
     pub zombie: bool,
+    /// skate_vita: the ped pool in place of retail's 31 (`retail::PED_POOL`), the only bound left on the peds under the
+    /// zombie cheat; None = retail's.
+    pub ped_pool: Option<u32>,
     /// Session seed (0 = derive from the map name).
     pub seed: u64,
     /// Log a population summary every 5 s.
@@ -312,11 +323,14 @@ pub struct PedBrainSettings {
     /// RunFromHonker's goal and speeds (`826A1358`).
     pub run_from_honker: skate_core::living_world::peds::honk::RunFromHonkerParams,
     pub values: skate_core::living_world::peds::brain::BrainSettings,
+    /// The world-prop plugins' values (offer scan, refusals, the seats-in-water rule); copied into the plugin props
+    /// every think, so a mod's change is in effect at once.
+    pub plugins: skate_core::living_world::peds::plugins::PluginSettings,
 }
 
 impl Default for PedBrainSettings {
     fn default() -> Self {
-        Self { enabled: true, mood: true, flee: Default::default(), run_from_honker: Default::default(), values: Default::default() }
+        Self { enabled: true, mood: true, flee: Default::default(), run_from_honker: Default::default(), values: Default::default(), plugins: Default::default() }
     }
 }
 
@@ -347,6 +361,7 @@ impl Default for LivingWorldSettings {
             user_npcs_off: false,
             free_play: None,
             zombie: false,
+            ped_pool: None,
             seed: 0,
             debug: false,
         }
@@ -375,6 +390,9 @@ impl LivingWorldSettings {
         config.skaters.line_chain = self.skater_line_chain;
         config.pedestrians.enabled = on && self.pedestrians.enabled;
         config.pedestrians.density = self.pedestrians.density;
+        if let Some(pool) = self.ped_pool {
+            config.pedestrians.pool = Some(pool);
+        }
         config.vehicles.enabled = on && self.vehicles.enabled;
         config.vehicles.density = self.vehicles.density;
     }
@@ -556,7 +574,8 @@ pub struct CarPose {
     pub serial: u32,
     /// Index of the car's model in `Session::car_models`.
     pub model: u16,
-    /// Translation and rotation (x, y, z, w) of the previous and the current tick.
+    /// Translation and rotation (x, y, z, w) of the two ticks the car is drawn between (upstream `drawn_pose`: the
+    /// two before the car's current pose, the ticks the skater is drawn between).
     pub prev: ([f32; 3], [f32; 4]),
     pub curr: ([f32; 3], [f32; 4]),
     pub wheel_prev: f32,
@@ -679,7 +698,7 @@ impl LivingWorldState {
             ped_hand_props::sync_hand_props(&mut self.peds, &self.settings, &observers, physics, &self.asset_root, self.population.world.tick());
             peds::apply_skater_takedowns(&mut self.peds.takedowns, skater, physics);
             let npc_actors: Vec<(u64, [f32; 3], [f32; 3])> = self.npcs.index.values().filter_map(|n| n.replay.last.as_ref().map(|s| (n.npc.id.to_u64(), s.position, s.velocity))).collect();
-            peds::advance_peds(&mut self.population, &mut self.peds, self.traffic.clock.as_ref(), physics, &self.obstacles, &observers, npc_actors, &self.settings);
+            peds::advance_peds(&mut self.population, &mut self.peds, self.traffic.clock.as_ref(), physics, &self.obstacles, &observers, Some(&*skater), npc_actors, &self.settings);
         }
         let ped_list: Vec<(u64, [f32; 3])> = {
             let mut l: Vec<_> = self.peds.index.values().map(|e| (e.ped.id.to_u64(), e.body.position.to_array())).collect();
@@ -798,7 +817,7 @@ impl LivingWorldState {
         let Some(dynamics) = physics.prop_dynamics() else { return };
         out.extend(self.peds.released.iter().filter_map(|(id, key, previous)| {
             let current = prop_frame(dynamics.pose(*id)?);
-            Some(peds::HandPropPose { model: self.peds.data.hand_prop_model(key)?, previous: previous.unwrap_or(current), current })
+            Some(peds::HandPropPose { id: *id, model: self.peds.data.hand_prop_model(key)?, previous: previous.unwrap_or(current), current })
         }));
     }
 
@@ -830,10 +849,10 @@ impl LivingWorldState {
             CarPose {
                 serial,
                 model: self.models.binary_search(&t.glb).map_or(u16::MAX, |i| i as u16),
-                prev: (m.prev.translation.to_array(), m.prev.rotation.to_array()),
-                curr: (m.curr.translation.to_array(), m.curr.rotation.to_array()),
-                wheel_prev: m.wheel_prev,
-                wheel: m.wheel,
+                prev: (m.drawn_prev.translation.to_array(), m.drawn_prev.rotation.to_array()),
+                curr: (m.prev.translation.to_array(), m.prev.rotation.to_array()),
+                wheel_prev: m.wheel_drawn_prev,
+                wheel: m.wheel_prev,
                 chassis: t.chassis,
                 secondary: t.secondary,
                 paint_gain: t.paint_gain,
@@ -1004,5 +1023,181 @@ mod traffic_tests {
         }
         assert!(most > 0, "cars spawn");
         assert!(moving > 0, "cars drive");
+    }
+}
+
+/// The stage spans' totals for `perf_bench` (sim-bench's subscriber), with `BENCH_SPANS=1`.
+#[cfg(all(test, feature = "oracle"))]
+#[path = "../../../tools/sim-bench/src/profile.rs"]
+mod bench_span_profile;
+
+/// Run with `--features stage-profile,oracle` (the skater dump is the oracle's).
+#[cfg(all(test, feature = "oracle"))]
+mod perf_bench {
+    use super::bench_span_profile as span_profile;
+
+    /// FNV-1a over bytes.
+    fn fold(hash: &mut u64, bytes: &[u8]) {
+        for b in bytes {
+            *hash = (*hash ^ *b as u64).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+
+    /// The ped navmesh's path search on DownTown (the chase re-plans every think): paths between pseudo-random
+    /// polygon pairs of one component, the time per search and a hash of the corners (an exact change keeps it).
+    #[test]
+    #[ignore = "requires an installed DownTown (SKATE3_ASSET_ROOT, SKATE3_MAP=<maps/DownTown.skate>)"]
+    fn downtown_path_bench() {
+        let root = std::path::PathBuf::from(std::env::var_os("SKATE3_ASSET_ROOT").unwrap());
+        let map = skate_data::skate_map::SkateMap::load(std::path::Path::new(&std::env::var_os("SKATE3_MAP").unwrap())).unwrap();
+        let mut session = crate::live::Session::load_map(&root, "easy", Some(map)).unwrap();
+        let mut settings = super::LivingWorldSettings::default();
+        settings.pedestrians = super::KindSetting { enabled: true, density: 0.25 };
+        assert!(session.start_living_world(settings));
+        session.step(Default::default());
+        let mesh = session.living.as_ref().and_then(|l| l.peds.data.nav.clone()).expect("DownTown's ped navmesh");
+        let n = mesh.polys.len() as u32;
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % u64::from(n)) as u32
+        };
+        let point = |poly: u32| skate_core::living_world::peds::NavPoint { poly, position: mesh.polys[poly as usize].centre };
+        let mut pairs = Vec::new();
+        while pairs.len() < 200 {
+            let (a, b) = (next(), next());
+            if a != b && mesh.reachable(a, b) {
+                pairs.push((point(a), point(b)));
+            }
+        }
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        let started = std::time::Instant::now();
+        let mut found = 0;
+        for (a, b) in &pairs {
+            if let Some(corners) = mesh.find_path(*a, *b) {
+                found += 1;
+                fold(&mut hash, format!("{corners:?}").as_bytes());
+            }
+        }
+        let per = started.elapsed().as_secs_f64() * 1e6 / pairs.len() as f64;
+        eprintln!("PATH_HASH {hash:016x} polys={n} found={found}/{} {per:.1} us a search", pairs.len());
+        // A chase's searches: to a polygon within 25 m.
+        let mut near = Vec::new();
+        while near.len() < 200 {
+            let (a, b) = (next(), next());
+            let (pa, pb) = (mesh.polys[a as usize].centre, mesh.polys[b as usize].centre);
+            if a != b && mesh.reachable(a, b) && (pa[0] - pb[0]).hypot(pa[2] - pb[2]) < 25.0 {
+                near.push((point(a), point(b)));
+            }
+        }
+        let started = std::time::Instant::now();
+        for (a, b) in &near {
+            if let Some(corners) = mesh.find_path(*a, *b) {
+                fold(&mut hash, format!("{corners:?}").as_bytes());
+            }
+        }
+        let per = started.elapsed().as_secs_f64() * 1e6 / near.len() as f64;
+        eprintln!("PATH_HASH_NEAR {hash:016x} {per:.1} us a search within 25 m");
+    }
+
+    /// The Vita's DownTown session on the desktop (Fast physics, Low traffic and peds, NPC skaters, the game
+    /// switches): 1440 ticks on foot walking about, then 1560 on the board pushing and carving. Prints the stage
+    /// profile (`--features stage-profile`) and one hash of every tick's skater dump and every drawn pose (skater,
+    /// cars, NPC skaters, peds, hand props, props): an exact optimization leaves the hash unchanged.
+    #[test]
+    #[ignore = "requires an installed DownTown (SKATE3_ASSET_ROOT, SKATE3_MAP=<maps/DownTown.skate>)"]
+    fn downtown_perf_bench() {
+        let spans: Option<&'static span_profile::Profiler> = std::env::var_os("BENCH_SPANS").map(|_| &*Box::leak(Box::new(span_profile::Profiler::new())));
+        if let Some(p) = spans {
+            tracing::subscriber::set_global_default(p).unwrap();
+        }
+        crate::live::enable_game_switches();
+        let root = std::path::PathBuf::from(std::env::var_os("SKATE3_ASSET_ROOT").unwrap());
+        let map = skate_data::skate_map::SkateMap::load(std::path::Path::new(&std::env::var_os("SKATE3_MAP").unwrap())).unwrap();
+        let mut session = crate::live::Session::load_map(&root, "easy", Some(map)).unwrap();
+        session.set_solver_iterations(25);
+        let mut settings = super::LivingWorldSettings::default();
+        settings.vehicles = super::KindSetting { enabled: true, density: 0.2 };
+        settings.pedestrians = super::KindSetting { enabled: true, density: 0.25 };
+        settings.skaters.enabled = true;
+        assert!(session.start_living_world(settings));
+        let ped_models = session.ped_models();
+        if let Some(p) = spans {
+            let _ = p.take();
+        }
+        let ticks: u32 = std::env::var("BENCH_TICKS").ok().and_then(|v| v.parse().ok()).unwrap_or(3000);
+        let _ = skate_core::profile::take();
+        let (mut cars, mut npcs, mut peds, mut hands, mut props) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        let mut dump = Vec::new();
+        let mut states = std::collections::BTreeMap::new();
+        let mut step_time = std::time::Duration::ZERO;
+        // `BENCH_INPUT_OUT=<file>`: the pads as a sim-oracle scenario (the Vita's autoplay plays it on DownTown).
+        let mut input_out = std::env::var_os("BENCH_INPUT_OUT").map(|_| String::from("# difficulty=easy\n"));
+        for t in 0..ticks {
+            let mut pad = skate_core::input::xbox::XboxState::default();
+            let stick = |deg: f32| {
+                let a = deg.to_radians();
+                [(a.cos() * 32767.0) as i16, (a.sin() * 32767.0) as i16]
+            };
+            match t {
+                60 | 1440 => pad.buttons = 0x8000,
+                121..1440 => pad.left = stick(90.0 + 60.0 * (t / 240) as f32),
+                1500.. => {
+                    if (t - 1500) % 40 < 18 {
+                        pad.buttons = 0x1000;
+                    }
+                    pad.left = stick(90.0 + 25.0 * (((t - 1500) / 200) as f32).sin());
+                }
+                _ => {}
+            }
+            if let Some(text) = &mut input_out {
+                text.push_str(&format!("{} {} {} {} {} {} {}\n", pad.buttons, pad.triggers[0], pad.triggers[1], pad.left[0], pad.left[1], pad.right[0], pad.right[1]));
+            }
+            let started = std::time::Instant::now();
+            let report = session.step(pad);
+            step_time += started.elapsed();
+            assert!(report.error.is_none(), "{:?}", report.error);
+            *states.entry(session.state_name()).or_insert(0u32) += 1;
+            dump.clear();
+            session.write_tick(&mut dump, false).unwrap();
+            fold(&mut hash, &dump);
+            if let Some((_, current)) = session.presentation() {
+                fold(&mut hash, format!("{:?}{:?}{:?}", current.root, current.bones, current.camera).as_bytes());
+            }
+            session.car_poses(&mut cars);
+            session.npc_poses(&mut npcs);
+            session.ped_poses(&ped_models, &mut peds);
+            session.hand_prop_poses(&mut hands);
+            session.prop_poses(&mut props);
+            fold(&mut hash, format!("{cars:?}{peds:?}{hands:?}{props:?}").as_bytes());
+            for n in &npcs {
+                fold(&mut hash, format!("{} {} {:?}{:?}", n.serial, n.alpha, n.current.root, n.current.bones).as_bytes());
+            }
+        }
+        if let (Some(text), Some(path)) = (input_out, std::env::var_os("BENCH_INPUT_OUT")) {
+            std::fs::write(&path, text).unwrap();
+        }
+        eprintln!("PERF_HASH {hash:016x}");
+        eprintln!("{ticks} ticks, {:.3} ms a tick in step; states {states:?}", step_time.as_secs_f64() * 1000.0 / ticks as f64);
+        eprintln!("{}", session.ped_brain_summary());
+        let mut profile = skate_core::profile::take();
+        profile.sort_by_key(|p| std::cmp::Reverse(p.1));
+        for (name, total, entries) in profile.iter().filter(|p| !p.0.starts_with("n_") && !p.0.starts_with("q_") && !p.0.ends_with("_n")).take(45) {
+            eprintln!("  {name}: {:.4} ms/tick ({entries})", *total as f64 / 1e6 / ticks as f64);
+        }
+        // Counters (`profile::count`): the mean per call.
+        for (name, total, entries) in profile.iter().filter(|p| p.0.starts_with("n_") || p.0.starts_with("q_") || p.0.ends_with("_n")) {
+            eprintln!("  {name}: {:.1} per call ({entries} calls)", *total as f64 / (*entries).max(1) as f64);
+        }
+        if let Some(p) = spans {
+            let mut v = p.take();
+            v.sort_by_key(|e| std::cmp::Reverse(e.1));
+            for (name, total, entries) in v.iter().take(40) {
+                eprintln!("  span {name}: {:.4} ms/tick ({entries})", total.as_secs_f64() * 1e3 / ticks as f64);
+            }
+        }
     }
 }

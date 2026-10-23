@@ -84,6 +84,14 @@ pub(super) fn advance(
     if resetting {
         skater.offboard_air_selector.reset();
         super::offboard::board_manager::runtime::reset_for_teleport(physics, skater);
+        // ResetSystems82DB92D0 (b297): TrajectorySelector82D67228 (keeps the in-flight request; clears the
+        // grind-locked-to-middle bit 9653 before this tick's grind gate reads it), OffBoardFeetIK82D77168 (b298),
+        // LandingOnDeck82D78B28 and the grind manager82D8A638 (previous state, engagement counter, cooldown; its
+        // child objects stay).
+        skater.trajectory.selector.reset();
+        skater.offboard_feet.reset();
+        skater.landing_deck.reset();
+        skater.player_input.grind.reset();
     }
     let collision = collision(skater);
     let mut callbacks = Callbacks {

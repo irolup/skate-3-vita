@@ -5,6 +5,12 @@ use super::{BoardWorld, ContactPrimitive, Vector3, WorldTriangle, query_metadata
 // Positive magnitude of thin_triangle's existing 0xb727_c5ac tolerance.
 pub(super) const THIN_MARGIN: f32 = f32::from_bits(0x3727_c5ac);
 
+std::thread_local! {
+    /// skate_vita (performance): the candidate mesh list of the query running on this thread
+    /// ([`BoardWorld::with_candidate_meshes`]).
+    static MESH_SCRATCH: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 impl BoardWorld {
     /// Conservative cluster culling, retaining canonical traversal order and
     /// every triangle in intersecting clusters. Narrow-phase remains unchanged.
@@ -21,9 +27,30 @@ impl BoardWorld {
 
     /// The meshes behind `candidate_ranges`, or None when it returns every triangle.
     pub(super) fn candidate_meshes(&self, bounds: Option<Bounds>) -> Option<Vec<usize>> {
+        let mut meshes = Vec::new();
+        self.candidate_meshes_into(bounds, &mut meshes).then_some(meshes)
+    }
+
+    /// skate_vita (performance): [`Self::candidate_meshes`] handed to `f` from this thread's scratch list (a query
+    /// inside `f` gets a list of its own), instead of a new list per query.
+    pub(super) fn with_candidate_meshes<R>(&self, bounds: Option<Bounds>, f: impl FnOnce(Option<&[usize]>) -> R) -> R {
+        MESH_SCRATCH.with(|scratch| match scratch.try_borrow_mut() {
+            Ok(mut meshes) => {
+                let some = self.candidate_meshes_into(bounds, &mut meshes);
+                f(some.then_some(&meshes[..]))
+            }
+            Err(_) => {
+                let meshes = self.candidate_meshes(bounds);
+                f(meshes.as_deref())
+            }
+        })
+    }
+
+    /// [`Self::candidate_meshes`] into `meshes`; false (and `meshes` unspecified) for None.
+    fn candidate_meshes_into(&self, bounds: Option<Bounds>, meshes: &mut Vec<usize>) -> bool {
         let (Some(metadata), Some(bounds)) = (&self.query_metadata, bounds.filter(|b| b.valid()))
         else {
-            return None;
+            return false;
         };
         let scale = [
             bounds.min.x,
@@ -39,16 +66,17 @@ impl BoardWorld {
         let bounds = bounds.expanded(
             self.maximum_fatness + self.maximum_triangle_margin + scale * (8. * f32::EPSILON),
         );
-        Some(self.query_index.query(bounds, &metadata.meshes))
+        self.query_index.query_into(bounds, &metadata.meshes, meshes);
+        true
     }
 
     /// skate_vita: the triangles of `range` whose bounds overlap `bounds`, from the per-mesh
     /// hierarchy where there is one (else a scan of the range), into `out` (cleared first).
     pub fn triangles_overlapping(&self, range: std::ops::Range<usize>, bounds: Bounds, out: &mut Vec<usize>) {
         out.clear();
-        match (self.candidate_meshes(Some(bounds)), &self.query_metadata) {
+        self.with_candidate_meshes(Some(bounds), |meshes| match (meshes, &self.query_metadata) {
             (Some(meshes), Some(metadata)) => {
-                for mesh in meshes {
+                for &mesh in meshes {
                     let r = &metadata.meshes[mesh].triangle_range;
                     if r.end > range.start && r.start < range.end {
                         self.triangle_index.query(mesh, bounds, &self.triangle_bounds, out);
@@ -57,7 +85,7 @@ impl BoardWorld {
                 out.retain(|i| range.contains(i));
             }
             _ => out.extend(range.filter(|&i| self.triangle_bounds[i].overlaps(bounds))),
-        }
+        })
     }
 
     pub fn line_candidates(
@@ -70,16 +98,16 @@ impl BoardWorld {
         // skate_vita: with metadata and valid bounds, each candidate mesh's
         // triangles come from its bounds hierarchy (triangle_index.rs): the same
         // indices, in the same order, as filtering its whole range below.
-        let indexed = match (self.candidate_meshes(bounds), bounds) {
+        let indexed = self.with_candidate_meshes(bounds, |meshes| match (meshes, bounds) {
             (Some(meshes), Some(b)) => {
                 let mut out = Vec::new();
-                for mesh in meshes {
+                for &mesh in meshes {
                     self.triangle_index.query(mesh, b, &self.triangle_bounds, &mut out);
                 }
                 Some(out)
             }
             _ => None,
-        };
+        });
         let linear = indexed.is_none().then(|| {
             self.candidate_ranges(bounds)
                 .into_iter()
@@ -121,6 +149,25 @@ impl BoardWorld {
 
     /// ZIP hierarchy results in canonical mesh order, for current metadata consumers.
     /// Pool, matching group, rejection mask and identity stay caller-owned.
+    /// skate_vita (performance): [`Self::candidate_mesh_indices`] appended to `out` (the same indices in the same
+    /// order) without a list of its own.
+    pub fn candidate_mesh_indices_extend(&self, bounds: Option<Bounds>, out: &mut Vec<usize>) -> Result<(), &'static str> {
+        let metadata = self.query_metadata()?;
+        let Some(bounds) = bounds.filter(|b| b.valid()) else {
+            out.extend(0..metadata.meshes.len());
+            return Ok(());
+        };
+        let bounds = conservative_bounds(bounds, self.maximum_fatness + self.maximum_triangle_margin);
+        MESH_SCRATCH.with(|scratch| match scratch.try_borrow_mut() {
+            Ok(mut meshes) => {
+                self.query_index.query_into(bounds, &metadata.meshes, &mut meshes);
+                out.extend_from_slice(&meshes);
+            }
+            Err(_) => out.extend(self.query_index.query(bounds, &metadata.meshes)),
+        });
+        Ok(())
+    }
+
     pub fn candidate_mesh_indices(
         &self,
         bounds: Option<Bounds>,

@@ -49,6 +49,10 @@ pub(crate) fn validate_runtime(map: &SkateMap) -> Result<(), String> {
             skate_data::skate_map::validate_static_objects(map, extension)?;
             continue;
         }
+        if extension.tag == crate::park_layout::EXTENSION_TAG {
+            // The in-memory skate.Park layout mark (park_layout::attach), never in a package file.
+            continue;
+        }
         if extension.tag == *b"SKYB" && extension.schema == 1 {
             eprintln!(
                 "SKATE LIMITATION: SKYB retail sky retained; using the map horizon until its shader adapter is available."
@@ -138,6 +142,7 @@ fn retail_archive(map: &SkateMap) -> Result<Option<&[u8]>, String> {
 fn retail_collision_world(
     archive: &[u8],
     material: RetailContactMaterial,
+    pieces: Option<&crate::park_layout::Pieces>,
 ) -> Result<BoardWorld, String> {
     let mut triangles = Vec::new();
     let mut packed_surfaces = Vec::new();
@@ -200,6 +205,9 @@ fn retail_collision_world(
         "SKATE_RWCM_READY triangles={count} query_clusters={} source=embedded",
         meshes.len()
     );
+    if let Some(pieces) = pieces {
+        append_pieces(&mut triangles, &mut packed_surfaces, &mut meshes, pieces, material)?;
+    }
     BoardWorld::with_query_metadata(
         triangles,
         QueryMetadata {
@@ -216,10 +224,45 @@ pub(crate) fn collision_world(
     map: &SkateMap,
     material: RetailContactMaterial,
 ) -> Result<BoardWorld, String> {
+    collision_world_with(map, material, None)
+}
+
+/// [`collision_world`] plus a skate.Park layout's placed pieces (crate::park_layout::Pieces): their posed triangles
+/// after the map's own, one query range per piece (retail registers each piece in the static set, b431).
+pub(crate) fn collision_world_with(
+    map: &SkateMap,
+    material: RetailContactMaterial,
+    pieces: Option<&crate::park_layout::Pieces>,
+) -> Result<BoardWorld, String> {
+    let pieces = pieces.filter(|p| !p.collision.is_empty());
     if let Some(archive) = retail_archive(map)? {
-        return retail_collision_world(archive, material);
+        return retail_collision_world(archive, material, pieces);
     }
-    portable_world(&map.geometry.collision, &map.materials, material)
+    let Some(pieces) = pieces else {
+        return portable_world(&map.geometry.collision, &map.materials, material, None);
+    };
+    let (mut triangles, mut packed_surfaces, mut meshes) = portable_parts(&map.geometry.collision, &map.materials, material, None, false)?;
+    append_pieces(&mut triangles, &mut packed_surfaces, &mut meshes, pieces, material)?;
+    BoardWorld::with_query_metadata(triangles, QueryMetadata { packed_surfaces, meshes, static_edges: vec![], island_flags: 0 })
+        .map_err(str::to_owned)
+}
+
+fn append_pieces(
+    triangles: &mut Vec<WorldTriangle>,
+    packed_surfaces: &mut Vec<u16>,
+    meshes: &mut Vec<QueryMesh>,
+    pieces: &crate::park_layout::Pieces,
+    material: RetailContactMaterial,
+) -> Result<(), String> {
+    let (more, surfaces, piece_meshes) = portable_parts(&pieces.collision, &pieces.materials, material, Some(&pieces.ranges), true)?;
+    let offset = triangles.len();
+    triangles.extend(more);
+    packed_surfaces.extend(surfaces);
+    meshes.extend(piece_meshes.into_iter().map(|mut mesh| {
+        mesh.triangle_range = mesh.triangle_range.start + offset..mesh.triangle_range.end + offset;
+        mesh
+    }));
+    Ok(())
 }
 
 /// skate_vita: a prop stands on the floor with its base plane (its template's lowest points, where
@@ -334,7 +377,30 @@ fn portable_world(
     collision: &[skate_data::skate_map::Collision],
     materials: &[skate_data::skate_map::Material],
     material: RetailContactMaterial,
+    // Ranges the query meshes must not cross (one prop instance each, so each has its own collision type); `None`
+    // chunks the whole list.
+    splits: Option<&[std::ops::Range<usize>]>,
 ) -> Result<BoardWorld, String> {
+    let (triangles, packed_surfaces, meshes) = portable_parts(collision, materials, material, splits, false)?;
+    let metadata = QueryMetadata {
+        packed_surfaces,
+        meshes,
+        static_edges: vec![],
+        island_flags: 0,
+    };
+    BoardWorld::with_query_metadata(triangles, metadata).map_err(str::to_owned)
+}
+
+/// [`portable_world`]'s triangles, packed surfaces and query meshes. `native_surfaces`: a triangle with native edge
+/// codes packs its own surface id (as an RWCM cluster unit does) instead of its package material's; the park pieces
+/// use it, the props keep their established packing.
+fn portable_parts(
+    collision: &[skate_data::skate_map::Collision],
+    materials: &[skate_data::skate_map::Material],
+    material: RetailContactMaterial,
+    splits: Option<&[std::ops::Range<usize>]>,
+    native_surfaces: bool,
+) -> Result<(Vec<WorldTriangle>, Vec<u16>, Vec<QueryMesh>), String> {
     let points: Vec<_> = collision.iter().map(|t| t.points).collect();
     let (positions, vertices, mut flags, mut cosines) =
         welded_edge_features(&points, collision.iter().any(|t| t.native_edges.is_none()))?;
@@ -344,9 +410,13 @@ fn portable_world(
         if let Some(edges) = source.native_edges {
             (flags[i], cosines[i]) = decode_native_edges(edges)?;
         }
-        let m = &materials[source.material as usize - 1];
-        // Exact EncodeRwSurfaceId mapping from the reference native adapter.
-        packed_surfaces.push((m.audio | (m.physics << 7) | (m.pattern << 12)) as u16);
+        if native_surfaces && source.native_edges.is_some() {
+            packed_surfaces.push(source.surface as u16);
+        } else {
+            let m = &materials[source.material as usize - 1];
+            // Exact EncodeRwSurfaceId mapping from the reference native adapter.
+            packed_surfaces.push((m.audio | (m.physics << 7) | (m.pattern << 12)) as u16);
+        }
         let points = vertices[i].map(|id| {
             let p = positions[id];
             Vector3::new(p.x, p.y, p.z)
@@ -371,8 +441,8 @@ fn portable_world(
     // triangle order and mesh identity/filter values: contact tie-breaking,
     // packed surfaces and adjacency must not change with this acceleration.
     let mut meshes = Vec::new();
-    for start in (0..triangles.len()).step_by(64) {
-        let end = (start + 64).min(triangles.len());
+    let whole = [0..triangles.len()];
+    for (start, end) in splits.unwrap_or(&whole).iter().flat_map(|r| (r.start..r.end).step_by(64).map(move |s| (s, (s + 64).min(r.end)))) {
         let bounds = Bounds::from_points(triangles[start..end].iter().flat_map(|t| t.triangle.vertices))
             .ok_or("SKATE collision bounds empty")?;
         meshes.push(QueryMesh {
@@ -385,13 +455,7 @@ fn portable_world(
             pool: QueryPool::Ground,
         });
     }
-    let metadata = QueryMetadata {
-        packed_surfaces,
-        meshes,
-        static_edges: vec![],
-        island_flags: 0,
-    };
-    BoardWorld::with_query_metadata(triangles, metadata).map_err(str::to_owned)
+    Ok((triangles, packed_surfaces, meshes))
 }
 
 /// One prop type's collision (skate_vita): the winding-fixed template-space triangles with
@@ -478,6 +542,12 @@ pub(crate) struct PropCollisionLayer {
     /// Instances added mid-game and retired since; their parked triangle
     /// ranges are reused by the next instance of the same size.
     retired: Vec<usize>,
+    /// The collision type last written to each instance's meshes (`u32::MAX` = none yet), so an unchanged type
+    /// costs no mesh scan.
+    collision_types: Vec<u32>,
+    /// skate_vita (performance): an instance took a slot or new triangles, or one was added or retired, since the
+    /// last collision-type pass (`GamePhysics::step_props` runs one only then or when a type can have changed).
+    collision_types_stale: bool,
 }
 
 impl PropCollisionLayer {
@@ -490,6 +560,8 @@ impl PropCollisionLayer {
             free: self.free.clone(),
             contact_material: self.contact_material,
             retired: self.retired.clone(),
+            collision_types: self.collision_types.clone(),
+            collision_types_stale: self.collision_types_stale,
         }
     }
 
@@ -504,6 +576,39 @@ impl PropCollisionLayer {
     pub fn world_mut(&mut self) -> &mut BoardWorld {
         &mut *self.world
     }
+    /// Gives an instance's query meshes the retail collision type's rejection flag (`1 << type`; DMOPool rebuild
+    /// `827778C0`). Returns whether anything changed.
+    pub fn set_collision_type(&mut self, instance: usize, collision_type: u32) -> bool {
+        let Some(range) = self.instances.get(instance).map(|i| i.range.clone()) else { return false };
+        if self.collision_types.len() < self.instances.len() {
+            self.collision_types.resize(self.instances.len(), u32::MAX);
+        }
+        if self.collision_types[instance] == collision_type {
+            return false;
+        }
+        self.collision_types[instance] = collision_type;
+        let flags = 1u32.checked_shl(collision_type).unwrap_or(0);
+        self.world_mut().set_rejection_flags(range, flags)
+    }
+
+    /// skate_vita: an instance that takes a slot (or new triangles) has meshes whose flags are not its own yet:
+    /// the next [`Self::set_collision_type`] writes them.
+    fn forget_collision_type(&mut self, instance: usize) {
+        if let Some(t) = self.collision_types.get_mut(instance) {
+            *t = u32::MAX;
+        }
+        self.collision_types_stale = true;
+    }
+
+    /// skate_vita: see `collision_types_stale` (the field).
+    pub(crate) fn collision_types_stale(&self) -> bool {
+        self.collision_types_stale
+    }
+
+    pub(crate) fn clear_collision_types_stale(&mut self) {
+        self.collision_types_stale = false;
+    }
+
     pub fn instances(&self) -> &[PropCollisionInstance] {
         &self.instances
     }
@@ -576,8 +681,10 @@ impl PropCollisionLayer {
             } else if let Some(range) = self.free[entry.template].pop() {
                 entry.range = range.clone();
                 edits.push((range, triangles));
+                self.forget_collision_type(instance);
             } else {
                 appends.push((instance, triangles));
+                self.forget_collision_type(instance);
             }
         }
         let refs: Vec<_> = edits.iter().map(|(range, t)| (range.clone(), t.as_slice())).collect();
@@ -651,6 +758,8 @@ impl PropCollisionLayer {
             free: Vec::new(),
             contact_material: material,
             retired: Vec::new(),
+            collision_types: Vec::new(),
+            collision_types_stale: true,
         })
     }
 
@@ -716,6 +825,7 @@ impl PropCollisionLayer {
         entry.id = id;
         entry.placement = (basis, translation);
         self.rebake(index, basis, translation)?;
+        self.collision_types_stale = true;
         Ok(index)
     }
 
@@ -752,9 +862,12 @@ pub(crate) struct PropShape {
 
 /// The retail collision shapes per DMO template id; empty when setup exported none (older install).
 pub(crate) fn load_dmo_collision(asset_root: &std::path::Path, map_name: &str) -> std::collections::BTreeMap<String, PropShape> {
-    let path = asset_root.join("private").join("native-props").join(format!("{map_name}.json"));
-    // skate_vita: through `skate_data::vfs` (the packs).
-    let Some(sidecar) = skate_data::vfs::read(&path).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()) else { return Default::default() };
+    load_collision_shapes(&asset_root.join("private").join("native-props").join(format!("{map_name}.json")))
+}
+
+/// The `collision` map of one placement sidecar (`dynamic_props.write_placements`: district props, park layouts).
+pub(crate) fn load_collision_shapes(path: &std::path::Path) -> std::collections::BTreeMap<String, PropShape> {
+    let Some(sidecar) = skate_data::vfs::read(path).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()) else { return Default::default() };
     let Some(map) = sidecar.get("collision").and_then(|v| v.as_object()) else { return Default::default() };
     let mut out = std::collections::BTreeMap::new();
     for (key, v) in map {
@@ -803,6 +916,105 @@ pub(crate) fn build_prop_layer_with(
         return Err(error);
     }
     Ok(Some(layer))
+}
+
+/// Every placed object's collision in world space (its template's retail shape when it has one, else its render
+/// triangles) with one contiguous range per object: the props' layer and the skate.Park pieces' share of the static
+/// world (crate::park_layout). skate_vita: only the ranges (the props build their layer with [prop_layer_unbaked]);
+/// the local triangles are not kept.
+pub(crate) fn posed_collision(
+    map: &SkateMap,
+    objects: &[skate_data::skate_map::StaticObject],
+    shapes: &std::collections::BTreeMap<String, PropShape>,
+) -> (Vec<skate_data::skate_map::Collision>, Vec<std::ops::Range<usize>>) {
+    let mut collision = Vec::new();
+    let mut mismatched = std::collections::BTreeSet::new();
+    let mut instances = Vec::new();
+    for object in objects {
+        let t = &object.transform;
+        // Row-vector affine (v @ basis + translation), as in spawn_instances.
+        let transform = |p: [f32; 3]| -> [f32; 3] {
+            [
+                p[0] * t[0] + p[1] * t[3] + p[2] * t[6] + t[9],
+                p[0] * t[1] + p[1] * t[4] + p[2] * t[7] + t[10],
+                p[0] * t[2] + p[1] * t[5] + p[2] * t[8] + t[11],
+            ]
+        };
+        let determinant = t[0] * (t[4] * t[8] - t[5] * t[7])
+            - t[1] * (t[3] * t[8] - t[5] * t[6])
+            + t[2] * (t[3] * t[7] - t[4] * t[6]);
+        let range =
+            object.first_index as usize..(object.first_index + object.index_count) as usize;
+        let start = collision.len();
+        let template = object.name.split('/').next().unwrap_or_default();
+        // Both meshes should be in the template's model space: a retail shape that does not line up with the render
+        // mesh (the garbage bags sit 0.38 m lower: anchored elsewhere, not decoded) keeps the render mesh, logged once.
+        let shape = shapes.get(template).filter(|shape| {
+            let bounds = |points: &mut dyn Iterator<Item = [f32; 3]>| points.fold(([f32::MAX; 3], [f32::MIN; 3]), |(lo, hi), p| {
+                (std::array::from_fn(|i| lo[i].min(p[i])), std::array::from_fn(|i| hi[i].max(p[i])))
+            });
+            let (rl, rh) = bounds(&mut map.geometry.indices[range.clone()].iter().map(|&i| map.geometry.vertices[i as usize].position));
+            let (sl, sh) = bounds(&mut shape.triangles.iter().flatten().copied());
+            let gap = (0..3).map(|i| (rl[i] - sl[i]).abs().max((rh[i] - sh[i]).abs())).fold(0.0f32, f32::max);
+            if gap > 0.25 && mismatched.insert(template.to_owned()) {
+                warn!("SKATE_PROP_COLLISION: template {template} retail shape bounds {sl:?}..{sh:?} differ from the render mesh {rl:?}..{rh:?} by {gap:.2} m; render mesh kept");
+            }
+            gap <= 0.25
+        });
+        if let Some(shape) = shape {
+            for ((tri, edges), surface) in shape.triangles.iter().zip(&shape.edges).zip(&shape.surfaces) {
+                let mut points = *tri;
+                let mut edges = *edges;
+                if determinant < 0. {
+                    points.swap(1, 2);
+                    // Edge i runs from vertex i to i + 1: swapping b and c reverses the loop, so edge 0 (a-b) becomes
+                    // a-c (old edge 2) and edge 2 becomes b-a (old edge 0).
+                    edges = edges.map(|e| [e[2], e[1], e[0]]);
+                }
+                let [a, b, c] = points.map(Vec3::from_array);
+                if (b - a).cross(c - a).length_squared() <= 0. {
+                    continue;
+                }
+                collision.push(skate_data::skate_map::Collision {
+                    points: points.map(transform),
+                    surface: *surface,
+                    material: 1,
+                    native_edges: edges,
+                });
+            }
+            if collision.len() > start {
+                instances.push(start..collision.len());
+            }
+            continue;
+        }
+        for tri in map.geometry.indices[range].chunks_exact(3) {
+            let mut points =
+                [tri[0], tri[1], tri[2]].map(|i| map.geometry.vertices[i as usize].position);
+            if determinant < 0. {
+                points.swap(1, 2);
+            }
+            let [a, b, c] = points.map(Vec3::from_array);
+            let cross = (b - a).cross(c - a);
+            if cross.length_squared() <= 0. {
+                continue;
+            }
+            let source = &map.materials
+                [map.geometry.vertices[tri[0] as usize].material as usize - 1];
+            // Wheels read the packed surface nibble from the triangle tag; use
+            // the same EncodeRwSurfaceId mapping as static map collision.
+            let surface = source.audio | (source.physics << 7) | (source.pattern << 12);
+            collision.push(skate_data::skate_map::Collision {
+                points: points.map(transform),
+                surface,
+                material: map.geometry.vertices[tri[0] as usize].material,
+                native_edges: None,
+            });
+        }
+        if collision.len() > start {
+            instances.push(start..collision.len());
+        }
+    }
+    (collision, instances)
 }
 
 /// skate_vita: [`build_prop_layer`] without triangles: the templates and instances, each
@@ -942,8 +1154,12 @@ pub(crate) fn prop_layer_unbaked(
 /// The authored grab splines per DMO template id (`native-props/<map>.json` `grab_splines`, doc 26i "Move Object
 /// step 1"); `None` when the export has none.
 pub(crate) fn load_dmo_grab_splines(asset_root: &std::path::Path, map_name: &str) -> Option<std::collections::BTreeMap<String, Vec<crate::living_world::vehicles::CarGrabSpline>>> {
-    let path = asset_root.join("private").join("native-props").join(format!("{map_name}.json"));
-    let sidecar: serde_json::Value = serde_json::from_slice(&skate_data::vfs::read(&path).ok()?).ok()?;
+    load_grab_splines(&asset_root.join("private").join("native-props").join(format!("{map_name}.json")))
+}
+
+/// The grab_splines map of one placement sidecar.
+pub(crate) fn load_grab_splines(path: &std::path::Path) -> Option<std::collections::BTreeMap<String, Vec<crate::living_world::vehicles::CarGrabSpline>>> {
+    let sidecar: serde_json::Value = serde_json::from_slice(&skate_data::vfs::read(path).ok()?).ok()?;
     let map = sidecar.get("grab_splines")?.as_object()?;
     let splines: std::collections::BTreeMap<_, _> = map.iter().map(|(k, v)| (k.clone(), crate::living_world::vehicles::parse_grab_splines(v))).filter(|(_, v): &(String, Vec<_>)| !v.is_empty()).collect();
     (!splines.is_empty()).then_some(splines)
@@ -952,8 +1168,12 @@ pub(crate) fn load_dmo_grab_splines(asset_root: &std::path::Path, map_name: &str
 /// The grind rails per DMO template id (`native-props/<map>.json` `grind_splines`, template space; retail setup
 /// 82C535C0, doc 26 "Grinding on props"); `None` when the export has none. A malformed list is an error.
 pub(crate) fn load_dmo_grind_rails(asset_root: &std::path::Path, map_name: &str) -> Result<Option<std::collections::BTreeMap<String, Vec<crate::grind_world::props::PropRail>>>, String> {
-    let path = asset_root.join("private").join("native-props").join(format!("{map_name}.json"));
-    let Ok(bytes) = skate_data::vfs::read(&path) else { return Ok(None) };
+    load_grind_rails(&asset_root.join("private").join("native-props").join(format!("{map_name}.json")))
+}
+
+/// The `grind_splines` map of one placement sidecar, per template id (template space).
+pub(crate) fn load_grind_rails(path: &std::path::Path) -> Result<Option<std::collections::BTreeMap<String, Vec<crate::grind_world::props::PropRail>>>, String> {
+    let Ok(bytes) = skate_data::vfs::read(path) else { return Ok(None) };
     let sidecar: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
     let Some(map) = sidecar.get("grind_splines").and_then(|v| v.as_object()) else { return Ok(None) };
     let rails = map.iter().map(|(k, v)| Ok((k.clone(), crate::grind_world::props::parse_rails(v).map_err(|e| format!("{}: {k}: {e}", path.display()))?)))
@@ -965,9 +1185,17 @@ pub(crate) fn load_dmo_types(
     asset_root: &std::path::Path,
     map_name: &str,
 ) -> Option<std::collections::BTreeMap<String, crate::physics::prop_dynamics::DmoType>> {
+    load_types(asset_root, &asset_root.join("private").join("native-props").join(format!("{map_name}.json")), map_name)
+}
+
+/// The 	ypes map of one placement sidecar, resolved against the installation's stock vault.
+pub(crate) fn load_types(
+    asset_root: &std::path::Path,
+    path: &std::path::Path,
+    map_name: &str,
+) -> Option<std::collections::BTreeMap<String, crate::physics::prop_dynamics::DmoType>> {
     use crate::physics::prop_dynamics::{dmo_type_blocks, DmoType, DMO_TYPE_CLASS};
-    let path = asset_root.join("private").join("native-props").join(format!("{map_name}.json"));
-    let sidecar: serde_json::Value = serde_json::from_slice(&skate_data::vfs::read(&path).ok()?).ok()?;
+    let sidecar: serde_json::Value = serde_json::from_slice(&skate_data::vfs::read(path).ok()?).ok()?;
     let map = sidecar.get("types")?.as_object()?;
     if map.is_empty() {
         return None;
@@ -1011,9 +1239,7 @@ pub(crate) fn load_dmo_types(
 /// skate_vita: each placed prop's template range (`first_index`, `index_count` of its MOBJ
 /// record), by id: what the renderer draws for it. From the same package the props load from.
 pub(crate) fn prop_template_ranges(asset_root: &std::path::Path, map_name: &str) -> std::collections::HashMap<u32, (u32, u32)> {
-    let dir = asset_root.join("private").join("native-props");
-    let package = dir.join(format!("{map_name}.props"));
-    let path = if skate_data::vfs::is_file(&package) { package } else { dir.join(format!("{map_name}.skate")) };
+    let path = props_package(&asset_root.join("private").join("native-props"), map_name);
     let Ok(data) = skate_data::vfs::read(&path) else { return Default::default() };
     let map = if skate_data::prop_package::is_package(&data) { skate_data::prop_package::decode(&data) } else { SkateMap::parse_render_only(&data) };
     let Ok(map) = map else { return Default::default() };
@@ -1032,18 +1258,56 @@ pub(crate) fn load_prop_layer(
     material: RetailContactMaterial,
     simulation: skate_core::physics::rigid_body::RetailSimulationStep,
 ) -> Option<(PropCollisionLayer, crate::physics::prop_dynamics::PropDynamics)> {
-    // skate_vita: files through `skate_data::vfs` (the packs); on the Vita the package is
-    // `<map>.props` (`skate_data::prop_package`: the `.skate` without its texture pixels).
-    let package = asset_root.join("private").join("native-props").join(format!("{map_name}.props"));
-    let path = if skate_data::vfs::is_file(&package) {
-        package
-    } else {
-        asset_root.join("private").join("native-props").join(format!("{map_name}.skate"))
-    };
-    if !skate_data::vfs::is_file(&path) {
+    let directory = asset_root.join("private").join("native-props");
+    load_prop_layer_at(asset_root, &props_package(&directory, map_name), &directory.join(format!("{map_name}.json")), map_name, material, simulation)
+}
+
+/// skate_vita: the package `<name>.props` (`skate_data::prop_package`: the `.skate` without its texture pixels) when
+/// baked, else `<name>.skate`.
+fn props_package(directory: &std::path::Path, name: &str) -> std::path::PathBuf {
+    let package = directory.join(format!("{name}.props"));
+    if skate_data::vfs::is_file(&package) { package } else { directory.join(format!("{name}.skate")) }
+}
+
+/// The prop package and sidecar a loaded map uses: its skate.Park layout's movable pieces
+/// (`park-layouts/<layout>.props.skate`, research b435: ordinary DMOs) when it carries a layout that has them, else the
+/// district's own (`native-props/<map>.skate`). No park stream has district props (2026-10-21), so the layout's
+/// package stands in for them; a stream with both would need the two merged.
+pub(crate) fn prop_files(asset_root: &std::path::Path, map: &SkateMap) -> (std::path::PathBuf, std::path::PathBuf, String) {
+    if let Some(layout) = crate::park_layout::layout_of(map) {
+        let directory = crate::park_layout::directory(asset_root);
+        let skate = props_package(&directory, &format!("{layout}.props"));
+        if skate_data::vfs::is_file(&skate) {
+            return (skate, directory.join(format!("{layout}.props.json")), layout.to_owned());
+        }
+    }
+    let directory = asset_root.join("private").join("native-props");
+    (props_package(&directory, &map.name), directory.join(format!("{}.json", map.name)), map.name.clone())
+}
+
+/// [load_prop_layer] for a loaded map ([prop_files]).
+pub(crate) fn load_map_prop_layer(
+    asset_root: &std::path::Path,
+    map: &SkateMap,
+    material: RetailContactMaterial,
+    simulation: skate_core::physics::rigid_body::RetailSimulationStep,
+) -> Option<(PropCollisionLayer, crate::physics::prop_dynamics::PropDynamics)> {
+    let (skate, json, name) = prop_files(asset_root, map);
+    load_prop_layer_at(asset_root, &skate, &json, &name, material, simulation)
+}
+
+fn load_prop_layer_at(
+    asset_root: &std::path::Path,
+    path: &std::path::Path,
+    sidecar: &std::path::Path,
+    map_name: &str,
+    material: RetailContactMaterial,
+    simulation: skate_core::physics::rigid_body::RetailSimulationStep,
+) -> Option<(PropCollisionLayer, crate::physics::prop_dynamics::PropDynamics)> {
+    if !skate_data::vfs::is_file(path) {
         return None;
     }
-    let loaded = skate_data::vfs::read(&path).map_err(|e| e.to_string()).and_then(|data| {
+    let loaded = skate_data::vfs::read(path).map_err(|e| e.to_string()).and_then(|data| {
         if skate_data::prop_package::is_package(&data) {
             skate_data::prop_package::decode(&data)
         } else {
@@ -1067,7 +1331,7 @@ pub(crate) fn load_prop_layer(
             }
         }
     }
-    let shapes = load_dmo_collision(asset_root, map_name);
+    let shapes = load_collision_shapes(sidecar);
     let retail_shaped = objects.iter().filter(|o| shapes.contains_key(o.name.split('/').next().unwrap_or_default())).count();
     info!("SKATE_PROP_COLLISION: {map_name} retail collision shapes {} templates, {retail_shaped}/{} props", shapes.len(), objects.len());
     // skate_vita: no triangles yet; the props take collision slots as they stream in.
@@ -1089,15 +1353,15 @@ pub(crate) fn load_prop_layer(
             for (instance, error) in layer.bake_placed(bodiless) {
                 warn!("SKATE_PROP_COLLISION: {map_name} instance {instance}: {error}");
             }
-            if let Some(types) = load_dmo_types(asset_root, map_name) {
+            if let Some(types) = load_types(asset_root, sidecar, map_name) {
                 let typed = dynamics.set_type_data(&types);
                 info!("SKATE_PROP_TYPES: {map_name} types={} props_with_type_data={typed}/{}", types.len(), objects.len());
             }
-            if let Some(splines) = load_dmo_grab_splines(asset_root, map_name) {
+            if let Some(splines) = load_grab_splines(sidecar) {
                 let with = dynamics.set_grab_splines(&splines);
                 info!("SKATE_PROP_GRAB: {map_name} templates={} props_with_grab_splines={with}/{}", splines.len(), objects.len());
             }
-            match load_dmo_grind_rails(asset_root, map_name) {
+            match load_grind_rails(sidecar) {
                 Ok(Some(rails)) => {
                     let templates = rails.len();
                     let with = dynamics.set_grind_rails(rails);
@@ -1411,6 +1675,7 @@ mod tests {
             &mut materials,
             &mut images,
             &mut buffers,
+            None,
         );
         assert_eq!(spawned, 2);
         meshes.publish(&mut world);

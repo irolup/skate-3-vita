@@ -6,12 +6,11 @@
 //! packed surfaces as the board collision pass.
 use super::ground_query::{self, IndexedEdgeBody};
 use skate_core::{
-    physics::board_world::BoardWorld,
     player::offboard::ground_query::{EdgeSearch, GroundQueryPacket, GroundQueryScene, LineHit},
 };
 
 pub(crate) struct SceneService<'a> {
-    pub world: &'a BoardWorld,
+    pub world: super::BipedWorld<'a>,
     pub vehicles: &'a [(usize, crate::dynamics::SolidBody)],
 }
 

@@ -58,12 +58,27 @@ pub struct Session {
 /// render and its pose (origin, basis columns).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PropPose {
+    /// The prop body's stable id (the replay recorder's key).
+    pub id: u32,
     pub first_index: u32,
     pub index_count: u32,
     pub origin: [f32; 3],
     pub basis: [[f32; 3]; 3],
     /// The instance's per-axis scale (1 for most props).
     pub scale: [f32; 3],
+}
+
+/// A shared view of the static collision world ([`Session::camera_world`]).
+pub struct CameraWorld(std::sync::Arc<skate_core::physics::board_world::BoardWorld>);
+
+impl CameraWorld {
+    /// The gameplay camera's fat line (`camera::world_query::line`) from `from` to `to` with `radius`: the first hit's
+    /// fraction along the segment and the hit normal.
+    pub fn sweep(&self, from: glam::Vec3, to: glam::Vec3, radius: f32) -> Option<(f32, glam::Vec3)> {
+        let lanes = |v: glam::Vec3| [v.x, v.y, v.z, 0.0];
+        let hit = crate::camera::world_query::line(&self.0, lanes(from), lanes(to), radius).ok()?;
+        (hit.hit != 0).then(|| (hit.fraction, glam::Vec3::new(hit.normal[0], hit.normal[1], hit.normal[2])))
+    }
 }
 
 /// Default bound of the decoded stock animation keys (M7).
@@ -476,6 +491,12 @@ impl Session {
         self.skater.travel_to([[c, 0.0, -s, 0.0], [0.0, 1.0, 0.0, 0.0], [s, 0.0, c, 0.0], [x, y, z, 1.0]])
     }
 
+    /// Teleports the skater to a locator (the Challenge Map's locations: `teleports.json` rows right, up, forward,
+    /// translation), as `respawn` does for the spawn.
+    pub fn teleport(&mut self, matrix: [[f32; 4]; 4]) -> Result<(), String> {
+        self.skater.travel_to(matrix)
+    }
+
     /// The fixed timestep for the next tick (stock `clock.rs`; 1/60 s unless the
     /// camera requested slow motion).
     pub fn period(&self) -> Duration {
@@ -487,8 +508,14 @@ impl Session {
         let Some(dynamics) = self.physics.prop_dynamics() else { return };
         for (id, origin, basis, scale) in dynamics.streamed_poses() {
             let Some(&(first_index, index_count)) = self.prop_templates.get(&id) else { continue };
-            out.push(PropPose { first_index, index_count, origin: [origin.x, origin.y, origin.z], basis: basis.columns, scale: [scale.x, scale.y, scale.z] });
+            out.push(PropPose { id, first_index, index_count, origin: [origin.x, origin.y, origin.z], basis: basis.columns, scale: [scale.x, scale.y, scale.z] });
         }
+    }
+
+    /// The static collision world for sweeps outside the step (the replay cameras while the session is paused).
+    /// Drop it before the next `step`: the step changes the world in place and needs it unshared.
+    pub fn camera_world(&self) -> CameraWorld {
+        CameraWorld(self.physics.world_geometry())
     }
 
     /// The world's placed props and how many are streamed in (not parked); `None` without props.
@@ -538,6 +565,10 @@ impl Session {
     /// GLB's skin joints are matched to them by name, case-insensitively.
     pub fn bone_names(&self) -> &[String] {
         &self.skater.animation.evaluator.frames.bone_names
+    }
+    /// Each stock rig bone's parent (-1: a root), in [`Self::bone_names`] order.
+    pub fn bone_parents(&self) -> &[i32] {
+        &self.skater.animation.evaluator.frames.parents
     }
 
     /// Oracle dump of this session (feature `oracle`): the harness header and one

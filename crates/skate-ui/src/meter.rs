@@ -4,8 +4,8 @@
 //! 5 tail on, 6 hide, 7 show). The reference has no feed for it: how the deck tilt maps
 //! to the arrow and the states below is ours (documented in PLAN.md §14 and
 //! `docs/milestones/M9-progress.md`).
-use crate::apt_scene::{self, Draw, Shapes};
-use crate::apt_vm::{Value, Vm};
+use crate::fe::apt_scene::{self, Draw, Shapes};
+use crate::fe::apt_vm::{Value, Vm};
 use crate::menu_runtime::{MenuRuntime, Natives};
 
 pub struct Host;

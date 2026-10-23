@@ -4,7 +4,7 @@ These are the reference repositories this project copies from or follows. Pinned
 
 | Reference | URL | Commit |
 |---|---|---|
-| skate-3-rust-engine | https://github.com/SK8-ENGINE/skate-3-rust-engine | `618e824`, a commit of pull request #52 (copied at `cb79689`, resynced 2026-10-08 to `b3c9679`, 2026-10-13 to `2e16697` and 2026-10-17 to `618e824`: see **Resync to b3c9679**, **Resync to 2e16697** and **L1 resync to PR #52 head `618e824`**) |
+| skate-3-rust-engine | https://github.com/SK8-ENGINE/skate-3-rust-engine | `b110bab`, a commit of pull request #52 (copied at `cb79689`, resynced 2026-10-08 to `b3c9679`, 2026-10-13 to `2e16697`, 2026-10-17 to `618e824`, 2026-10-19 to `fad5aae` and 2026-10-21 to `b110bab`: see **Resync to b3c9679**, **Resync to 2e16697**, **L1 resync to PR #52 head `618e824`**, **L1 resync to PR #52 head `fad5aae`** and **Resync to PR #52 head `b110bab`**; the front end and Instant Replay are still at `fad5aae` until step 2) |
 | cargo-vita | https://github.com/vita-rust/cargo-vita | `c6bbf22` |
 | vitasdk-sys | https://github.com/vita-rust/vitasdk-sys | `cee132f` |
 | examples | https://github.com/vita-rust/examples | `5ef9e08` |
@@ -369,3 +369,253 @@ Check: `downtown_peds_walk_and_pose` (20 s idle at the DownTown spawn, retail de
 | vita-bake `living.rs` | `ped_tables.json` with the behaviour classes; the compiled ped graphs and plugin descriptors (`.stategraph`) under their stock paths; `waypoints.json`, `hand_props.json` | ours |
 
 Check: `downtown_peds_walk_and_pose` (20 s idle at the DownTown spawn): 15 peds, at the end 8 in plugins (seats, bins, conversations), 4 wandering, 2 starting a conversation, 1 greeting; 2 conversations; deterministic (PED_HASH 507ae464bfaea8c2 twice); `think_peds` 0.15 ms a tick on the desktop. TRAFFIC_HASH unchanged.
+
+## L1 resync to PR #52 head `fad5aae` (2026-10-19)
+
+The PR moved 80 commits after `618e824` (living world fixes, the Challenge Map, the Steam launcher, Better Water). Method as before (`git merge-file` per copied file, ours / `618e824` / `fad5aae`, the `madd` transform on both upstream sides): 68 files merged cleanly, the rest resolved by hand; the five living-world files ported without Bevy (`peds.rs`, `ped_body.rs`, `ped_hand_props.rs`, `vehicles.rs`, `npc_skaters.rs`) were merged the same way and their Bevy-side blocks ported by hand.
+
+| Part | What | Edits |
+|---|---|---|
+| skate-core | living world: peds (brain, mood store evicting by priority, chase and the new `peds/chase_alert.rs`, conversations that passers-by join through the offer scan, plugins with the seats-in-water rule, nav, wander), NPC skaters (`ai_record`, `ai_signals`, `controller_b`, `npc_tricks`), population, replay; `dmo.rs` (`step_kept`: a kept prop scores like a keep placement), `board_world.rs` (`set_rejection_flags`), skeleton body collision feedback and update, grab scene, move object | `dmo.rs`: upstream's live score inside our memoized eviction queue (a placement's live and candidate scores cached apart, compared as upstream's `front` and `best`) |
+| skate-sim physics | on foot: props are walker step geometry (`BipedWorld`: map and prop world), the prop collision types (heavy 12 / light 14 / held 13) the walker filters, ped part contacts on foot; grab slots, carry stick sides and turn ease, the skitch grab, the bail clamp on props, kept props near the player, `moved_ids`; the solve's ped part velocities after the solve (`Proxies::ped_after`, `SkaterRuntime::{ped_hits, ped_after}`) | `skate_world.rs`: `set_collision_type` over our template slots (an instance that takes a slot or new triangles has its type written again, `forget_collision_type`; appended slots already have meshes of their own, upstream's `portable_world` splits); `physics.rs`: `biped_world` beside our collision window; `grab_view` (a PC gizmo viewer) a stand-in with `logging()` off; Bevy log macros → `tracing` |
+| skate-sim living world | `think_peds` (the seat push gate as a step, seats in water, conversation offers for founders and passers-by, the plugin graph's End on leaving, a held sit avoid, the approach route dropped with the move, tazer clips, refusals for conversation areas, a lost prop's waypoint released, the map-change reset); `advance_peds` (tazer clips; the local skater's ped reaction from the solve's contact with the ped body, the torso's speed after the solve); `ped_body.rs` (retail part material, no friction; capsule inertia, the parts turn in the solve; proxy ids from the ped serial, `proxy_serial`; the bodies stay through a reaction; `reaction_part_speed`); `ped_hand_props.rs` (the record rotation as Rz Ry Rx, the attach locator from `hand_props.json` `attach`, the tazer's clip states); `ped_mood.rs` / `ped_plugins.rs` / `ped_hand_props.rs` read one parsed tables document; `vehicles.rs` (a car drawn one tick behind its current pose, `drawn_prev`); the census keeps moved props (`step_kept`, `moved_ids`); `PedBrainSettings::plugins` | our loader reads the tables once through `skate_data::vfs` (`PedData::read_tables`, `ped_tables.json` first) and passes the parsed document to every reader; `CarPose` publishes the drawn pair; the map-change resets of `sync_hand_props` and `PopulationState::install` (`continue_serials_from`) are not needed (the Vita builds a new living world for each world it loads) |
+
+| Not taken (and why) | Upstream files |
+|---|---|
+| The Challenge Map and the retail menu changes (R2) | `skate-core/src/challenge_map.rs`, `menus.rs`, `skate-data/src/challenge_map.rs`, `menu_tables.rs`, `skate-game/src/challenge_map*.rs`, `retail_menu*.rs`, `crossbar_host.rs`, `tools/prepare_menu_movies.py` |
+| The HUD's central message (ZAP!, Tazed!, BAM!) and the chase alerts over peds: presentation over the PC HUD; the chase messages' choice is in skate-core (`chase_message`) for later | `skate-game/src/hud_central.rs`, `living_world/ped_alerts.rs`, `peds.rs` `post_chase_messages`, `tools/prepare_chase_arrows.py` |
+| Loading behind the PC loading screen (the Vita loads the living world with the world) | `living_world/preload.rs`, `mod.rs` early loads, `peds.rs` `early_load_ped_data` |
+| NPC skater speech and the skater-bump lines (no NPC audio on the Vita), the ambience read-ahead at map load | `skate-audio/src/player/contacts.rs`, `state.rs`, `world/skater_speech.rs`, `world/skaters.rs`, `skate-game/src/game_audio/*` |
+| The simulated NPC tier (not ported), NPC log lines and the roster look | `living_world/npc_sim.rs`, `npc_skaters.rs` |
+| PC host: launcher, Steam launcher, setup, SDK docs, mods, Better Water, XInput rumble, trace-all switches and timing diagnostics, the grab visualizer, the APT runtime (`skate-ui` keeps its own) | `app.rs`, `main.rs`, `setup.rs`, `tools/steam-launcher/`, `sdk/`, `skate-mods/`, `modding/`, `water_*.rs`, `input/platform.rs`, `trace_all.rs`, `system_timing.rs`, `physics/grab_view.rs`, `living_world/opt_ins.rs`, `apt_*.rs` |
+
+Reference: built from `fad5aae` (`reference.sh`; in the scratch copy `splash.rs` and `setup.rs` `local_stamp`, which link Windows libraries even in test builds, replaced by no-ops): 19 of the 20 Course dumps equal `618e824`'s (`04_kickflip` differs from tick 1701 upstream); the port (mul_add) 20/20 against it, no-fma 20/20 against its baseline; Fast physics (25 iterations) 20/20 against the reference and its baseline. Tests: skate-core 1074 passed, skate-sim 307 of 308 (`embedded_static_rwcm_hits_distinct_actor_query_ids`, as before). DownTown (20 s idle at the spawn): traffic 13 cars, 12 moving at 6.2 m/s; the skitch test latched at tick 3, 99 ticks skitching; the car knock's first wipeout at tick 6 (both unchanged); 3 NPC skaters posed; 15 peds (4 in plugins, 6 starting conversations, 2 conversations), deterministic (PED_HASH 3c87b0e441ed4c93 twice).
+
+**Performance after the resync (exact).** On the Vita, DownTown's tick went from 16-18 ms to 26-44 ms after this resync. Most of it came from upstream's grab-slot fix (every streamed-in prop is in the grab scene now; before it, ids of 2^24 and up were left out, 2 of DownTown's 786 props): the grab scene was rebuilt from every prop twice a tick, each spline's geometry allocated again and every record checked again (3-17 ms on the Vita).
+
+| Change | Files | Check |
+|---|---|---|
+| A body's grab-scene splines built once (`set_grab_splines`; the keys, scaled points and approach depend only on the grab slot, the axis scale and the splines) | skate-sim `physics/prop_dynamics.rs` (`grab_scene_splines`) | carry, skitch and car-knock tests unchanged |
+| `set_props` / `set_cars` replace their provider's objects in place and check only the new ones, with the same checks in the same order; a spline the registry already held under the same object id (the same `Arc` geometry, descriptor, `word_272` and assembly identities) only needs its frame and object vector finite | skate-sim `physics/offboard/grab_scene.rs` (`replace`, `check`) | as above |
+| The collision-type pass runs only when a type can have changed (the held prop, the bodies or their tuning: `collision_type_epoch`; a slot taken or an instance added: `collision_types_stale`); upstream walked every body every tick | skate-sim `physics.rs`, `prop_dynamics.rs`, `skate_world.rs` | DownTown ped, NPC, traffic, skitch and knock hashes unchanged |
+| The census asks `PropDynamics::is_moved` for the ids it scores instead of building the moved set over every body each pass | skate-sim `living_world.rs` | as above |
+
+Vita (DownTown, Low traffic and peds, NPC skaters, on foot and on board): grab scene 0.3-0.9 ms a tick (was 2.6-17), tick 19-24 ms (before the last two rows; they took 0.6 and 0.27 ms). The rest of the difference to before the resync is retail behaviour taken with it: ped body parts that turn in the solve (+1 ms), on-foot queries that see the props (+0.5-1 ms).
+
+Known upstream issue (`fad5aae`): with prop grab on (the game's mode), carrying newspaper box 2198011218 by its authored grab records sinks it below the floor, in upstream's engine too (`downtown_dragged_props_rest_on_the_floor` with `set_prop_grab_enabled(true)`); the test runs with the switch off, as upstream's.
+
+## DownTown performance (exact, 2026-10-20)
+
+Every change here keeps every simulated and drawn value: `living_world::perf_bench::downtown_perf_bench` (3000 ticks of DownTown as the Vita plays it: Fast physics, Low traffic and peds, NPC skaters, on foot and on the board; `--features stage-profile,oracle`) hashes every tick's skater dump and every drawn pose (skater, cars, NPC skaters, peds, hand props, props) and gives `1c5bcc5f282bfa7d` before and after each one; the ped, traffic, NPC, skitch and car-knock hashes are unchanged and parity is 20/20 and 20/20. Most of the cost was memory traffic the Vita's caches do not hide: loops over all 786 prop bodies (large records) for the ~50 streamed in, and allocations per query.
+
+| Change | Files |
+|---|---|
+| `PropDynamics::live`: the streamed-in bodies' indices (ascending), kept by `set_dormant`, `spawn_body`, `remove_body`; the step (stream-in, upright, push, awake list), the contact pass, the grab objects, the streamed poses, the nearest body and the obstacle boxes walk it instead of skipping dormant bodies one by one; `live_rail_bodies` the same for the rail queries | skate-sim `physics/prop_dynamics.rs` |
+| `dmo_placement_count` is a count kept at load (the census asked every tick and counted every body) | skate-sim `physics/prop_dynamics.rs` |
+| `think_peds`: the ped seats follow their props only when a prop's pose can have changed (`PropDynamics::pose_epoch`, bumped by every pose write: integration, teleport, placement, seating, tuning, bodies added or removed) or a prop is settling (the pass wrote back the same seats for every one of DownTown's 887 plugin props each tick); the streamed-out test per id (`is_dormant`) instead of a set of every dormant body | skate-sim `living_world/peds.rs`, `physics/prop_dynamics.rs` |
+| The grab scene's props are rebuilt only when their inputs changed (`PropDynamics::grab_signature`: each grabbable body's grab slot, frame, velocities, position and inertia as bits, and the splines' generation) | skate-sim `physics.rs`, `physics/prop_dynamics.rs` |
+| World queries: `QueryIndex::query_into` (the traversal stack an array, the result into a caller's list), the candidate meshes from a per-thread scratch list (`with_candidate_meshes`, a nested query gets its own) and `candidate_mesh_indices_extend` for the walker's ground queries; the same indices in the same order | skate-core `physics/board_world.rs`, `board_world/{broadphase,query_index}.rs`; skate-sim `physics/offboard/ground_query/world.rs` |
+| Solid contacts: the skater's volume shapes built on the stack (the same parry shapes `SharedShape` builds) and every shape's bounds once per call (`ShapeSphere`, `SolidBody::contact_near`; `contact` is `contact_near` over the bounds it computed) instead of per pair | skate-sim `dynamics.rs`, `physics/solid_contacts.rs` |
+
+Tools: the bench above (it writes its pads as a scenario with `BENCH_INPUT_OUT`, and prints the stage spans with `BENCH_SPANS=1` through sim-bench's subscriber); `scripts/vita-render-bench.py --park DownTown --features stage-profile` plays such a scenario on the Vita with the living world and the saved settings (`autoplay.rs`: districts start the living world; their dump is not kept) and prints the stage totals.
+
+## R2a: retail menus 2, data side (PR #52 `fad5aae`)
+
+| Part | What | Edits |
+|---|---|---|
+| skate-core `crossbar.rs`, `fe_blur.rs`, `fe_fade.rs`, `fe_input.rs`, `fe_popup.rs`, `fe_stack.rs`, `menu_values.rs`, `menus.rs`, `menus_tests.rs`, `video_calibration.rs` | the retail front end's pure parts: the menu registry and its value rules, the crossbar model, the screen stack, pad input, popups, fades, the pause blur's parameters, Video Calibration | the `madd` transform (`menu_values.rs`); `rumble.rs` (no rumble on the Vita), `trick_guide.rs` and `camera_track.rs` (the Trick Guide, a later step) not taken |
+| skate-data `menu_tables.rs` | the menu tables' records, their JSON form and `to_menu_data` | the data side only: `extract`, `json_from_xex` and the table locators are not copied (they unpack the executable with upstream's `xex` module, which holds the retail key; this repo holds no part of it); a data test reads the user's extracted tables |
+| `tools/menu-tables` (ours) | writes `menu-tables.json` from the user's own `default.xex` with the reference checkout's `skate_data::menu_tables::json_from_xex`, built from that checkout (its own workspace, a path dependency on `../skate-3-rust-engine`, the lock at `fad5aae`): upstream setup's `skate3rust --extract-menu-tables` | — |
+| vita-bake `ui.rs` | `ui.pak` carries the menu movie set (`private/menu-movies`, without the Challenge Map's world map images) and `private/menu-tables.json` | ours |
+
+User's disc: 47 pause items, 35 settings rows, 13 settings screens, 8 mode menus, 70 FE screens, 8 Trick Guide categories; the movie set is 35 movies (`ui.pak` 18.7 -> 31.6 MB).
+
+## R2b: retail menus 2, the front end on the Vita (PR #52 `fad5aae`)
+
+| Part | What | Edits |
+|---|---|---|
+| skate-ui `fe/` (`apt_display`, `apt_imports`, `apt_movie`, `apt_scene`, `apt_stage`, `apt_text`, `apt_vm`, `fe_language`, `crossbar_host`, `settings_host`, `popup_host`, `image_renderer_host`) | upstream skate-game's APT runtime and screen hosts, beside this crate's older runtime | `crate::X` -> `crate::fe::X`; no Bevy; mods (`PopupMods`) not taken; stand-ins for the Trick Guide, Challenge Map and prompt-glyph hosts. Memory (exact): one shared `SharedText` (language and fonts, no fonts JSON tree kept), `Font.glyphs` shared; a movie's characters, actions and display states shared by its clones (`Arc`, copy on write at the link / createTextField / setTextFormat writes), display states kept every 8 frames and the frames between replayed. Speed (exact, frame-by-frame draw hash unchanged): object field names interned (`Name`), `Vm::set` in place; clips in a vector by id (`Instances`); `seek` keeps the last frame's list per clip (`cursor`), updates the children map and placements in place, and a settled clip's frame without controls only writes its children's names again (`settled`, cleared by attachMovie / createTextField / removeMovieClip); the enterFrame pass walks the clips once (`born`); the unresolved-import set computed once; `create` reads the character without copying it; function bodies, functions and their constant pools shared, register banks reused. `fe::profile` (feature `fe-profile`): phase timers |
+| skate-ui `fe/menu_stage.rs`, `retail_menus.rs`, `retail_menu_movies.rs` | `retail_menu_stage.rs` `setup` / `update` / the draw list without Bevy: the pause menu, Game Settings, popups, Video Calibration | the Trick Guide and the Challenge Map not taken yet; `PAUSE_ROOTS` (the lean set: `read_lean`); FE sound names from `private/menu-sounds.json` (or the manifest's `frontend` field only); no keyboard, no env switches; a stage error stops the front end (the game drops it) |
+| skate-vita `fe_menus.rs`, `app.rs` | device test: loads after the other UI loaders, Triangle on the pause menu opens it (waits with a note while it loads); the world behind the pause menu is captured once and drawn as an image (`vita_render::read_rgba`, `Apt::draw_screen`) | ours |
+| vita-bake `ui.rs` | `private/menu-sounds.json` (the fe sound names) in `ui.pak` | ours |
+| `tools/prepare_menu_screens.py` | the reference's `prepare_menu_movies` with the Vita's extra roots (HUD meters, replay screens) | ours |
+
+DownTown on the Vita, new pause menu open: update 30 -> 4.1 ms, the pause screen 38-45 -> 58-60 fps; the front end's memory on the desktop 49 -> 17.6 MB.
+
+## R2c: the retail front end is the Vita's main and pause menu
+
+| Part | What | Edits |
+|---|---|---|
+| skate-core `crossbar.rs` | A on a sub-option row reports `SelectSubOption { tab, row, sub }` | ours (NOT RETAIL YET: retail's sub-option select cases, sub_8261BC30 by kind, are not decoded) |
+| skate-ui `fe/menu_stage.rs` | `boot_with` (the host edits the menu data, sub-option lists and settings screens before the registry), `Frame::sub_options`, `close`, `set_sub_options`, `closable` (a menu Back and Start do not close) | ours |
+| skate-vita `vita_menus.rs` (ours) | the Vita's layout of retail's free skate menu (`FreePlay`): Respawn, Parks / Districts / Training (sub-option lists: the column holds six rows), Main menu, Quit, Replay Editor (instant and saved replays), On Screen Help, Controls, Stick calibration, Game Settings; the career, online, Challenge Map, Trick Guide, music and extras items leave it. A `VitaMain` mode of the same crossbar is the main menu. Game Settings: retail's Difficulty and effects volume drive the Vita's; three screens for the Vita's own settings (controls, world, system); retail rows without a Vita equivalent stay greyed | ours |
+| skate-vita `app.rs`, `fe_menus.rs` | the front end opens on the main and pause screens (the plain menus without it); the loading screen at startup (pic0.png and a turning circle) until the world and every UI loader are ready, then straight into the game; the same screen while a world loads; the world behind the main menu is frozen too | ours; the M9 crossbar (`crossbar_ui.rs`, `handle_crossbar`, `crossbar_menus`) removed |
+
+## R2d: the Trick Guide (list) and the menus' button prompts
+
+| Part | What | Edits |
+|---|---|---|
+| skate-core `trick_guide.rs` | the Trick Guide screen's model: three-level list, picker callbacks, slots, stance remap | verbatim |
+| skate-data `trick_guide.rs` | the guide from the skater collections and the menu tables | `Interned` field data (`as_str`); ours: `to_json` / `from_json` (vita-bake writes `private/trick-guide.json` into ui.pak; the Vita does not load the collections a second time) |
+| skate-ui `fe/trick_guide_host.rs` | FETrickTutorial and the picker natives | `crate::fe`; the mods' layers (`TrickGuideMods`) not taken |
+| skate-ui `fe/menu_stage.rs` | upstream's Trick Guide flow (FE 14: open on black, fade-in count, Back up / close on black, queued screen states); `PAUSE_ROOTS` adds `tricks/trickguide`; button prompts are reported (`prompts`) instead of dropped | the 3D demo scene not yet (R2d step 2); the stance is the default (regular) |
+| skate-vita `fe_menus.rs`, `app.rs`, `vita_menus.rs` | Learn > Trick Guide in both menus; the prompts drawn as the Vita's controller glyphs (the replay screens' icons and plates) | ours |
+| vita-bake `ui.rs` | `private/trick-guide.json`; the M9 `core_menu` screen is no longer packed | ours |
+
+## R2d step 2: the Trick Guide's 3D demo
+
+| Part | What | Edits |
+|---|---|---|
+| skate-core `camera_track.rs`, skate-data `ice_camera.rs`, `scene_clip.rs` | the ViewScene camera tracks (`ice_000.bin`) and the one-clip scene banks (`trickguide/<name>1.abin`) | verbatim |
+| skate-vita `trick_demo.rs` | skate-game `trick_guide_scene.rs` without Bevy: the highlighted entry's clip after the 60 ms settle, the clip's bones as a simulation snapshot (the skater's binding skins it), the camera from the track fitted to the clip (`place`, dutch roll, lens) or the side view | the set stays at the origin and the skater is posed in its space (upstream parents the set to the player root: the same picture); the set's sky, sun and fog not drawn; a clip that fails is not read again while highlighted |
+| vita-render `scene.rs` | a demo slot (`load_demo`, `draw_demo`: the set and the skater only); the park's buffer setup shared (`park_gpu`, `delete_park`) | ours |
+| vita-bake `map.rs` (`trickguide`) | `trickguide.pak` and its `.idx`: the set as a map pack, the camera tracks, the 312 clips (29 MB, read from the card one at a time) | ours |
+| skate-vita `app.rs`, skate-ui `menu_stage.rs` | the demo replaces the frozen world while the guide is open (`trick_guide_demo`); the pack is mounted during the loading screen | ours |
+
+## R2e: the Challenge Map
+
+| Part | What | Edits |
+|---|---|---|
+| skate-core `challenge_map.rs` | the map screen's model (tree, tabs, back, picker, markers) | verbatim |
+| skate-data `challenge_map.rs` | the tree, pictures and markers from the collections | `Interned` field data; ours: `Baked` (`bake`: skate-game `retail_menus::challenge_map` with the teleports of `teleports.json`; `to_json` / `from_json`: vita-bake writes `private/challenge-map.json` into ui.pak) |
+| skate-ui `fe/challenge_map_host.rs` | the map screen's natives | `crate::fe` |
+| skate-ui `fe/menu_stage.rs` | upstream's FE 17 flow (open on the `progression` root, B / tab keys, close at the root, the marker quads, a picked location through the registry: `teleport:<key>` closes the menus and is reported); `register_teleports` (only the locations whose world the host has), `teleport` | `PAUSE_ROOTS` adds `map/challengemap` |
+| skate-sim `live.rs` | `Session::teleport` (`travel_to` a locator) | ours |
+| skate-vita `app.rs`, `lab.rs`, `fe_menus.rs`, `vita_menus.rs` | Single Player > Challenge Map in both menus; a location teleports here or loads its world first (the request waits for the load); named images (world maps, marker icons) upload on first draw and go when the menus close | ours |
+| vita-bake `ui.rs` | `private/challenge-map.json`; the world map images (14 MB) stay in ui.pak on the card | ours |
+
+## Resync to PR #52 head `b110bab`, step 1: simulation and living world (2026-10-21)
+
+The PR moved 36 commits after `fad5aae` (ped fixes, ped body A, skate.Park layouts, the Challenge Map's unlocks and skate.Park folder, Instant Replay, DLC). Method as before (`git merge-file` per copied file, ours / `fad5aae` / `b110bab`, the `madd` transform on both upstream sides): 40 files merged cleanly, 17 resolved by hand (upstream's Bevy systems kept out; their logic ported into our Bevy-free functions). The front-end runtime and Instant Replay are step 2.
+
+| Part | What | Edits |
+|---|---|---|
+| skate-core | living world: the stored contact reaction during a takedown attempt (b326), knockdown re-hits (b372), recovery intervals, obstacle snap-out, chase reachability (`reach_failed`, `apply_reach_report`), wander re-path to the same target, NPC flip latch, `controller_b` start snap radius; new `living_world/ai_push.rs` (used by upstream's simulated NPC tier only); wipeout side-on mid-trick factor (b448); grab-scene registry without the O(n²) id scan (b334) | `ai_push.rs` with `madd` |
+| skate-data | `challenge_map.rs` (the World field filter, `LocationUnlocks`, the skate.Park folder, leaves sorted by label text, b447-b458), `ped_anim.rs` (recovery intervals, ground restart times), `skate_map.rs` (declared-size check) | `bake` takes `LocationUnlocks` and sorts by the `label_key` / `name` of `teleports.json`; the DLC rows (`Collections::merge_dlc`) not taken |
+| skate-sim physics | ped body A in the prop step (`ped_prop_volumes`, `actor_push_mass`), the trajectory selector reset after placement (b310), `Proxies::clone_from` reusing buffers (b333), the wipeout reasons' ped force, Better Object Mover (generated grab splines; off) | `prop_dynamics.rs`: our grab-scene spline cache and epochs kept, rebuilt when Better Object Mover generates splines (no Vita setting for it yet, upstream's toggle is a PC overlay system) |
+| skate-sim park layouts | new `park_layout.rs`: a world row's skate.Park layout (`attach`, `layout_of`), its pieces' posed collision appended to the static world and their rails to the rail provider (`with_pieces`); `skate_world.rs` `posed_collision`, `prop_files`, the sidecar loaders by path | Bevy-free: no `ParkPiece` entities or draw inputs (`load_draws`); files through `skate_data::vfs`, a layout's package may be a `prop_package`; `posed_collision` returns the ranges only (our prop layer is built by `prop_layer_unbaked`); not with a collision window (streamed district). Nothing on the Vita attaches a layout yet and vita-bake does not bake `private/park-layouts`, so the parks stay empty for now |
+| skate-sim living world | `peds.rs` (the deferred reaction played in `advance_peds`, contacts during an attempt stored, knocked-down re-hits, a plugin / taunt clip interrupted by a hit (b371), walking out of a prop footprint, slides applied however short (b311 / b331), stuck peds re-path, the render ground probe at 1.6 m with a ceiling-limited retry (b359), seat carry (b219), conversation areas kept until emptied (b348), mood log limiter, intercept destination and the reach check every 10 updates); `ped_body.rs` (body A, b342) | ported into our functions; `ped_body.rs` body A from `peds.index`, sorted by id as upstream |
+
+| Not taken (and why) | Upstream files |
+|---|---|
+| Instant Replay and its recorder hooks (`replay::retire`, `keep_model`, `world_live`): step 2, compared first with our replay editor | `skate-core/src/replay_buffer*`, `replay_edit*`, `skate-game/src/replay/*`, `replay_menu_host.rs` |
+| DLC packs (rows, maps, unlock files) | `collections.rs` `merge_dlc`, `tools/asset_pipeline/dlc.py`, `stfs.py` |
+| Extras / cheats (the zombie cheat), offline profile, text entry and viewer, licenses screen | `cheats.rs`, `extras.rs`, `offline_profile.rs`, `text_entry.rs`, `text_viewer.rs`, `*_host.rs` |
+| The teleporter prompt (D-pad Up) | `teleporters.rs`, `controllers.rs` `dpad_up_pressed` |
+| The simulated NPC tier (not ported) and its logs | `npc_sim.rs`, `npc_skaters.rs` `log_backwards` |
+| Ped diagnostics (`PED_BLOCKED` blocker names, `PED_FLOATING`), the despawn distance log | `peds.rs` |
+
+Reference: built from `b110bab` (`reference.sh`; in the scratch copy the `#[link(name = "kernel32" / "user32" / "gdi32")]` attributes removed and the 16 Win32 functions the test binary then lacks defined as no-op stubs, `win32_stubs.rs`): its 20 Course dumps are bit-identical to `fad5aae`'s, so `oracle/ref` is unchanged; the port (mul_add) 20/20, no-fma 20/20 against its baseline. Tests: skate-core 1144 passed, skate-data passed, skate-sim 316 of 317 (`embedded_static_rwcm_hits_distinct_actor_query_ids`, as before). DownTown perf bench: `PERF_HASH 53abc53d9efa40c7` (was `1c5bcc5f282bfa7d`: the ped behaviour changed upstream), the same timings. Vita: DownTown peds checked by the user.
+
+## Resync to PR #52 head `b110bab`, step 2a: the world in instant replays, front-end runtime fixes (2026-10-22)
+
+| Part | What | Edits |
+|---|---|---|
+| skate-core `replay_buffer.rs` (+ tests) | the instant replay recording of every drawn actor: one key track per actor id, local joint rotations as i16 quaternions, a key only when the quantised pose changed, retail's 5400-frame window, a byte budget | verbatim |
+| skate-vita `world_replay.rs` | upstream `replay/world.rs` without Bevy: the sim thread records the skater, NPC skaters, peds, traffic cars (the wheel angle as the one joint's rotation), streamed-in props and released hand props after each tick (outside the shared lock); a replay draws them from the recording at its time, at full opacity and LOD 0 | ours: the byte budget is 24 MB (upstream 128 MB); bones arrive as model-space matrices, so each joint's local is its parent's (affine) inverse times its own; what the poses do not carry (models, tints, paint, mesh ranges) is each actor's latest; a held hand prop shows the latest one held (NOT RETAIL YET); a replay loaded from the card has no world |
+| skate-vita `session_replay.rs`, `app.rs`, `lab.rs`; skate-sim `live.rs` | P1 frames carry their session tick (`world_time`); `Session::bone_parents`; `PropPose::id` | ours |
+| skate-ui `fe/apt_movie.rs` | registerClass: the constructor runs after the clip's children are placed (b452: a child's construct value no longer overwrites what the parent's constructor set, e.g. a button's type) | verbatim logic; the menu draw hash (`pause_stage_draw_hash`) is now `4e61a07dab07242d` |
+| skate-ui `fe/apt_vm.rs` | `UPDATE_BUDGET` 2,000,000 instructions (was 100,000) | verbatim |
+
+Vita (DownTown, traffic, peds and AI skaters): the full 90 s window in 19.5 MB with 28-57 actors (a busier minute, 60 actors: ~0.3 MB/s, about 75 s in 24 MB); recording 0.8-1.4 ms a tick on the sim thread; playback checked by the user. Tests: skate-core `replay_buffer` 7, skate-vita 26 (`world_replay` locals compose back to the globals), skate-ui 38.
+
+**Step 2a, part 1 (2026-10-22).** Released hand props are recorded by their prop body id (`HandPropPose::id`; the DownTown perf hash, which prints the hand prop poses, is now `61cf3defaaa72803`, the simulation unchanged); the looks (models, tints, the held hand prop) are a history of changes, so a replay shows what a ped held at its time; the bones' inverses are affine. The replay cameras take retail's 40 m leash (`replay_camera::leash`, `82682CB0`, b381 / b449); retail's swept-sphere camera collision (`82682D80`) is not ported (a district streams its collision around the live skater, not the replay's). The living world needs no freeze for the replay (upstream's `world_live`): the simulation is paused while a replay is open. Vita DownTown (about 60 actors): recording 1.05-1.44 ms a tick, worst tick 1.9 ms, 18.8 MB for 60 s; checked by the user.
+
+## Resync to PR #52 head `b110bab`, step 2b: the retail replay screen on the menu stage (2026-10-22)
+
+| Part | What | Edits |
+|---|---|---|
+| skate-ui `fe/replay_menu_host.rs` | the instant replay screen's natives (FE 12 `replay2/replay_editor2`, `FEReplayMenu.*`) from a per-frame feed, the screen states posted on its edges (play / stop, panel, the editor modes b386, effects rows and values, in / out heads in 30 fps frames, the cursor), the length text, the help's page turns; the timeline strip (`CustomTimeline`: bands per camera, key quads, b403) | without the Create pack's screen (`replay_editor3`, channels, tints); ours from the P1 editor (device-tuned on the same movie): the over-marker states 1006 / 1007 / 1009, the zoom text and its refresh (11), the help pages per camera mode, a camera edit returning to the effects menu |
+| skate-ui `fe/menu_stage.rs`, `fe/apt_scene.rs`, `fe/crossbar_host.rs`, `fe/prompt_glyphs.rs`, `fe/apt_stage.rs` | FE 12 opened with the replay, shown after its IntroComplete, fed and closed with it; FE 13 (help) over it; the `CustomTimeline` placeholder and its expansion; `FEReplayMenu` natives; the replay prompt names (`_hud`, `_UpDown`, `_Arrows`) | `PAUSE_ROOTS` adds the two replay movies; `Stage::draw_levels` (ours): while the help is shown only its prompts go to the host (the Vita's glyphs are drawn over every movie) |
+| skate-vita `session_replay.rs` (`screen_feed`), `fe_menus.rs` (`replay`), `app.rs` | the replay's feed from P1's playback; the retail screen takes the replay when the set has it (P1's own screens otherwise); the help by page turns; P1's Finished popup stays for now | ours |
+
+The DownTown chase: upstream's intercept (b306) sets a destination every think, so a chasing ped plans a path every tick. `NavMesh::find_path` (skate-core `peds/nav.rs`) allocated and filled three arrays the size of the mesh per search (DownTown: 36,443 polygons); they are now kept per thread and stamped with the search number (an unstamped polygon reads as the fresh values): the same search and path (`downtown_path_bench`: `PATH_HASH` unchanged; a search within 25 m 22.4 → 8.1 µs on the desktop), the DownTown perf hash unchanged. Vita (DownTown, chases): peds 1.4-1.8 ms a tick; checked by the user. The replay runs at 36-38 fps (P1's screens: about 30).
+
+## Resync to PR #52 head `b110bab`, step 2c: the replay's Finished menu on the menu stage, menu fixes (2026-10-22)
+
+| Part | What | Edits |
+|---|---|---|
+| skate-ui `fe/menu_stage.rs` | the game's popups (`push_popup`, `remove_popups`, `popup_shown`, choices in `Frame::popup_choices`), as upstream's engine popup channel for the replay's Finished menu; while a popup is shown only its prompts go to the host; `track_pads` (the press tracking follows the pads without keys, so the press that raised a popup is not taken by it: upstream's fix of 2026-10-20 for the same instant close) | ours: the popup movie's B answers -1 (retail's cancel constant is 255), both read as a cancel |
+| skate-ui `fe/crossbar_host.rs` | the crossbar's sub-option column (a picker) asks `Game.OnMenuGetItemEnabled` per row and greyed every row nobody answered: no highlight in Parks, Districts, the Replay Editor list or On-screen help since R2c. The crossbar answers enabled while the column is open | NOT RETAIL YET: the crossbar's own handler is not decoded (every row enabled, as the popup host's) |
+| skate-vita `fe_menus.rs`, `app.rs` | the Finished menu (Upload Video, Save Replay, Exit; B closes) as the stage's popup with the pad; the retail replay screen closes in the frame the replay ends (it stayed drawn over the pause menu after a saved replay); the old Vita pause menu draws only when the retail menus are off or failed (it showed over the retail one during the hand-over and in the frozen world) | ours |
+
+Tests: `replay_tests` (the Finished popup: Down + A picks Save, B cancels, only its prompts; Exit then the pause menu opens again), `column_tests::a_columns_highlight_moves_with_down` (fails without the crossbar answer); the pause menu draw hash unchanged (`4e61a07dab07242d`). Checked on the Vita by the user.
+
+## Resync to PR #52 head `b110bab`, step 2d: the editor's speed and shake rules (2026-10-22)
+
+| Part | What | Edits |
+|---|---|---|
+| skate-vita `session_replay.rs` | retail's effects rules (upstream doc 37 "M2 step 8", research b398, b461-b472): the speed in percent, 10..100 in steps of 10 (P1 had 25 % to 400 %); Left / Right and A step live values loaded when the menu opens; B commits them into the clip under the playhead unless a clip marker is under it, and A leaving a camera edit commits too (`82507438`); the encoded length counts each clip's frames inside the In / Out points at its speed (`8250B590`) | ours (user decision 2026-10-22): with no marker yet the commit lands on the whole replay (retail loses a commit on a lane without keys, b465, medium-high confidence); P1's saved speeds 1..5 load as 30 / 50 / 100 % |
+| skate-ui `fe/crossbar_host.rs` | `Game.IsDemo` answers false: the effects menu highlights its advanced cameras only when it is false (`UpdateEffectsSelection`); upstream leaves it unanswered too | ours |
+
+Not taken: the look lanes (brightness, contrast, saturation, tint; upstream "M3"): they belong to the Create pack's editor (`replay_editor3`), not the base game's. Tests: `effects_land_on_commit_and_the_length_counts_slow_motion`, `the_full_game_is_not_the_demo`. Checked on the Vita by the user.
+
+## Resync to PR #52 head `b110bab`, step 2e: the replay cameras stay out of walls (2026-10-22)
+
+| Part | What | Edits |
+|---|---|---|
+| skate-vita `replay_camera.rs` | upstream `replay/camera_collision.rs` (research b449): `constrain` (the leash, a swept 0.13 m sphere from the last accepted position with a slide along the hit plane, a line of sight from the player; a cut pulls the camera in front of an occluder; a hidden player turns a non-Free camera back) and its tests | without Bevy; the sweep is a closure over the session's world |
+| skate-sim `live.rs`, `physics.rs`, `physics/world_handle.rs` | `Session::camera_world`: the static collision world's shared geometry with the gameplay camera's fat line (`CameraWorld::sweep`) | ours |
+| skate-vita `lab.rs`, `app.rs`, `session_replay.rs` | the paused sim thread lends the world to the replay (`Shared::camera_world`) and takes it back before any tick (a tick changes it in place, `Arc::get_mut`); the app constrains the shown camera each frame (the clip's, the edited one, the instant orbit; not the recorded camera of play, which collided when played); a seek, a new camera or a jump over 1 m is a cut | ours: the line of sight starts 1 m above the skater's root; in a district only the loaded window collides (user decision 2026-10-22: no streaming for the replay) |
+
+Vita: the replay at 38 fps as before; checked by the user.
+
+## Resync to PR #52 head `b110bab`, step 3: one APT runtime (2026-10-22)
+
+The M9 copy of the APT runtime (skate-ui `apt_attach`, `apt_display`, `apt_movie`, `apt_scene`, `apt_text`, `apt_vm`, `trick_names`) is gone; everything runs on `skate_ui::fe` (skate-game's `apt_*` with the Vita's optimizations).
+
+| Part | What | Edits |
+|---|---|---|
+| skate-ui `hud_runtime.rs` | the trick display's runtime: skate-game `hud_runtime.rs` at `b110bab` (on the same runtime as the front end; AS2 scale / rotation writes, `next_action`) | `crate::fe` paths |
+| skate-ui `menu_runtime.rs` (ours, M9) | the linked HUD screens (the manual meter, the trick analyzer) on `fe`: `registerClass` through the movie's linkage table and `classes`, `attachMovie` through `Movie::attach` with the new subtree's constructors inside the call (as `apt_stage`), the queue through `next_action` | ours |
+| skate-ui `fe/apt_display.rs` | the M9 linked screens' clip event fields (`key`, `offset`) read as `key_code`, `actions_offset` | serde aliases |
+| removed | P1's old replay screens (skate-ui `replay_editor`, `popup`; skate-vita `replay_ui`), the M9 crossbar (`crossbar`), sim-oracle `ui-crossbar` / `ui-popup` / `ui-replay` / `ui-replay-help`; vita-bake packs only the meters' linked screens; README step 4 links only them | — |
+
+Checks against the old runtime (sim-oracle built from the previous commit): `hud-trace` over the 20 scenarios gives the same text changes in the same order (only the VM's object ids differ by one); `ui-meter` and `ui-analyzer` render pixel-identical PNGs; the pause menu draw hash unchanged (`4e61a07dab07242d`). Vita: the HUD builds in 1.26 s as before; checked by the user.
+
+## Resync to PR #52 head `b110bab`, step 4a: the teleporter prompt (2026-10-22)
+
+Menu set v11 (`tools/prepare_menu_screens.py --reference` at `b110bab`: the action overlay, Extras, the Skate Profile, the terms screen) and the disc's teleporters.
+
+| Part | What | Edits |
+|---|---|---|
+| skate-vita `teleporters.rs` | skate-game `teleporters.rs` at `b110bab` (research b420 / b421 / b423): the loaded map's teleporters armed, the skater's query cylinder against each volume, D-pad Up asks `ID_PAUSEMENU_CONFIRM` (No / Yes) or lists the exits, Yes moves the skater (another map loads first) | the cylinder stands on the root with fixed head / hips heights (1.63 m / 0.98 m, NOT RETAIL YET while crouching or falling); skate.Park layout teleporters not armed (no layouts on the Vita) |
+| skate-ui `menu_stage.rs`, `crossbar_host.rs` | the action overlay (`hud2/actionoverlay2`, SignUpHUD) on the popup layer: state 2 (Teleport) with the title from `SignUpPoster.GetTeleportTitle` / `HUDComponents.SignUp_GetChallengeTitle`, state 0 when hidden | ours: prompts off the 1280×720 stage are not reported (the idle prompt sits at y = 864) |
+| vita-bake `ui.rs` | `private/teleporters.json` in ui.pak with every volume inline from `maps/<map>.triggers` | 12 of 16 resolve; the DownTown / Industrial skate park pairs have no volume in the install's triggers (same gap upstream), left out |
+| skate-ui `replay_menu_host.rs`, skate-vita `session_replay.rs` | fixes: the movie places In / Out from `GetPlayheadPosition` (its `GetCursorOffset` ignores its argument), so during MOVE_START / MOVE_END the playhead answers the head's fraction, and both are placed when the screen opens; the timeline band ends at the Out point; the LB drag cannot cross the heads (the Vita panicked on the playhead clamp) | ours |
+
+Vita: checked by the user (teleporters, the In / Out markers and band, no crash with the heads together).
+
+## Resync to PR #52 head `b110bab`, step 4b: Extras, cheat codes, the licenses viewer (2026-10-23)
+
+| Part | What | Edits |
+|---|---|---|
+| skate-core `cheats.rs`, `extras.rs`, `text_entry.rs`, `text_viewer.rs` | upstream at `b110bab` (doc 31, research b304 / b305 / b320 / b322) | verbatim |
+| skate-ui `fe/extras_host.rs` | skate-game `extras_host.rs`: the Extras natives and the text viewer's `tos` object | no Bevy messages (the stage's frame carries the cheats); no on-screen keyboard state |
+| skate-ui `fe/menu_stage.rs` | upstream `retail_menu_stage` Extras (FE 18), text entry (FE 46) and text viewer (FE 3): input, open / close, loaded and intro states, row actions, the cheat matcher | ours: FE 46 asks the game for text (`Frame::text_entry`, `MenuStage::text_entered`): the Vita's system keyboard, as retail opened the Xbox one (user 2026-10-23); the dialogs are standard popups (upstream's small popups show no option and take only B on a cancelable popup: they never closed); the Licenses row is enabled (upstream greys it as WIP) and a line break is its own word (the movie ends a line only on a "\n" word) |
+| skate-ui `fe/apt_vm.rs` | ours: `eval("a.b")` resolves the first name on the current target (the clip whose frame actions run) when the scope chain has none, then the members (nucleus_tos finds its line fields so; upstream's VM leaves them undefined) | NOT RETAIL (mechanism) |
+| tools `gen_licenses.py`, skate-ui `fe/licenses.txt` | upstream's generator for skate-vita on the Vita target, plus the linked C libraries | ours |
+| vita-platform `ime.rs`, vita-render `swap(dialog)` | ours: the IME common dialog, drawn by vitaGL's swap while it runs | ours |
+| skate-vita `settings.rs`, skate-sim `living_world.rs` | the zombie cheat (the sim's existing zombie path): session-only flag, peds on whatever the setting, `ped_pool` 8 instead of retail's 31 (user's choice: a Vita cap; the sim is at its budget with them) | NOT RETAIL: the cap; the yellow colour matrix (`colour_matrix_zombiemode`) is not drawn yet |
+
+Checks: Extras test on menu set v11 (cheat on / off, the warning, Licenses lines); pause draw hash `d6aff5817a2f6680` (was `516c36b60e3d81e2`: only the Extras item now enabled). Vita: checked by the user (zombie code, Licenses, HUD and pause menu unchanged).
+
+## Resync to PR #52 head `b110bab`, step 4c: the zombie colour grade (2026-10-23)
+
+| Part | What | Edits |
+|---|---|---|
+| skate-vita `colour_grade.rs` | skate-game `colour_matrix.rs` at `b110bab` (research b100): the stock `post_fx` record `colour_matrix_zombiemode` from the collections in sim.pak, built with `skate_core::colour_matrix::build` | loaded the first time the cheat is on |
+| vita-render `scene.rs` `Grade`, the world shaders | ours: retail applies the grade in its tone pass (b101: near / far rows weighted linearly in view depth between the record's distances); here every world shader applies it last (opaque draws the same; alpha blends of an affine map commute), the weight per vertex from `gl_Position.w`, the sky's clear colour through the far band on the CPU; the HUD and menus stay ungraded | user's choice 2026-10-23 (world shaders, not a post pass) |
+
+Vita: checked by the user (the zombie look on and off, the picture and frame rate unchanged without it).
+
+## Resync to PR #52 head `b110bab`, step 4d: the Skate Profile, the retail pause rows (2026-10-23)
+
+| Part | What | Edits |
+|---|---|---|
+| skate-core `offline_profile.rs` | upstream at `b110bab` (doc 31, research b308) | verbatim |
+| skate-ui `fe/offline_profile_host.rs` | skate-game `offline_profile_host.rs`: the Progression and Stats objects | upstream's `ProfileMods` layers not taken (no mods): the pages stay empty until a career system fills them |
+| skate-ui `fe/menu_stage.rs` | upstream `retail_menu_stage` FE 61: input (tab keys, scroll left to the movie, Back), open / close, loaded / intro, the queued states | the movie in `PAUSE_ROOTS` |
+| skate-vita `vita_menus.rs` | ours (user 2026-10-23): the pause SinglePlayer tab lists retail's rows (Challenge Map, Resume Career, Free Play, Call Skater greyed, Skate Profile); Respawn, Parks, Districts, Training and Main menu leave the pause menu (the Challenge Map reaches every world, the session marker stands in for Respawn; the start-up menu keeps its lists); Quit ends Options | ours |
+
+Checks: Skate Profile test on menu set v11 (opens on tab 0, the tab key steps, Back closes); pause draw hash `67632849c692e697`. Vita: checked by the user.

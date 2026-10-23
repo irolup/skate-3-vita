@@ -82,13 +82,22 @@ INSTALL=../game_data/prepared/$(python3 -c "import json; print(json.load(open('.
 echo $INSTALL
 ```
 
-### Step 4 : rebuild the game's menu screens
-
-The Vita version uses six of the original menu screens: the main and pause menus, the manual meter, the trick analyzer, the replay editor and its help, and the popups. This rebuilds them from your disc. Copy the whole block at once:
+The retail menus also need the menu tables, which are read from your disc's `default.xex`. This builds a small tool from the reference project of step 1 and runs it (the first time, Rust downloads what it needs, which takes a minute):
 
 ```sh
+cargo run --release --manifest-path tools/menu-tables/Cargo.toml -- ../game_data/skate3_x360/default.xex $INSTALL/assets/private/menu-tables.json
+```
+
+It should end with a line like `menu-tables.json: 47 pause items, 35 settings rows, 8 modes`.
+
+### Step 4 : rebuild the game's menu screens
+
+The main and pause menus, Game Settings, the replay editor and their popups are the game's own front-end movies. The first line exports them from your disc with the reference project's exporter. The loop then rebuilds two more screens: the manual meter and the trick analyzer. Copy the whole block at once:
+
+```sh
+python3 tools/prepare_menu_screens.py --game ../game_data/skate3_x360 --assets $INSTALL/assets --work ../game_data/menu-movies-work
 C=$INSTALL/assets/private/stock/skater-collections.json
-for s in main/core_menu hud2/manualmeter hud2/trickanalyser replay2/replay_editor2 replay2/replay_help popup/sk8popup; do
+for s in hud2/manualmeter hud2/trickanalyser; do
     python3 tools/prepare_ui_screen.py --game ../game_data/skate3_x360 --collections $C --output ../game_data/ui-screens --bundle data/fe/source/screens/$s
     python3 tools/link_ui_screen.py --game ../game_data/skate3_x360 --collections $C --output ../game_data/ui-screens --screen ${s##*/}
 done
@@ -111,6 +120,7 @@ $B props    $INSTALL $OUT
 $B living   $INSTALL $OUT
 $B audio    $INSTALL/assets/private/audio $OUT
 $B ambience $INSTALL/assets/private/audio $OUT
+$B trickguide $INSTALL $OUT
 ```
 
 | Line | What it makes |
@@ -124,6 +134,7 @@ $B ambience $INSTALL/assets/private/audio $OUT
 | `living` | traffic, pedestrians and AI skaters |
 | `audio` | the board's own sounds |
 | `ambience` | the ambient city sounds |
+| `trickguide` | the Trick Guide's 3D demo: its set and the skater's trick animations |
 
 When it's done, `../game_data/SKATEVITA` holds about 1 GB of `.pak` files (and matching `.idx` files). That's your complete game data.
 

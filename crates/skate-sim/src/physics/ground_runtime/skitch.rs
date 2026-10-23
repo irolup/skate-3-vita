@@ -143,6 +143,10 @@ pub(crate) fn query(state: &mut PhysicsGroundState, owner: &mut Owner, p: &Proce
             state.word_2564 = id;
         }
         let after = state.flag_2729.then_some((state.word_2560, state.word_2564));
+        if after != before && crate::physics::grab_view::logging() {
+            // With the grab visualizer on: why each car spot in range did or did not latch.
+            log_candidates(owner.validated(), frame, position, velocity, deck, bounds, p, s);
+        }
         if after != before {
             // SKITCH_LATCH: a grabbable spline (kind 1 = traffic car) comes into or leaves latch range.
             tracing::info!(
@@ -155,7 +159,12 @@ pub(crate) fn query(state: &mut PhysicsGroundState, owner: &mut Owner, p: &Proce
             );
         }
     }
-    owner.query(Query {
+    owner.query(query_of(p, position, bounds, limits, s));
+}
+
+/// The mode-255 query `82D39BB8` submits.
+fn query_of(p: &ProcessedPhysicsInput, position: [f32; 4], bounds: Bounds, limits: BoardLimits, s: &SkitchQuerySettings) -> Query {
+    Query {
         position,
         sort_position: position,
         bounds,
@@ -163,7 +172,44 @@ pub(crate) fn query(state: &mut PhysicsGroundState, owner: &mut Owner, p: &Proce
         mode: 255,
         capacity: s.capacity,
         context: QueryContext { selection_flags_2948: p.actor_query_2948, matching_id_2952: p.actor_query_2952 as i32 },
-    });
+    }
+}
+
+/// The skitch query and latch without the grab input or the validation lines, for the grab visualizer
+/// (`grab_view`): the car spots in range and the one the latch would take. Reads only.
+pub(crate) fn preview(
+    scene: &crate::physics::offboard::grab_scene::Scene<'_>,
+    p: &ProcessedPhysicsInput,
+    deck: [f32; 4],
+    s: &SkitchQuerySettings,
+) -> Result<(Vec<Record>, Option<(u32, u32)>), String> {
+    let frame = p.effective_anim_transform_192.map(|v| v.map(f32::from_bits));
+    let position = p.vectors_544_560_592_608[2].map(f32::from_bits);
+    let velocity = p.vectors_400_416[0].map(f32::from_bits);
+    let (bounds, limits) = query_shape(frame, s);
+    let records = scene.query(&query_of(p, position, bounds, limits, s))?;
+    let latch = latch(&records, frame, position, velocity, deck, bounds, latch_limits(s), p, s).latch;
+    Ok((records, latch))
+}
+
+/// `SKITCH_CANDIDATE` per car spot in range (grab visualizer on): passes CanGrabSpline with the latch limits, and the
+/// time to the spline against the latch time.
+#[allow(clippy::too_many_arguments)]
+fn log_candidates(records: &[Record], frame: [[f32; 4]; 4], position: [f32; 4], velocity: [f32; 4], deck: [f32; 4], bounds: Bounds, p: &ProcessedPhysicsInput, s: &SkitchQuerySettings) {
+    for record in records {
+        let d = record.descriptor();
+        let alone = latch(std::slice::from_ref(record), frame, position, velocity, deck, bounds, latch_limits(s), p, s);
+        let qualified = qualify(record, position, bounds, latch_limits(s));
+        tracing::info!(
+            "SKITCH_CANDIDATE kind={} id={:#x} can_grab={} time={:?} latch_time={:.2} latch={}",
+            d.kind,
+            d.id,
+            qualified,
+            alone.time,
+            s.latch_time,
+            alone.latch.is_some()
+        );
+    }
 }
 
 #[cfg(test)]

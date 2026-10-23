@@ -219,3 +219,28 @@ fn a_profile_without_slot_tricks_skips_grabs() {
     assert_eq!(off(NOSEMANUAL), TrickChoice::Start(NOSEMANUAL));
     assert_eq!(choose(&air_line(BSGRAB, 60), 1, 10, &ctx(&p, 1)), TrickChoice::Start(BSGRAB));
 }
+
+/// A dropped slot (choice -1) starts no trick: the record still says so, but the cursor enters no trick phase, so the
+/// puppet shows no trick pose for it (research b187; before, the span opened and the puppet fell back to a grind pose).
+#[test]
+fn a_dropped_slot_opens_no_trick_span() {
+    use crate::living_world::replay::ReplayPhase;
+    let p = profile();
+    let l = air_line(BSGRAB, 60);
+    let ls: BTreeMap<[u8; 16], ReplayLine> = [(l.id, l.clone())].into();
+    let tricks = TrickContext { slot_tricks: false, ..ctx(&p, 1) };
+    let b = BranchContext { position: [0.0; 3], forward: [0.0, 0.0, 1.0], speed: 5.0, players: &[], others: &[], in_use: &[], preferred_skill: -1, online: false, chain: ChainConfig { radius: 0.0, ..ChainConfig::retail() }, tricks };
+    let mut c = LineCursor::new(l.id, 0);
+    let mut records = Vec::new();
+    let mut phases = Vec::new();
+    for _ in 0..200 {
+        let mut ev = Vec::new();
+        c.step(&ls, &mut Decider::Decide(b), &mut ev);
+        records.extend(ev.into_iter().filter_map(|e| if let CursorEvent::Trick(r) = e { Some(r) } else { None }));
+        assert_eq!(c.current_trick(), -1);
+        phases.extend(c.phase_history().map(|(e, _)| e.phase));
+    }
+    assert_eq!(records.iter().map(|r| (r.recorded, r.chosen)).collect::<Vec<_>>(), [(BSGRAB, -1)]);
+    assert!(phases.contains(&ReplayPhase::Air), "{phases:?}");
+    assert!(!phases.iter().any(|ph| matches!(ph, ReplayPhase::AirTrick | ReplayPhase::GroundTrick)), "{phases:?}");
+}

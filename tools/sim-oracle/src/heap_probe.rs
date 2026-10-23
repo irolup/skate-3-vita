@@ -266,7 +266,7 @@ pub fn run_ui(packs: &Path) -> Result<bool, String> {
         sketchy: false,
         stance: [false; 4],
         trick_name: String::new(),
-        trick_metrics: std::array::from_fn(|_| skate_ui::apt_vm::Value::Bool(false)),
+        trick_metrics: std::array::from_fn(|_| skate_ui::fe::apt_vm::Value::Bool(false)),
         context_tricks: Vec::new(),
     };
     let runtime = skate_ui::hud_runtime::Runtime::load(&hud, input)?;
@@ -274,17 +274,9 @@ pub fn run_ui(packs: &Path) -> Result<bool, String> {
     let shapes: serde_json::Value = hud["shapes"].clone();
     let t = step("HUD shapes (as JSON; the Vita keeps them as Shapes)", t);
     drop(shapes);
-    let menu: serde_json::Value = serde_json::from_slice(file("private/ui/core_menu.linked.json")?).map_err(|e| e.to_string())?;
-    let t = step("menu core_menu.linked.json parsed (dropped after the build)", t);
-    let crossbar = skate_ui::crossbar::Crossbar::load(&menu, Vec::new())?;
-    let t = step("menu crossbar built", t);
-    drop(menu);
-    let t = step("menu JSON dropped", t);
     drop(runtime);
     let t = step("HUD runtime dropped", t);
     drop(hud);
-    let t = step("HUD JSON dropped", t);
-    drop(crossbar);
-    step("crossbar dropped", t);
+    step("HUD JSON dropped", t);
     Ok(true)
 }

@@ -12,4 +12,4 @@ publish.workspace = true
 skate-core = { path = "../skate-core" }
 
 [target.'cfg(target_os = "vita")'.dependencies]
-vitasdk-sys = { version = "0.3.3", features = ["SceCtrl_stub", "SceTouch_stub", "ScePower_stub", "SceLibKernel_stub", "SceKernelThreadMgr_stub", "SceProcessmgr_stub", "SceAudio_stub"] }
+vitasdk-sys = { version = "0.3.3", features = ["SceCtrl_stub", "SceTouch_stub", "ScePower_stub", "SceLibKernel_stub", "SceKernelThreadMgr_stub", "SceProcessmgr_stub", "SceAudio_stub", "SceCommonDialog_stub"] }

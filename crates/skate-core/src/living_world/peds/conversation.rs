@@ -6,6 +6,11 @@
 //!   with up to 3 member slots (participant, in-position bit) and a state (`D+1172`);
 //! - gathering (vf4) while it has room and the state is 0 or 1; a ped may join (vf8) when its
 //!   entity type fills a free slot of the chosen row, or of any candidate row before one is chosen;
+//! - passers-by join through the ordinary offer scan (`826C0058` -> `826BFE18`, b212): the area is an offer
+//!   whose transfer expression is `ConversationIsGatheringMembers` (vf4) and `EntityAllowedToJoinConversation`
+//!   (vf8) and not `IsChasing`; the founders go through the same test (`826A6CD8` ignores its result);
+//! - add (`82E1D380` via `82E1DB50` / `82E1DC70`) turns a ped away unless it is gathering and the ped fits; each
+//!   join narrows the candidate rows to the ones every member fits;
 //! - 3 waypoints (`82E1D620`) on a 1.5 m circle 120 deg apart from a random start in [0, pi);
 //!   a ped locks the nearest free one (vfunc 144 `82E1CBC0`);
 //! - when every member signalled "in position" (vf44) it starts (`82E1EBC0`): fewer than 2
@@ -31,7 +36,8 @@ pub const SPEAKER_SPEECH_BASE: i32 = 33;
 /// Every listener's speech value (`82E3DAD8`); no audio event uses it.
 pub const LISTENER_SPEECH: i32 = 41;
 
-/// Member slots (`D+1040`, 3 inline).
+/// Member slots (`D+1040`, 3 inline) and the participants of a row that count (index < 3, `82E1DC70`). The
+/// member cap itself is the descriptor's `maxNumberOfParticipants` (`ConversationParams::max_members`).
 pub const MAX_MEMBERS: usize = 3;
 /// The state at which a conversation is complete (vf36).
 pub const COMPLETE: u8 = 7;
@@ -60,11 +66,13 @@ pub struct ConversationParams {
     pub max_distance: f32,
     /// The centre is dropped onto the world with a ray this far above and below it, m (`82E166C0`, `0x822F8B84`).
     pub drop_height: f32,
+    /// Most members (descriptor `maxNumberOfParticipants`, 3; vf4).
+    pub max_members: usize,
 }
 
 impl Default for ConversationParams {
     fn default() -> Self {
-        Self { radius: 1.5, waypoints: 3, exclusion: 50.0, ahead: 3.0, turn_seconds: 3.0, gather_seconds: 30.0, jitter: 0.8, locate_tolerance: 0.5, max_area_cost: 1.0, max_distance: 3.0, drop_height: 3.0 }
+        Self { radius: 1.5, waypoints: 3, exclusion: 50.0, ahead: 3.0, turn_seconds: 3.0, gather_seconds: 30.0, jitter: 0.8, locate_tolerance: 0.5, max_area_cost: 1.0, max_distance: 3.0, drop_height: 3.0, max_members: MAX_MEMBERS }
     }
 }
 
@@ -77,10 +85,11 @@ pub struct ConversationRow {
     pub values: Vec<i32>,
 }
 
-/// A member slot.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// A member slot and the member's entity type (its key in the rows).
+#[derive(Clone, Debug, PartialEq)]
 pub struct Member {
     pub ped: u64,
+    pub entity: String,
     pub in_position: bool,
 }
 
@@ -104,6 +113,7 @@ pub struct Conversation {
     /// The gather timer (`D+1136`), s, and its start value.
     pub gather_timer: f32,
     pub gather_seconds: f32,
+    pub max_members: usize,
 }
 
 /// What a speaker says this turn (`82E3DAD8`): the speech value (line id + 33), the variant
@@ -170,36 +180,34 @@ impl Conversation {
             }
         }
         let center = center.unwrap_or_default();
-        Self { id, center, waypoints, members: Vec::new(), candidates, row: None, value: None, state: 0, speaker: 0, line: None, variant: 0, gather_timer: 0.0, gather_seconds: params.gather_seconds }
+        Self { id, center, waypoints, members: Vec::new(), candidates, row: None, value: None, state: 0, speaker: 0, line: None, variant: 0, gather_timer: 0.0, gather_seconds: params.gather_seconds, max_members: params.max_members }
     }
 
     /// vf4.
     pub fn is_gathering(&self) -> bool {
-        self.members.len() < MAX_MEMBERS && self.state <= 1
+        self.members.len() < self.max_members && self.state <= 1
     }
 
     /// vf8: `entity` fills a free slot of the chosen row, or of a candidate row before one is chosen.
-    pub fn allowed_to_join(&self, entity: &str, member_types: &[String], rows: &[ConversationRow]) -> bool {
-        let fits = |r: &ConversationRow| {
-            let mut free = r.participants.clone();
-            for t in member_types {
-                if let Some(i) = free.iter().position(|p| p == t) {
-                    free.remove(i);
-                }
-            }
-            free.iter().any(|p| p == entity)
-        };
+    pub fn allowed_to_join(&self, entity: &str, rows: &[ConversationRow]) -> bool {
         match self.row {
-            Some(r) => rows.get(r).is_some_and(fits),
-            None => self.candidates.iter().filter_map(|&r| rows.get(r)).any(fits),
+            Some(r) => rows.get(r).is_some_and(|r| fits(&self.members, r, entity)),
+            None => self.candidates.iter().filter_map(|&r| rows.get(r)).any(|r| fits(&self.members, r, entity)),
         }
     }
 
-    pub fn join(&mut self, ped: u64) -> bool {
-        if !self.is_gathering() || self.members.iter().any(|m| m.ped == ped) {
+    /// `82E1D380`: turned away unless gathering and `entity` fills a free slot (`82E1DB50`); before a row is chosen the
+    /// candidates narrow to the rows it fits (`82E1DC70`: each row's first untaken participant equal to its key is
+    /// marked, unmatched rows are dropped). The first join starts gathering.
+    pub fn join(&mut self, ped: u64, entity: &str, rows: &[ConversationRow]) -> bool {
+        if !self.is_gathering() || self.members.iter().any(|m| m.ped == ped) || !self.allowed_to_join(entity, rows) {
             return false;
         }
-        self.members.push(Member { ped, in_position: false });
+        if self.row.is_none() {
+            let members = &self.members;
+            self.candidates.retain(|&r| rows.get(r).is_some_and(|r| fits(members, r, entity)));
+        }
+        self.members.push(Member { ped, entity: entity.to_string(), in_position: false });
         if self.state == 0 {
             self.state = 1;
             self.gather_timer = self.gather_seconds;
@@ -348,6 +356,17 @@ impl Conversation {
     }
 }
 
+/// `row` has a participant slot (index < 3) of type `entity` left after the members take theirs.
+fn fits(members: &[Member], row: &ConversationRow, entity: &str) -> bool {
+    let mut free: Vec<&str> = row.participants.iter().take(MAX_MEMBERS).map(String::as_str).collect();
+    for m in members {
+        if let Some(i) = free.iter().position(|p| *p == m.entity) {
+            free.remove(i);
+        }
+    }
+    free.contains(&entity)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -360,9 +379,11 @@ mod tests {
         let mut c = Conversation::new(1, Some([0.0; 3]), vec![0], &ConversationParams::default(), None, &mut rand);
         assert_eq!(c.waypoints.len(), 3);
         assert!((c.waypoints[0].0[2] - 1.5).abs() < 1e-5, "start angle 0 -> +z");
-        assert!(c.allowed_to_join("teen_male", &["adult_male".into()], &rows));
-        assert!(!c.allowed_to_join("adult_male", &["adult_male".into()], &rows), "no free adult_male slot");
-        assert!(c.join(10) && c.join(11));
+        assert!(c.join(10, "adult_male", &rows));
+        assert!(c.allowed_to_join("teen_male", &rows));
+        assert!(!c.allowed_to_join("adult_male", &rows), "no free adult_male slot");
+        assert!(!c.join(12, "adult_male", &rows), "turned away");
+        assert!(c.join(11, "teen_male", &rows));
         let a = c.lock_closest_waypoint(10, [0.0, 0.0, 5.0]).unwrap();
         assert_eq!(a, c.waypoints[0].0);
         assert_ne!(c.lock_closest_waypoint(11, [0.0, 0.0, 5.0]).unwrap(), a, "a locked waypoint is skipped");
@@ -392,8 +413,7 @@ mod tests {
         let mut seq = [0.0f32, 0.0, 0.0, 0.9, 0.9].into_iter().chain(std::iter::repeat(0.0));
         let mut rand = || seq.next().unwrap();
         let mut c = Conversation::new(1, Some([0.0; 3]), vec![0], &ConversationParams::default(), None, &mut rand);
-        c.join(1);
-        c.join(2);
+        assert!(c.join(1, "a", &rows) && c.join(2, "b", &rows));
         c.signal_in_position(1, &rows, &mut rand);
         c.signal_in_position(2, &rows, &mut rand);
         let t = c.turn_speech().unwrap();
@@ -406,8 +426,7 @@ mod tests {
         let rows = vec![ConversationRow { name: "r".into(), participants: vec!["a".into(), "b".into()], values: vec![] }];
         let mut rand = || 0.0f32;
         let mut c = Conversation::new(1, Some([0.0; 3]), vec![0], &ConversationParams::default(), None, &mut rand);
-        c.join(1);
-        c.join(2);
+        assert!(c.join(1, "a", &rows) && c.join(2, "b", &rows));
         assert_eq!((c.state, c.gather_timer), (1, 30.0));
         assert!(!c.tick(29.9, &rows, &mut rand));
         assert!(c.tick(0.2, &rows, &mut rand), "nobody signalled in position: starts at 0");
@@ -419,8 +438,7 @@ mod tests {
         let rows = vec![ConversationRow { name: "r".into(), participants: vec!["a".into(), "b".into()], values: vec![1] }];
         let mut rand = || 0.0f32;
         let mut c = Conversation::new(1, Some([0.0; 3]), vec![0], &ConversationParams::default(), None, &mut rand);
-        c.join(1);
-        c.join(2);
+        assert!(c.join(1, "a", &rows) && c.join(2, "b", &rows));
         c.signal_in_position(1, &rows, &mut rand);
         c.signal_in_position(2, &rows, &mut rand);
         assert_eq!(c.leave(9), Left::NotMember);
@@ -430,11 +448,51 @@ mod tests {
     }
 
     #[test]
+    fn a_third_member_joins_while_gathering_and_narrows_the_rows() {
+        // `82E1DC70`: two `a` members leave only the row with two `a` slots; a third `a` finds no slot.
+        let rows = vec![
+            ConversationRow { name: "ab".into(), participants: vec!["a".into(), "b".into()], values: vec![1] },
+            ConversationRow { name: "aab".into(), participants: vec!["a".into(), "a".into(), "b".into()], values: vec![2] },
+        ];
+        let mut rand = || 0.0f32;
+        let mut c = Conversation::new(1, Some([0.0; 3]), vec![0, 1], &ConversationParams::default(), None, &mut rand);
+        assert!(c.join(1, "a", &rows) && c.join(2, "a", &rows));
+        assert_eq!(c.candidates, vec![1], "only aab fits two a's");
+        assert!(!c.join(3, "a", &rows), "no third a slot");
+        assert!(c.join(3, "b", &rows));
+        assert!(!c.is_gathering() && !c.join(4, "b", &rows), "3 members: full");
+        let mut taken = Vec::new();
+        for p in [1, 2, 3] {
+            taken.push(c.lock_closest_waypoint(p, [0.0; 3]).unwrap());
+        }
+        assert!(taken[0] != taken[1] && taken[1] != taken[2] && taken[0] != taken[2], "the third takes the last waypoint");
+        c.signal_in_position(1, &rows, &mut rand);
+        c.signal_in_position(2, &rows, &mut rand);
+        assert_eq!(c.state, 1, "waits for the third");
+        c.signal_in_position(3, &rows, &mut rand);
+        assert_eq!((c.state, c.row, c.value), (2, Some(1), Some(2)));
+    }
+
+    #[test]
+    fn nobody_joins_after_the_start() {
+        let rows = vec![ConversationRow { name: "aba".into(), participants: vec!["a".into(), "b".into(), "a".into()], values: vec![] }];
+        let mut rand = || 0.0f32;
+        let mut c = Conversation::new(1, Some([0.0; 3]), vec![0], &ConversationParams::default(), None, &mut rand);
+        assert!(c.join(1, "a", &rows) && c.join(2, "b", &rows));
+        c.signal_in_position(1, &rows, &mut rand);
+        c.signal_in_position(2, &rows, &mut rand);
+        assert_eq!(c.state, 2);
+        assert!(c.allowed_to_join("a", &rows), "the row still has an a slot");
+        assert!(!c.join(3, "a", &rows), "vf4: no longer gathering");
+    }
+
+    #[test]
     fn a_lone_member_ends_the_conversation() {
+        let rows = vec![ConversationRow { name: "r".into(), participants: vec!["a".into(), "b".into()], values: vec![] }];
         let mut rand = || 0.5f32;
-        let mut c = Conversation::new(1, Some([0.0; 3]), vec![], &ConversationParams::default(), None, &mut rand);
-        c.join(10);
-        c.signal_in_position(10, &[], &mut rand);
+        let mut c = Conversation::new(1, Some([0.0; 3]), vec![0], &ConversationParams::default(), None, &mut rand);
+        assert!(c.join(10, "a", &rows));
+        c.signal_in_position(10, &rows, &mut rand);
         assert!(c.is_complete());
     }
 

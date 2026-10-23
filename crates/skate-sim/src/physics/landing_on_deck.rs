@@ -120,7 +120,7 @@ pub(crate) fn advance(physics: &mut GamePhysics, skater: &mut SkaterRuntime) -> 
         .ok_or("Landing update requires the completed board toolkit")?;
     let board = toolkit.deck;
     let forward = toolkit.effective[2];
-    let scene = super::offboard::contact_toolkit::StaticScene::new(&physics.world)
+    let scene = super::offboard::contact_toolkit::StaticScene::new(physics.biped_world())
         .map_err(str::to_owned)?;
     let output = skater.landing_deck.update(&scene, &skater.player_input)?;
     skater.landing_on_deck.state.align(

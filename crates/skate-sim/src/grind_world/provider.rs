@@ -144,6 +144,35 @@ impl StaticProvider {
         Ok(Self { #[cfg(test)] source_for_primitive: vec![0; primitives.len()], primitives, metadata, #[cfg(test)] rail_guids, assets, #[cfg(test)] source_rail_indices })
     }
 
+    /// The placed skate.Park pieces' rails (crate::park_layout::pose_rails), one asset per piece after the map's
+    /// own. Retail queries them through the static piece manager, its second pluggable provider after the DMO one
+    /// (b431: 82858290 -> 82868860 -> 82C1F098, piece AABB first, then each segment's posed bounds); here they join
+    /// the static pass, so under the 40-record cap they come before the props (NOT RETAIL order; parks have few props).
+    pub fn with_pieces(mut self, pieces: &[crate::park_layout::PieceRails]) -> Result<Self, String> {
+        for piece in pieces.iter().filter(|p| !p.segments.is_empty()) {
+            let first = self.primitives.len();
+            let bounds: Vec<Bounds> = piece.segments.iter().map(|(_, _, [min, max])| Bounds { min: *min, max: *max }).collect();
+            for (primitive, metadata, _) in &piece.segments {
+                self.primitives.push(*primitive);
+                self.metadata.push(*metadata);
+                #[cfg(test)]
+                {
+                    self.source_for_primitive.push(self.assets.len());
+                    self.source_rail_indices.push(primitive.owner & 0xFFFF);
+                }
+            }
+            let whole = bounds.iter().copied().reduce(Bounds::union).ok_or("Empty park piece rails")?.padded();
+            self.assets.push(Asset {
+                #[cfg(test)]
+                source: SourceIdentity { stream_file: String::new(), asset_id: format!("park piece {}", piece.piece), section_index: 0, section_offset: 0 },
+                bounds: whole,
+                indices: (first..self.primitives.len()).collect(),
+                tree: Octree::new(whole, bounds)?,
+            });
+        }
+        Ok(self)
+    }
+
     pub fn primitives(&self) -> &[Primitive] { &self.primitives }
 
     pub fn metadata(&self, primitive: usize) -> Option<&spline::PrimitiveMetadata> {

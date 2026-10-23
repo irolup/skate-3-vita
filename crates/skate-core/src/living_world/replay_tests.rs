@@ -828,7 +828,8 @@ fn drawn_skater_faces_the_retail_path_frame_direction() {
 /// `dot(recorded skater row 2, character row 2) < 0`). A recorder riding switch at the spawn node
 /// (skater frame turned round, board forward) sets the flip; the drawn skater is the recorded
 /// frame turned 180 deg about up (rows 0 and 2 negated, [code] `sub_8246B358`). Spawned in the
-/// air or off board, nothing is latched yet.
+/// air, retail's first update sees the takeoff edge (b354); off board, nothing is latched; on the
+/// ground the same test is a stand-in.
 #[test]
 fn retail_flip_latches_at_spawn_against_the_node_world_frame() {
     const BACKWARD: [u8; 4] = [128, 255, 128, 128];
@@ -840,21 +841,23 @@ fn retail_flip_latches_at_spawn_against_the_node_world_frame() {
     let ls = lines(vec![l.clone()]);
     let mut c = LineCursor::spawn(&ls, id(1), 0);
     c.facing_rule = FacingRule::RidingEntry;
-    assert!(c.flip && c.riding);
+    assert!(c.flip && !c.airborne);
     assert!(flip_test(&l.nodes[0], node_world_frame(&l.nodes[0])));
     let s = c.sample(&ls, 0.0).unwrap();
     assert_eq!(s.skater, turn_about_up(target_skater(&l, 0, 1, 0.0)));
     assert!(fz(s.skater) > 0.99, "switch stance drawn on the board's side");
     // Same line spawned on a forward node: no flip.
     assert!(!LineCursor::spawn(&ls, id(1), 12).flip);
-    // Spawned in the air or off board: not riding, nothing latched.
-    for flag in [node_flags::AIRBORNE, node_flags::OFF_BOARD] {
-        let mut m = l.clone();
-        m.nodes[0].flags = flag;
-        let ms = lines(vec![m]);
-        let c = LineCursor::spawn(&ms, id(1), 0);
-        assert!(!c.flip && !c.riding);
-    }
+    // Spawned off board: nothing latched. In the air: latched against the spawn frame.
+    let mut m = l.clone();
+    m.nodes[0].flags = node_flags::OFF_BOARD;
+    let c = LineCursor::spawn(&lines(vec![m]), id(1), 0);
+    assert!(!c.flip && !c.airborne);
+    let mut m = l.clone();
+    m.nodes[0].flags = node_flags::AIRBORNE;
+    let c = LineCursor::spawn(&lines(vec![m.clone()]), id(1), 0);
+    assert!(c.airborne);
+    assert_eq!(c.flip, flip_test(&m.nodes[0], node_world_frame(&m.nodes[0])));
     // The flip holds while riding: the recorded revert at node 10 turns the drawn body round with
     // it (now against travel), no per-node fold.
     let mut c = LineCursor::spawn(&ls, id(1), 0);
@@ -864,12 +867,12 @@ fn retail_flip_latches_at_spawn_against_the_node_world_frame() {
 }
 
 /// Retail facing rule: the flip is held across a line switch ([code] `sub_8246C7F8` /
-/// `sub_8246BEE0` store line and node only) and latched again only on a riding entry (here: a
-/// chain onto a line that starts in the air, then the landing), against the character's forward
-/// (the drawn body, still mid switch blend when the landing comes quickly). Host and a mirroring
-/// client agree on the flip frame by frame.
+/// `sub_8246BEE0` store line and node only) and latched again only at takeoff (b354: `+928` is
+/// the airborne byte; here a chain onto a line that starts in the air), against the character's
+/// forward (the drawn body, still the old line's at the edge); the landing keeps it. Host and a
+/// mirroring client agree on the flip frame by frame.
 #[test]
-fn retail_flip_is_held_across_a_switch_and_relatched_on_landing() {
+fn retail_flip_is_held_across_a_switch_and_relatched_at_takeoff() {
     const BACKWARD: [u8; 4] = [128, 255, 128, 128];
     let fz = |q: [f32; 4]| rotate(q, [0.0, 0.0, 1.0])[2];
     let players: [Vec3; 0] = [];
@@ -896,11 +899,10 @@ fn retail_flip_is_held_across_a_switch_and_relatched_on_landing() {
     assert!(flips.iter().all(|f| f.3), "held across the switch");
     assert_eq!(c.sample(&ls, 0.0).unwrap().skater, turn_about_up(target_skater(&ls[&id(2)], c.node as usize, c.node as usize + 1, c.frame_in_segment as f32 / 10.0)));
     assert!(fz(c.sample(&ls, 0.0).unwrap().skater) < -0.99);
-    // Relatched on landing: line 1 forward, chain onto line 3 whose first nodes are airborne and
-    // recorded turned round (the recorder jumped in fakie). Landing fast (1 frame per air node),
-    // the body still faces the old way (+Z) inside the 0.2 s blend: dot < 0 sets the flip and the
-    // landed line is drawn on the body's side. Landing late (blend over, the body drawn as line 3
-    // records it): the flip stays clear.
+    // Relatched at takeoff: line 1 forward, chain onto line 3 whose first nodes are airborne and
+    // recorded turned round (the recorder jumped in fakie). At the edge the body still faces the
+    // old way (+Z): dot < 0 sets the flip, however long the air lasts, and the landing keeps it,
+    // so the landed line is drawn on the body's side.
     let air_line = |frames: u8| {
         let mut l = along(3, [0.0, 0.0, 21.0], [0.0, 1.0], 31);
         for (k, n) in l.nodes.iter_mut().enumerate() {
@@ -915,16 +917,15 @@ fn retail_flip_is_held_across_a_switch_and_relatched_on_landing() {
         }
         l
     };
-    for (frames, latched) in [(1u8, true), (20u8, false)] {
+    for frames in [1u8, 20u8] {
         let ls = lines(vec![along(1, [0.0; 3], [0.0, 1.0], 21), air_line(frames)]);
         let (c, flips, records) = ride(&ls, 300);
         assert_eq!(c.line, id(3));
+        let takeoff = flips.iter().find(|f| f.1 == id(3)).unwrap();
+        assert!(takeoff.3, "latched at takeoff ({frames} frames per air node)");
         let landed = flips.iter().find(|f| f.1 == id(3) && f.2 >= 3).unwrap();
-        assert_eq!(landed.3, latched, "landing {frames} frames per air node");
-        assert_eq!(c.flip, latched, "held after the landing");
-        if latched {
-            assert!(fz(c.sample(&ls, 0.0).unwrap().skater) > 0.99, "drawn on the body's side");
-        }
+        assert!(landed.3 && c.flip, "held after the landing");
+        assert!(fz(c.sample(&ls, 0.0).unwrap().skater) > 0.99, "drawn on the body's side");
         // A client mirroring the records derives the same flip on every frame.
         let mut m = LineCursor::spawn(&ls, id(1), 0);
         m.facing_rule = FacingRule::RidingEntry;
@@ -1069,4 +1070,25 @@ fn retail_fakie_bit_follows_the_drawn_body_against_travel() {
     assert!(run(FacingRule::PerNode, retail::FAKIE).iter().all(|b| !b.0), "drawn forward: never fakie");
     let off = crate::animation::riding_fakie::Settings { high_speed: 1000.0, low_speed: 1000.0, ..retail::FAKIE };
     assert!(run(FacingRule::RidingEntry, off).iter().all(|b| !b.0), "a mod can turn the fakie drawing off");
+}
+
+#[test]
+fn steering_target_at_cursor_b_matches_the_cursor_pose_like_sub_8246de38() {
+    // The record target is built from cursor B (node, fraction); the replay cursor at the same place gives the same pose.
+    let ls = lines(vec![straight(1, [10.0, 2.0, 0.0], 8, 4, 0.5)]);
+    let line = &ls[&id(1)];
+    let mut c = LineCursor::spawn(&ls, id(1), 0);
+    c.advance(6, &ls, &mut Decider::Stay, &mut Vec::new());
+    let from_cursor = c.line_target(&ls).unwrap();
+    let at_b = line_target_at(line, (1, 0.5)).unwrap();
+    assert_eq!(from_cursor.position, at_b.position);
+    assert_eq!(from_cursor.step, at_b.step);
+    assert!((at_b.position[2] - 0.75).abs() < 1e-5, "{:?}", at_b.position);
+    // B behind the cursor (after a rejoin): the target moves back with it.
+    let behind = line_target_at(line, (0, 0.0)).unwrap();
+    assert!((behind.position[2] - 0.0).abs() < 1e-5);
+    // The last node gives its own pose; past the end there is none.
+    let last = line_target_at(line, (7, 0.9)).unwrap();
+    assert!((last.position[2] - 3.5).abs() < 1e-5);
+    assert!(line_target_at(line, (8, 0.0)).is_none());
 }

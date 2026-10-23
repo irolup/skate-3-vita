@@ -89,6 +89,7 @@ mod provider;
 mod octree;
 pub(crate) mod props;
 pub(crate) use provider::{RailHit, RailRules, RailSource, RailView, StaticProvider};
+pub(crate) use spline::PrimitiveMetadata;
 
 #[cfg(test)]
 mod tests;

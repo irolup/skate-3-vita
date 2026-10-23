@@ -177,3 +177,25 @@ fn wheel_lines_keep_audio_and_physics_bits_of_the_same_tag() {
     assert_eq!(lines.audio_surfaces, [0; 4]);
     assert_eq!(lines.seam_patterns, [0; 4]);
 }
+
+/// The AI spawn push (`82C04168` sets every part's velocity) read through the observed acceleration: from rest the
+/// one-step spike reads as IsBumped (`82BA7310`); with the history pre-filled with the pushed velocity, as the engine's
+/// handover does (`GamePhysics::push_context_velocity`), it reads nothing. Retail outcome (recomp trace 2026-10-19,
+/// AIPUSH / BUMPQ: every IsBumped evaluation within 1 s after both AI spawn pushes was false): not bumped.
+#[test]
+fn a_spawn_push_with_a_prefilled_history_does_not_read_as_bumped() {
+    use crate::animation::ground_acceleration::{is_bumped, Settings};
+    let settings = Settings { scale_x_acc: 1.0, min_bump_mag: 10.0 };
+    let push = Vector3::new(-3.6214, -0.0014, -0.1991);
+    let bumped = |ground: &BoardGroundState| {
+        let a = ground.accelerations[BodyId::Deck.index()];
+        is_bumped([a.x, a.y, a.z, 0.0], &settings)
+    };
+    let mut from_rest = BoardGroundState::default();
+    from_rest.sample_accelerations([push; BODY_COUNT], 1.0 / 60.0);
+    assert!(bumped(&from_rest), "a raw push from rest spikes");
+    let mut prefilled = BoardGroundState::default();
+    prefilled.previous_velocities.fill(push);
+    prefilled.sample_accelerations([push; BODY_COUNT], 1.0 / 60.0);
+    assert!(!bumped(&prefilled), "the pre-filled push reads no acceleration");
+}

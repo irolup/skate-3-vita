@@ -95,6 +95,7 @@ fn settings() -> Settings {
             balance_total: 100.0,
             balance_min_speed: 1.0,
             balance_base: 1.0,
+            trick_scalar: f32::from_bits(0x3e99_999a),
         },
         air: AirSettings {
             xz_trick: 10.0,
@@ -130,6 +131,28 @@ fn request_input() -> RequestInput {
         category: 100,
     }
 }
+/// A ped hit has no bail rule of its own (research b185 / b448): its body parts' contact force goes through the
+/// ordinary ground check, whose limits shrink by the side-on mid-trick factor (flags_2472 bit 15, retail 0.3).
+#[test]
+fn a_ped_hit_bails_side_on_mid_trick_but_not_upright() {
+    let mut s = settings();
+    s.ground.max_contact = 8.5;
+    s.ground.max_arm_contact = 30.0;
+    let mut f = input();
+    f.regions_force[0] = 4.0; // |relative velocity . normal| of a ped part on the skater's body, m/s
+    let bails = |s: &Settings, f: &Frame| {
+        let mut state = Requests::new();
+        state.cooldown = 0.0;
+        check_ground(&mut state, s, &mode(), f);
+        state.reasons[0]
+    };
+    assert!(!bails(&s, &f), "upright: 4.0 < 8.5");
+    f.flags_2472 |= 1 << 15;
+    assert!(bails(&s, &f), "side-on mid-trick: 4.0 > 8.5 x 0.3");
+    s.ground.trick_scalar = 1.0;
+    assert!(!bails(&s, &f), "a mod's factor 1.0 keeps the upright limit");
+}
+
 #[test]
 fn wipeout_ground_priority_and_repeated_force_change_runout_selection() {
     let mut state = Requests::new();

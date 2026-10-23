@@ -44,6 +44,17 @@ pub(crate) struct PlayerInputRuntime {
     pub grind_observation: Option<super::grind::ManagerObservation>,
 }
 impl PlayerInputRuntime {
+    /// A pooled NPC body becoming a new NPC: retail builds a new PhysicalPlayer for every new actor
+    /// (`82590DC0` -> `82DB18A0`, b295), so every ctor-built part starts fresh (processed-input cache, grind input,
+    /// pre-input, dynamic normal). The physical / processed words mirror the live state and stay for the placement's
+    /// state Exit / Enter (b299). The same actor keeps all of it across a respawn or its next line: pool only.
+    pub(crate) fn reset_for_new_actor(&mut self, data: &Collections) -> Result<(), String> {
+        let fresh = Self::load(data)?;
+        let old = std::mem::replace(self, fresh);
+        self.physical = old.physical;
+        self.processed = old.processed;
+        Ok(())
+    }
     pub fn pending_teleport(&self) -> Option<AnimationPartTransform> {
         self.pending_teleport
     }

@@ -92,14 +92,22 @@ pub struct WanderParams {
     /// Seconds a walking ped may stay inside the corner radius without getting closer before it moves on to the next
     /// corner (ours).
     pub stall_seconds: f32,
-    /// A walking ped that moves less than `stuck_distance` metres in `stuck_seconds` plans a new target away from the
-    /// old one (ours).
+    /// A walking ped that stays within `stuck_distance` (0.13 m) for `stuck_seconds` (0.5 s) re-paths to the SAME
+    /// target, once per still spell. The values are the bot's still timer (`82E97118`, b313 / b314), but retail runs
+    /// that timer only in bot mode 4, not for walking peds (b336): on walking peds this re-path is OURS. The outcome
+    /// matches retail, which never gives a walking ped's target up for lack of progress (b190, b332).
     pub stuck_distance: f32,
     pub stuck_seconds: f32,
+    /// NOT RETAIL (ours, a safety net): still pinned after this many seconds, the ped gives up its target and plans
+    /// away from it (the pre-2026-10-19 stuck watch). 0 = off.
+    pub give_up_seconds: f32,
     /// Personal space for yielding, metres ahead (ours: the navigation record's 2.0,
     /// `Hash_7C8E344CDEC7510B`, meaning unverified).
     pub yield_distance: f32,
-    /// Seconds a yielding ped waits before re-planning on the short fan (ours).
+    /// NOT RETAIL (ours): seconds a yielding ped waits before it re-paths to the same target. Keeping the target is
+    /// retail's outcome; the 2.0 s is borrowed from the bot's mode-0 (no path) controller `82EA4408`, which walking path
+    /// peds never run (b335). Retail's walking path step `82EA0808` has no neighbour handling at all (b336): our yield,
+    /// sidestep and push are ours; what keeps retail walking peds apart is not read yet.
     pub yield_patience: f32,
 }
 
@@ -118,10 +126,11 @@ impl Default for WanderParams {
             stop_heading: 60f32.to_radians(),
             walk_heading: 15f32.to_radians(),
             stall_seconds: 0.5,
-            stuck_distance: 0.3,
-            stuck_seconds: 2.0,
+            stuck_distance: 0.13,
+            stuck_seconds: 0.5,
+            give_up_seconds: 2.0,
             yield_distance: 2.0,
-            yield_patience: 3.0,
+            yield_patience: 2.0,
         }
     }
 }
@@ -222,6 +231,12 @@ pub struct PedNav {
     pub stuck: Option<(Vec3, f32)>,
     pub reverse: bool,
     pub stuck_count: u32,
+    /// The still timer fired in this still spell (it fires once until the ped moves out of `stuck_distance`).
+    pub still_fired: bool,
+    /// Re-path to the same target on the next step (the still timer, a yield, the host's refused steps).
+    pub repath_due: bool,
+    /// How often the ped re-pathed to its target (logs, tests).
+    pub repaths: u32,
 }
 
 fn rotate_y(v: [f32; 2], angle: f32) -> [f32; 2] {
@@ -331,8 +346,13 @@ impl PedNav {
                 if self.route_index >= route.points.len() {
                     self.route_index = if route.looped { 0 } else { route.points.len() - 1 };
                 }
-                let t = route.points[self.route_index];
+                let mut t = route.points[self.route_index];
                 self.route_index += 1;
+                // A route point inside a cut (a plugin waypoint just in front of its own prop): retail snaps the bot
+                // destination onto the cut mesh within 0.5 m (b302), so the path ends at the nearest free point.
+                if let Some(s) = obstacles.and_then(|o| o.snap_out(t, mesh.agent[1])) {
+                    t = s;
+                }
                 (t, mesh.locate(t))
             }
         } else {
@@ -358,6 +378,30 @@ impl PedNav {
         }
         // The path search or a detour can repeat a corner; the pass test needs a clear line to a DIFFERENT next one.
         self.corners.dedup_by(|x, y| dist_xz(*x, *y) < 1e-3);
+    }
+
+    /// Re-path from `here` to the SAME target (retail re-requests the bot's destination, `82E957F8`; b315, b332): the
+    /// target and a route's index stay. No path: the corners are dropped and the long fan skipped, so the arrival
+    /// branch picks a new target (retail: a failed request ends the path, then the bot is done, b190).
+    pub fn repath(&mut self, mesh: &NavMesh, here: NavPoint, obstacles: Option<&NavObstacles>) {
+        let Some(target) = self.target else { return };
+        self.repaths += 1;
+        self.next = 0;
+        self.stall = None;
+        match mesh.locate(target).and_then(|to| mesh.find_path(here, to)) {
+            Some(c) => {
+                self.corners = c;
+                if let Some(o) = obstacles {
+                    self.corners = o.detour(mesh, here.position, &self.corners, mesh.agent[1]);
+                    self.obstacle_version = o.version;
+                }
+                self.corners.dedup_by(|x, y| dist_xz(*x, *y) < 1e-3);
+            }
+            None => {
+                self.corners.clear();
+                self.skip_long = true;
+            }
+        }
     }
 
     /// One world tick. `position` / `heading` / `state` are the body's; `others` the nearby
@@ -402,20 +446,23 @@ impl PedNav {
             self.waiting = NavWait::OffMesh;
             return NavOutput { intent: Intent::Idle, turn: 0.0, waiting: NavWait::OffMesh, turn_degrees: 0, steer: 0.0 };
         };
-        // Arrival / no plan: choose the next target (the bot's state 1).
-        let arrived = self.corners.is_empty() || (self.next + 1 >= self.corners.len() && self.corners.last().is_some_and(|c| dist_xz(*c, position) < params.corner_radius));
-        // Ours: stuck watch. A walking ped that moves less than `stuck_distance` in `stuck_seconds` (pinned on a
-        // boundary corner it cannot step onto, 2026-10-16) gives up its target and plans away from it, the long fan
-        // skipped (retail's reverse, event 4, whose sender in NavPower is not decoded).
+        // Ours (the still timer's values, `82E97118`, which retail runs in bot mode 4 only, b336): a walking ped still for
+        // `stuck_seconds` re-paths to the same target, once per still spell. Retail has no give-up (b190, b332);
+        // `give_up_seconds` is our NOT RETAIL safety net (0 = off).
         let mut give_up = false;
         if matches!(state, Locomotion::Walk | Locomotion::Start) {
             self.stuck = match self.stuck {
                 Some((a, t)) if dist_xz(a, position) < params.stuck_distance => {
-                    if t + dt >= params.stuck_seconds {
+                    let t = t + dt;
+                    if params.give_up_seconds > 0.0 && t >= params.give_up_seconds {
                         give_up = true;
                         None
                     } else {
-                        Some((a, t + dt))
+                        if t >= params.stuck_seconds && !self.still_fired {
+                            self.still_fired = true;
+                            self.repath_due = true;
+                        }
+                        Some((a, t))
                     }
                 }
                 _ => Some((position, 0.0)),
@@ -423,6 +470,14 @@ impl PedNav {
         } else {
             self.stuck = None;
         }
+        if self.stuck.is_none_or(|(_, t)| t == 0.0) {
+            self.still_fired = false;
+        }
+        if std::mem::take(&mut self.repath_due) && !give_up {
+            self.repath(mesh, here, obstacles);
+        }
+        // Arrival / no plan: choose the next target (the bot's state 1).
+        let arrived = self.corners.is_empty() || (self.next + 1 >= self.corners.len() && self.corners.last().is_some_and(|c| dist_xz(*c, position) < params.corner_radius));
         if give_up {
             self.reverse = true;
             self.skip_long = true;
@@ -543,10 +598,9 @@ impl PedNav {
         if wait != NavWait::None {
             self.waited += dt;
             if wait == NavWait::Yield && self.waited > params.yield_patience {
-                // Give up and pick another way (as after a failure event).
+                // Re-path to the same target (retail never gives the target up, b332; the wait is ours, b335).
                 self.waited = 0.0;
-                self.skip_long = true;
-                self.corners.clear();
+                self.repath_due = true;
             }
             self.waiting = wait;
             return NavOutput { intent: Intent::Idle, turn: 0.0, waiting: wait, turn_degrees: 0, steer: 0.0 };

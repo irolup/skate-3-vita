@@ -51,6 +51,21 @@ pub struct SolidContact {
     pub time_of_impact: f32,
 }
 
+/// skate_vita (performance): the centre and radius of a posed shape's bounds, as [`SolidBody::contact`] computes them,
+/// so a caller can compute them once per shape ([`SolidBody::contact_near`]).
+#[derive(Clone, Copy, Debug)]
+pub struct ShapeSphere {
+    pub center: Vector,
+    pub radius: f32,
+}
+
+impl ShapeSphere {
+    pub fn of(shape: &dyn rapier3d::parry::shape::Shape, pose: &Pose) -> Self {
+        let bounds = shape.compute_aabb(pose);
+        Self { center: (bounds.maxs + bounds.mins) * 0.5, radius: (bounds.maxs - bounds.mins).length() * 0.5 }
+    }
+}
+
 impl SolidBody {
     /// Exact separation/penetration, followed by a full-step translational AND
     /// rotational sweep. The native solver consumes current-frame witness
@@ -70,12 +85,30 @@ impl SolidBody {
         if !(dt.is_finite() && dt > 0. && skin.is_finite() && skin >= 0.) {
             return None;
         }
-        let bounds_a = shape_a.compute_aabb(&pose_a);
-        let bounds_b = collider.shape.compute_aabb(&collider.pose);
-        let radius_a = (bounds_a.maxs - bounds_a.mins).length() * 0.5;
-        let radius_b = (bounds_b.maxs - bounds_b.mins).length() * 0.5;
-        let center_a = (bounds_a.maxs + bounds_a.mins) * 0.5;
-        let center_b = (bounds_b.maxs + bounds_b.mins) * 0.5;
+        let (a, b) = (ShapeSphere::of(shape_a, &pose_a), ShapeSphere::of(&*collider.shape, &collider.pose));
+        self.contact_near(collider, shape_a, pose_a, a, b, com_a, linear_a, angular_a, dt, skin)
+    }
+
+    /// skate_vita (performance): [`Self::contact`] with both shapes' [`ShapeSphere`]s already computed (`a` of
+    /// `shape_a` at `pose_a`, `b` of the collider); the same result.
+    #[allow(clippy::too_many_arguments)]
+    pub fn contact_near(
+        &self,
+        collider: &SolidCollider,
+        shape_a: &dyn rapier3d::parry::shape::Shape,
+        pose_a: Pose,
+        a: ShapeSphere,
+        b: ShapeSphere,
+        com_a: Vector,
+        linear_a: Vector,
+        angular_a: Vector,
+        dt: f32,
+        skin: f32,
+    ) -> Option<SolidContact> {
+        if !(dt.is_finite() && dt > 0. && skin.is_finite() && skin >= 0.) {
+            return None;
+        }
+        let (radius_a, radius_b, center_a, center_b) = (a.radius, b.radius, a.center, b.center);
         let travel = (linear_a - self.linvel).length() * dt
             + angular_a.length() * dt * ((center_a - com_a).length() + radius_a)
             + self.angvel.length() * dt * ((center_b - self.center_of_mass).length() + radius_b);

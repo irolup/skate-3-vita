@@ -21,6 +21,12 @@ impl From<BoardWorld> for WorldHandle {
 
 impl WorldHandle {
     /// A handle to the same world with fresh scratch (a worker for another skater's step).
+    /// The shared geometry itself (a reader outside the step: the replay cameras' sweeps). The holder must drop it
+    /// before the step changes the world (`DerefMut` needs the only reference).
+    pub(crate) fn geometry(&self) -> Arc<BoardWorld> {
+        Arc::clone(&self.shared)
+    }
+
     pub(crate) fn share(&self) -> Self {
         Self { shared: Arc::clone(&self.shared), scratch: Box::default() }
     }

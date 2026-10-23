@@ -2,7 +2,6 @@
 use super::ground_sync::SceneService;
 use skate_core::{
     math::Vector3,
-    physics::board_world::BoardWorld,
     player::offboard::ground_query::{
         self as query, ConsumeInput, Frame, GroundAdjustment, GroundQueryPacket, GroundQueryScene,
         LineHit, QueryContext,
@@ -35,7 +34,7 @@ impl State {
     }
     pub(crate) fn submit(
         &mut self,
-        world: &BoardWorld,
+        world: super::BipedWorld<'_>,
         vehicles: &[(usize, crate::dynamics::SolidBody)],
         frame: [[f32; 4]; 4],
         velocity: [f32; 4],

@@ -8,5 +8,12 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
-serde.workspace = true
+serde = { workspace = true, features = ["rc"] }
+# R2: the front end's menu registry, crossbar, screen stack and pad input; the menu tables.
+skate-core = { path = "../skate-core" }
+skate-data = { path = "../skate-data" }
 serde_json.workspace = true
+
+[features]
+# skate_vita (R2 performance): the front end's phase timers (`fe::profile`).
+fe-profile = []

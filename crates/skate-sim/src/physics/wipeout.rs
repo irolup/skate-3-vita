@@ -13,6 +13,8 @@ pub(crate) struct Wipeout {
     modes: [Mode; 5],
 }
 impl Wipeout {
+    /// The loaded thresholds (read-only; the bail log prints the ones a check compared against).
+    pub(crate) fn settings(&self) -> &Settings { &self.settings }
     pub(crate) fn adopt_mode_settings(&mut self, other: Self) { self.modes = other.modes; }
     pub fn check_air_collision(
         &mut self,

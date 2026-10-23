@@ -7,7 +7,7 @@ mod math;
 mod qualify;
 pub use qualify::{qualify,qualify_at,closest_point,best_spline,best_spline_excluding,nearest_distance,at_distance,at_along};
 pub use query::query;
-pub use record::{AssemblyData, Geometry, RecordInput};
+pub use record::{AssemblyData, Geometry, PartData, RatesData, RecordInput};
 pub use registry::{Object, Provider, Registry, Spline};
 use super::{ground_query::QueryContext, ground_sync::{Bounds, BoardLimits}};
 pub type Vector = [f32; 4];

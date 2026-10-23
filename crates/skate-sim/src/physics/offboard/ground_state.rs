@@ -131,7 +131,7 @@ impl GroundQueryScene for Services<'_> {
         );
         cache.with_primary_edges(|edges| {
             super::ground_query::with_world_scene(
-                &self.physics.world,
+                self.physics.biped_world(),
                 edges,
                 &[],
                 |scene| scene.edge_candidates(search),
@@ -147,7 +147,7 @@ impl GroundQueryScene for Services<'_> {
         );
         cache.with_primary_edges(|edges| {
             super::ground_query::with_world_scene(
-                &self.physics.world,
+                self.physics.biped_world(),
                 edges,
                 &[],
                 |scene| scene.query_lines(packet),

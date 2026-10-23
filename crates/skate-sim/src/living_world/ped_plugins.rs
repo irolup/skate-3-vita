@@ -148,10 +148,22 @@ pub(crate) fn map_props(root: &Path, map: &str) -> Vec<PluginProp> {
 impl PluginData {
     /// Load from the asset root (`private/living_world/tables.json` and `waypoints.json`, the stock descriptors).
     pub fn load(root: &Path) -> Result<Self, String> {
-        // skate_vita: through `skate_data::vfs`; the packs carry the peds' classes in `ped_tables.json`.
-        let dir = root.join("private/living_world");
-        let bytes = skate_data::vfs::read(&dir.join("ped_tables.json")).or_else(|_| skate_data::vfs::read(&dir.join("tables.json"))).map_err(|e| e.to_string())?;
-        let tables: Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        Self::load_with(root, None)
+    }
+
+    /// [`Self::load`] with `tables.json` already parsed (`None`: read and parse it here).
+    pub fn load_with(root: &Path, parsed: Option<&Value>) -> Result<Self, String> {
+        let read;
+        let tables: &Value = match parsed {
+            Some(v) => v,
+            None => {
+                // skate_vita: through `skate_data::vfs`; the packs carry the peds' classes in `ped_tables.json`.
+                let dir = root.join("private/living_world");
+                let bytes = skate_data::vfs::read(&dir.join("ped_tables.json")).or_else(|_| skate_data::vfs::read(&dir.join("tables.json"))).map_err(|e| e.to_string())?;
+                read = serde_json::from_slice::<Value>(&bytes).map_err(|e| e.to_string())?;
+                &read
+            }
+        };
         let entities = tables.pointer("/classes/livingworld_entities").and_then(Value::as_object).ok_or("tables.json has no livingworld_entities")?;
         let props = tables.pointer("/classes/livingworld_props").and_then(Value::as_object).ok_or("tables.json has no livingworld_props")?;
         let field = |key: &str, name: &str| -> Option<Value> {
@@ -266,7 +278,17 @@ mod tests {
         sit.transfer.as_ref().unwrap().names(&mut names);
         eprintln!("sit graph {} transfer {names:?}", sit.graph);
         assert!(names.contains(&"HasFirstWaypointAvailable".to_string()) && names.contains(&"IsChasing".to_string()));
-        assert_eq!(data.classes["waypoint_conversation"].descriptor.as_ref().map(|d| d.max_participants), Some(3));
+        let conv = &data.classes["waypoint_conversation"];
+        assert_eq!(conv.descriptor.as_ref().map(|d| d.max_participants), Some(3));
+        // b212: offer radius 20 m; transfer ConversationIsGatheringMembers and EntityAllowedToJoinConversation and not IsChasing.
+        assert_eq!(conv.numbers.get("Hash_E2101F2B17A0E6B5").copied(), Some(20.0));
+        let mut names = Vec::new();
+        conv.descriptor.as_ref().unwrap().transfer.as_ref().expect("conversation transfer").names(&mut names);
+        eprintln!("conversation transfer {names:?}");
+        for n in ["ConversationIsGatheringMembers", "EntityAllowedToJoinConversation", "IsChasing"] {
+            assert!(names.iter().any(|x| x == n), "{n}");
+        }
+        assert!(data.odds["adult_female01"].iter().any(|(c, _)| c == "waypoint_conversation"), "plugin_odds key");
         // Hand props per class: a list (vending machine) and a bare one-entry record (newspaper box).
         assert_eq!(data.classes["waypoint_vendingmachine"].hand_props, vec![("pop".to_string(), 0.5), ("waterbottle".to_string(), 0.5)]);
         assert_eq!(data.classes["waypoint_newspaperbox"].hand_props, vec![("newspaper".to_string(), 1.0)]);

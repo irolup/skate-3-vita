@@ -60,6 +60,7 @@ def main():
     ap.add_argument("--out", default=str(ROOT / "oracle" / "vita-render"))
     ap.add_argument("--park", help="run on this park's map pack (map_<PARK>.pak) instead of the Course")
     ap.add_argument("--upload-packs", metavar="DIR", help="upload changed DIR/*.pak first (vita-run.py)")
+    ap.add_argument("--features", help="more skate-vita cargo features (e.g. stage-profile)")
     ap.add_argument("--title", default="SKTV00001")
     ap.add_argument("--timeout", type=float, default=7200)
     ap.add_argument("--ip", default=os.environ.get("VITA_IP"))
@@ -74,7 +75,7 @@ def main():
         run_spec.loader.exec_module(vr)
         vr.upload_packs(Path(args.upload_packs), args.ip)
     env = vt.sdk_env()
-    cmd = ["cargo", "vita", "build", "eboot", "--", "--release", "-p", "skate-vita", "--features", "replay"]
+    cmd = ["cargo", "vita", "build", "eboot", "--", "--release", "-p", "skate-vita", "--features", ",".join(["replay"] + ([args.features] if args.features else []))]
     print("build:", " ".join(cmd), flush=True)
     subprocess.run(cmd, cwd=ROOT, env=env, check=True, stdout=subprocess.DEVNULL)
     self_path = ROOT / "target/armv7-sony-vita-newlibeabihf/release/skate-vita.self"

@@ -58,8 +58,14 @@ impl<'a> Class<'a> {
 }
 
 /// Parse the mood tables from `tables.json` bytes.
+#[cfg(test)]
 pub(crate) fn parse(bytes: &[u8]) -> Result<MoodTables, String> {
     let root: Value = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+    parse_in(&root)
+}
+
+/// The same from the parsed `tables.json`.
+pub(crate) fn parse_in(root: &Value) -> Result<MoodTables, String> {
     let classes = root.get("classes").and_then(Value::as_object).ok_or("tables.json has no classes")?;
     let class = |name: &str| classes.get(name).and_then(Value::as_object).map(Class).ok_or_else(|| format!("tables.json has no {name}"));
     let cats = class("livingworld_moodeventcategories")?;
@@ -69,7 +75,7 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<MoodTables, String> {
     let mut t = MoodTables::default();
     for key in cats.0.keys() {
         // B1DD absent (discrete): the attribute default 0.0 (`0x830D0850`).
-        t.categories.insert(key.clone(), MoodCategory { magnitude: cats.f32(key, "Hash_B1DD").unwrap_or(0.0), lifetime: cats.f32(key, "Hash_A379").unwrap_or(30.0), near: cats.f32(key, "Hash_D16BF47CF5417C44").unwrap_or(0.0), far: cats.f32(key, "Hash_A7EB37BC10C5A42F").unwrap_or(0.0) });
+        t.categories.insert(key.clone(), MoodCategory { magnitude: cats.f32(key, "Hash_B1DD").unwrap_or(0.0), lifetime: cats.f32(key, "Hash_A379").unwrap_or(30.0), near: cats.f32(key, "Hash_D16BF47CF5417C44").unwrap_or(0.0), far: cats.f32(key, "Hash_A7EB37BC10C5A42F").unwrap_or(0.0), priority: cats.u32(key, "Hash_1A3FB63DFDAE0C4F").unwrap_or(0) });
     }
     for key in results.0.keys() {
         let gate = |flag: &str| results.flag(key, flag);
@@ -136,8 +142,14 @@ pub(crate) const ZOMBIE_KEY: &str = "zombie";
 
 /// The chase records (`livingworld_entities_chase`, parents merged, numeric fields) by entity
 /// type, and the `global` and `zombie` records.
+#[cfg(test)]
 pub(crate) fn chase_records(bytes: &[u8]) -> (BTreeMap<String, ChaseRecord>, Option<ChaseRecord>, Option<ChaseRecord>) {
     let Ok(root) = serde_json::from_slice::<Value>(bytes) else { return Default::default() };
+    chase_records_in(&root)
+}
+
+/// The same from the parsed `tables.json` (parsed once per load, shared by every reader).
+pub(crate) fn chase_records_in(root: &Value) -> (BTreeMap<String, ChaseRecord>, Option<ChaseRecord>, Option<ChaseRecord>) {
     let (Some(entities), Some(chase)) = (root.pointer("/classes/livingworld_entities").and_then(Value::as_object), root.pointer("/classes/livingworld_entities_chase").and_then(Value::as_object)) else {
         return Default::default();
     };
@@ -169,8 +181,14 @@ pub(crate) fn chase_records(bytes: &[u8]) -> (BTreeMap<String, ChaseRecord>, Opt
 pub(crate) const TAKEDOWN_FIELD: &str = "Hash_76AC331FBD5803FF";
 
 /// The takedown tables (`livingworld_entity_takedown`, parents merged) by entity type, and the `zombie` table.
+#[cfg(test)]
 pub(crate) fn takedown_tables(bytes: &[u8]) -> (BTreeMap<String, TakedownTable>, Option<TakedownTable>) {
     let Ok(root) = serde_json::from_slice::<Value>(bytes) else { return Default::default() };
+    takedown_tables_in(&root)
+}
+
+/// The same from the parsed `tables.json` (parsed once per load, shared by every reader).
+pub(crate) fn takedown_tables_in(root: &Value) -> (BTreeMap<String, TakedownTable>, Option<TakedownTable>) {
     let (Some(entities), Some(tables)) = (root.pointer("/classes/livingworld_entities").and_then(Value::as_object), root.pointer("/classes/livingworld_entity_takedown").and_then(Value::as_object)) else {
         return Default::default();
     };
@@ -195,6 +213,8 @@ pub(crate) fn takedown_tables(bytes: &[u8]) -> (BTreeMap<String, TakedownTable>,
                         min_speed: f32::from_bits(u(e, "u32_32")),
                         // Byte +36 of the big-endian word at +36.
                         mirrors: u(e, "u32_36") >> 24 != 0,
+                        // Byte +38 bit 0: may trip on failure (`826A49D8`; b326).
+                        trips: (u(e, "u32_36") >> 8) & 1 != 0,
                     })
                     .collect()
             })
@@ -213,8 +233,14 @@ pub(crate) const PERCEPTION_FIELD: &str = "Hash_A27862C1107F64EC";
 /// `chasedpersondetectibilitytest` near (`D16B`) / far (`A7EB`) times the perceptions record's
 /// scales (`D036` / `D238`), its fov (`7435`), and the scales themselves (near, far, fov) for the
 /// mood post's test with each category's ranges. Types without a record get none.
+#[cfg(test)]
 pub(crate) fn sight(bytes: &[u8]) -> (BTreeMap<String, Sight>, BTreeMap<String, [f32; 3]>) {
     let Ok(root) = serde_json::from_slice::<Value>(bytes) else { return Default::default() };
+    sight_in(&root)
+}
+
+/// The same from the parsed `tables.json` (parsed once per load, shared by every reader).
+pub(crate) fn sight_in(root: &Value) -> (BTreeMap<String, Sight>, BTreeMap<String, [f32; 3]>) {
     let classes = |n: &str| root.pointer(&format!("/classes/{n}")).and_then(Value::as_object).map(Class);
     let (Some(entities), Some(perceptions), Some(cats)) = (classes("livingworld_entities"), classes("livingworld_entities_perceptions"), classes("livingworld_moodeventcategories")) else {
         return Default::default();
@@ -246,8 +272,14 @@ pub(crate) struct ConversationTables {
 /// The sit plugin's values per entity type (`livingworld_entities`, parents merged): sit time min / max
 /// (`Hash_1190326371F1A684` / `Hash_69F67C678B2673C9`) and the stand-up chance (`Hash_B040D387ABA6E24D`), read by
 /// SetSitTimer `826A2898` and GoingToStandBackUp `826AD1F0`; a missing field keeps the retail default.
+#[cfg(test)]
 pub(crate) fn sit_values(bytes: &[u8]) -> BTreeMap<String, skate_core::living_world::peds::brain::SitValues> {
     let Ok(root) = serde_json::from_slice::<Value>(bytes) else { return Default::default() };
+    sit_values_in(&root)
+}
+
+/// The same from the parsed `tables.json` (parsed once per load, shared by every reader).
+pub(crate) fn sit_values_in(root: &Value) -> BTreeMap<String, skate_core::living_world::peds::brain::SitValues> {
     let Some(entities) = root.pointer("/classes/livingworld_entities").and_then(Value::as_object) else { return Default::default() };
     let e = Class(entities);
     let d = skate_core::living_world::peds::brain::SitValues::default();
@@ -266,8 +298,14 @@ pub(crate) fn sit_values(bytes: &[u8]) -> BTreeMap<String, skate_core::living_wo
 
 /// Each entity type's starting hand prop: the carry chance (`Hash_3DB019A08284F45C`, read by `8269A588` in the ped
 /// constructor `82E33198`) and its `handprop_odds` list of (handprop key, probability).
+#[cfg(test)]
 pub(crate) fn starting_hand_props(bytes: &[u8]) -> BTreeMap<String, (f32, Vec<(String, f32)>)> {
     let Ok(root) = serde_json::from_slice::<Value>(bytes) else { return Default::default() };
+    starting_hand_props_in(&root)
+}
+
+/// The same from the parsed `tables.json` (parsed once per load, shared by every reader).
+pub(crate) fn starting_hand_props_in(root: &Value) -> BTreeMap<String, (f32, Vec<(String, f32)>)> {
     let Some(entities) = root.pointer("/classes/livingworld_entities").and_then(Value::as_object) else { return Default::default() };
     let e = Class(entities);
     entities
@@ -283,8 +321,14 @@ pub(crate) fn starting_hand_props(bytes: &[u8]) -> BTreeMap<String, (f32, Vec<(S
         .collect()
 }
 
+#[cfg(test)]
 pub(crate) fn conversation_tables(bytes: &[u8]) -> ConversationTables {
     let Ok(root) = serde_json::from_slice::<Value>(bytes) else { return Default::default() };
+    conversation_tables_in(&root)
+}
+
+/// The same from the parsed `tables.json` (parsed once per load, shared by every reader).
+pub(crate) fn conversation_tables_in(root: &Value) -> ConversationTables {
     let class = |n: &str| root.pointer(&format!("/classes/{n}")).and_then(Value::as_object);
     let (Some(entities), Some(convs), Some(cats), Some(groups)) =
         (class("livingworld_entities"), class("livingworld_conversations"), class("livingworld_conversation_categories"), class("livingworld_conversation_category_groups"))
@@ -322,8 +366,14 @@ pub(crate) fn conversation_tables(bytes: &[u8]) -> ConversationTables {
 }
 
 /// Entity type -> its reaction set name.
+#[cfg(test)]
 pub(crate) fn reaction_sets(bytes: &[u8]) -> BTreeMap<String, String> {
     let Ok(root) = serde_json::from_slice::<Value>(bytes) else { return BTreeMap::new() };
+    reaction_sets_in(&root)
+}
+
+/// The same from the parsed `tables.json` (parsed once per load, shared by every reader).
+pub(crate) fn reaction_sets_in(root: &Value) -> BTreeMap<String, String> {
     let Some(entities) = root.pointer("/classes/livingworld_entities").and_then(Value::as_object) else { return BTreeMap::new() };
     let c = Class(entities);
     entities.keys().filter_map(|k| Some((k.clone(), c.reference(k, REACTIONS_FIELD)?))).collect()

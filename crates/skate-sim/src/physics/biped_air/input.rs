@@ -99,6 +99,6 @@ pub(super) fn submit(
     let g = physics.settings.step.simulation.gravity_acceleration;
     skater
         .offboard_air_selector
-        .launch(&physics.world, packet, [g.x, g.y, g.z, 0.], context)
+        .launch(physics.biped_world(), packet, [g.x, g.y, g.z, 0.], context)
         .map_err(str::to_owned)
 }

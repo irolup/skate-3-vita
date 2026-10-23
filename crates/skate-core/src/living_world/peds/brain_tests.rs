@@ -296,7 +296,7 @@ fn a_takedown_attempt_succeeds_on_contact_with_the_target() {
     use super::super::takedown::TakedownChoice;
     let conditions = ops(&[("HasTakeDownTargetable", &[]), ("CanAttemptTakeDownTargetable", &[]), ("HasMonitoredIntent", &[("intentName", "ActiveTakedown")]), ("TakeDownAttemptSuccessful", &[])]);
     let behaviors = ops(&[("ChaserEvaluateWhoToTakeDown", &[]), ("TakeDownTargetablePredictions", &[]), ("AttemptTakeDownTargetable", &[]), ("TakeDownTargetableSuccess", &[]), ("TakedownTargetableClearOnEnd", &[])]);
-    let choice = TakedownChoice { entry: 2, mirrored: false, predicted: [0.0, 0.0, 1.0] };
+    let choice = TakedownChoice { entry: 2, mirrored: false, predicted: [0.0, 0.0, 1.0], trips: false };
     let choose = |_: u64| Some(choice);
     let at = |_: u64| Some([0.0f32, 0.0, 1.0]);
     let mut brain = PedBrain { chasee: Some(9), ..Default::default() };
@@ -311,13 +311,77 @@ fn a_takedown_attempt_succeeds_on_contact_with_the_target() {
     h.update(2, [0; 6], &f);
     assert_eq!(h.condition_activation(3, &f), 0, "no contact yet");
     h.brain.takedown_contact = true;
+    // The deciding touch also asked for Colliding; success drops that (`826A4E50` clears byte +8, b317).
+    h.brain.begin_colliding = true;
     h.update(2, [0; 6], &f);
     assert_eq!(h.condition_activation(3, &f), 1);
     h.begin(3, [0; 6], &f);
     assert_eq!(h.brain.chase_requests, vec![ChaseRequest::Takedown { target: 9 }]);
     assert!(!h.brain.takedown_active);
+    assert!(!h.brain.begin_colliding, "the attacker does not fall from its own takedown");
     h.end(4, [0; 6], &f);
     assert_eq!((h.brain.takedown_target, h.brain.takedown_choice), (None, None));
+}
+
+/// b326: a contact during a takedown attempt is stored, not dropped. Attempt Begin (`826A49D8`) drops a reaction stored
+/// before it; a stored contact blocks the success decision (`826A4BE8`); Failure Begin (`826A5068`) keeps it, or trips
+/// (Knockdown FromBack) when the entry may trip and the roll hits; Colliding Begin hands it to the host.
+#[test]
+fn a_failed_takedown_keeps_its_stored_reaction_and_may_trip() {
+    use super::super::skater_contact::{ReactionDirection, ReactionKind, StoredReaction};
+    use super::super::takedown::TakedownChoice;
+    let behaviors = ops(&[("AttemptTakeDownTargetable", &[]), ("TakeDownTargetableFailure", &[]), ("PedestrianColliding", &[]), ("TakeDownTargetableFailure", &[("tripChance", "1.0")])]);
+    assert_eq!(behaviors.get(1), Some(&PedOp::TakeDownTargetableFailure { trip_chance: 0.35 }), "retail default 0.35");
+    let bumped = StoredReaction { kind: ReactionKind::Standing, direction: ReactionDirection::FromLeft, closing: 2.0, toucher: Some(44) };
+    let settings = BrainSettings::default();
+    let none = |_: u64| None;
+    let f = frame();
+    let mut brain = PedBrain { takedown_target: Some(9), takedown_choice: Some(TakedownChoice { entry: 0, mirrored: false, predicted: [0.0; 3], trips: false }), pending_reaction: Some(bumped), begin_colliding: true, ..Default::default() };
+    let mut h = BrainHost { behaviors: &behaviors, conditions: &[], brain: &mut brain, settings: &settings, position: [0.0; 3], heading: 0.0, skater: None, target_position: &none, chase: Default::default() };
+    // Attempt Begin drops what was stored before.
+    h.begin(0, [0; 6], &f);
+    assert_eq!((h.brain.pending_reaction, h.brain.begin_colliding, h.brain.takedown_trips), (None, false, false));
+    // A bump by someone else during the attempt (the host stores it): the target's touch no longer decides it.
+    h.brain.pending_reaction = Some(bumped);
+    h.brain.begin_colliding = true;
+    h.brain.takedown_contact = true;
+    h.update(0, [0; 6], &f);
+    assert_eq!(h.brain.takedown_result, None, "a stored contact blocks the decision");
+    // Failure without the trip flag keeps the stored reaction and draws no random number.
+    let rng_before = h.brain.rng.clone();
+    h.begin(1, [0; 6], &f);
+    assert_eq!((h.brain.pending_reaction, h.brain.begin_colliding), (Some(bumped), true));
+    assert_eq!(h.brain.rng, rng_before, "no roll without the entry's trip flag");
+    // Colliding Begin hands it to the host.
+    h.begin(2, [0; 6], &f);
+    assert_eq!((h.brain.reaction_due, h.brain.pending_reaction), (Some(bumped), None));
+    // An entry that may trip, with chance 1: the failure stores the trip, replacing a stored bump.
+    h.brain.reaction_due = None;
+    h.brain.takedown_choice = Some(TakedownChoice { entry: 0, mirrored: false, predicted: [0.0; 3], trips: true });
+    h.begin(0, [0; 6], &f);
+    assert!(h.brain.takedown_trips);
+    h.brain.pending_reaction = Some(bumped);
+    h.begin(3, [0; 6], &f);
+    assert_eq!(h.brain.pending_reaction, Some(StoredReaction { kind: ReactionKind::Knockdown, direction: ReactionDirection::FromBack, closing: 0.0, toucher: None }));
+    assert!(h.brain.begin_colliding);
+}
+
+/// Plugin End (`8269F310` -> `82E0C9E8`) releases the plugin: a ped bumped out of its conversation does not rejoin it
+/// and is not busy for the mood producer any more (b318).
+#[test]
+fn leaving_the_plugin_state_releases_the_plugin() {
+    let conditions = ops(&[]);
+    let behaviors = ops(&[("Plugin", &[])]);
+    let mut brain = PedBrain { plugin: Some(648), has_plugin: true, ..Default::default() };
+    let settings = BrainSettings::default();
+    let none = |_: u64| None;
+    let f = frame();
+    let mut h = BrainHost { behaviors: &behaviors, conditions: &conditions, brain: &mut brain, settings: &settings, position: [0.0; 3], heading: 0.0, skater: None, target_position: &none, chase: Default::default() };
+    h.begin(0, [0; 6], &f);
+    assert!(h.brain.in_plugin);
+    h.end(0, [0; 6], &f);
+    assert!(!h.brain.in_plugin);
+    assert_eq!(h.brain.chase_requests, vec![ChaseRequest::ExitPlugin], "the host releases the conversation");
 }
 
 #[test]
@@ -369,10 +433,21 @@ fn a_tazer_is_drawn_then_hits_its_target_once() {
     // 8 m ahead, 3.6 deg off: inside 10 m and the 20 deg cone.
     assert_eq!(h.condition_activation(1, &f), 1);
     h.begin(0, [0; 6], &f);
+    assert_eq!(h.brain.chase_requests, vec![ChaseRequest::TazerClip { clip: TAZER_INTO }], "the draw clip");
+    h.brain.chase_requests.clear();
     h.update(0, [0; 6], &f);
     assert_eq!(h.condition_activation(0, &f), 0, "still drawing");
     h.brain.tick_timers(0.2);
     h.update(0, [0; 6], &f);
+    assert_eq!(h.brain.hand_prop.key.as_deref(), Some(TAZER_PROP), "an empty hand gets the tazer once timer 37 is out");
+    assert_eq!(h.condition_activation(0, &f), 0, "drawn comes from the draw clip, not the timer");
+    // 0.3 s left on the draw clip: not yet; 0.2 s: the cycle clip and drawn (state 2).
+    h.brain.update_tazer_clip(&settings, Some((TAZER_INTO, true)), 0.3);
+    assert_eq!(h.condition_activation(0, &f), 0);
+    h.brain.update_tazer_clip(&settings, Some((TAZER_INTO, true)), 0.2);
+    assert_eq!(h.brain.tazer_state, Some(2));
+    assert_eq!(h.brain.chase_requests, vec![ChaseRequest::TazerClip { clip: TAZER_CYC }]);
+    h.brain.chase_requests.clear();
     assert_eq!(h.condition_activation(0, &f), 1);
     h.begin(1, [0; 6], &f);
     assert_eq!(h.brain.speech, Some(66));
@@ -382,6 +457,40 @@ fn a_tazer_is_drawn_then_hits_its_target_once() {
     h.update(1, [0; 6], &f);
     h.update(1, [0; 6], &f);
     assert_eq!(h.brain.chase_requests, vec![ChaseRequest::Taze { target: 3 }]);
+}
+
+#[test]
+fn putting_the_tazer_away_waits_for_the_holster_clip_then_deletes_the_prop() {
+    let behaviors = ops(&[("EndTaze", &[("want", "taze")])]);
+    let conditions = ops(&[]);
+    let mut brain = PedBrain { tazer_state: Some(2), tazer_drawn_requested: true, ..Default::default() };
+    brain.hand_prop.request(TAZER_PROP);
+    brain.hand_prop.holding = true;
+    let settings = BrainSettings::default();
+    let none = |_: u64| None;
+    let f = frame();
+    let mut h = BrainHost { behaviors: &behaviors, conditions: &conditions, brain: &mut brain, settings: &settings, position: [0.0; 3], heading: 0.0, skater: None, target_position: &none, chase: Default::default() };
+    h.begin(0, [0; 6], &f);
+    assert_eq!((h.brain.tazer_state, h.brain.tazer_drawn_requested), (Some(3), true), "state 3; the request stays until the clip ends");
+    assert_eq!(h.brain.chase_requests, vec![ChaseRequest::TazerClip { clip: TAZER_OUT }]);
+    h.brain.update_tazer_clip(&settings, Some((TAZER_OUT, true)), 0.4);
+    assert!(h.brain.hand_prop.has(), "holster clip still playing");
+    h.brain.update_tazer_clip(&settings, Some((TAZER_OUT, true)), 0.15);
+    assert_eq!((h.brain.tazer_state, h.brain.tazer_drawn_requested, h.brain.hand_prop.has()), (Some(0), false, false));
+    // A ped whose set lacks the clips does not get stuck drawing.
+    let mut b = PedBrain { tazer_state: Some(1), ..Default::default() };
+    b.update_tazer_clip(&settings, Some((TAZER_INTO, false)), 0.0);
+    assert_eq!(b.tazer_state, Some(2));
+    // A hand already holding something keeps it; no tazer prop.
+    let behaviors = ops(&[("DrawTazer", &[("want", "taze")])]);
+    let mut brain = PedBrain::default();
+    brain.hand_prop.request("can");
+    brain.hand_prop.holding = true;
+    let mut h = BrainHost { behaviors: &behaviors, conditions: &conditions, brain: &mut brain, settings: &settings, position: [0.0; 3], heading: 0.0, skater: None, target_position: &none, chase: Default::default() };
+    h.begin(0, [0; 6], &f);
+    h.brain.tick_timers(0.2);
+    h.update(0, [0; 6], &f);
+    assert_eq!(h.brain.hand_prop.key.as_deref(), Some("can"));
 }
 
 #[test]
@@ -597,6 +706,33 @@ fn plugin_flags_hold_while_their_behaviours_run() {
     assert!(!brain.own_plugin_object && !brain.ignore_standing_collisions && brain.explicit_turn.is_none());
 }
 
+/// A ped whose prop plugin ended keeps no waypoint: as a conversation partner it locks the conversation's waypoint and
+/// faces the centre, not the old seat (research b186: a kept seat waypoint flipped Speak / TurnToFace for minutes).
+#[test]
+fn a_released_prop_waypoint_lets_a_conversation_lock_its_own() {
+    let settings = BrainSettings::default();
+    let none = |_: u64| None;
+    let behaviors = [PedOp::LockFirstWaypoint];
+    let free = [[7.5, 0.0, 1.0]];
+    let conversation = || ConversationInfo { complete: false, speaker: None, center: [6.0, 0.0, 1.0], free_waypoints: &free, speech: None };
+    let mut brain = PedBrain { waypoint: Some([-1.0, 0.0, 0.0]), waypoint_facing: Some([0.0, 0.0, 1.0]), ..Default::default() };
+    {
+        let chase = ChaseView { conversation: Some(conversation()), ..Default::default() };
+        let mut h = BrainHost { behaviors: &behaviors, conditions: &[], brain: &mut brain, settings: &settings, position: [0.0; 3], heading: 0.0, skater: None, target_position: &none, chase };
+        h.begin(0, [0; 6], &frame());
+    }
+    assert_eq!(brain.waypoint, Some([-1.0, 0.0, 0.0]), "a held slot is not relocked (retail's gate)");
+    brain.release_plugin_waypoint();
+    assert_eq!((brain.waypoint, brain.waypoint_facing), (None, None));
+    {
+        let chase = ChaseView { conversation: Some(conversation()), ..Default::default() };
+        let mut h = BrainHost { behaviors: &behaviors, conditions: &[], brain: &mut brain, settings: &settings, position: [0.0; 3], heading: 0.0, skater: None, target_position: &none, chase };
+        h.begin(0, [0; 6], &frame());
+    }
+    assert_eq!(brain.waypoint, Some([7.5, 0.0, 1.0]));
+    assert!(matches!(brain.chase_requests.last(), Some(ChaseRequest::LockWaypoint { at }) if *at == [7.5, 0.0, 1.0]));
+}
+
 /// IsOnRoad (the stub, always false), SimpleRandom (percentage x 0.01 against a roll), IsAtWaypoint (3 m horizontal
 /// by default) and InSkaterRadius (3D).
 #[test]
@@ -743,7 +879,7 @@ fn a_wiping_chasee_is_not_taken_down_and_ends_the_chase_within_2_m() {
     let mut brain = PedBrain::default();
     brain.chasee = Some(100);
     brain.takedown_target = Some(100);
-    brain.takedown_choice = Some(super::super::takedown::TakedownChoice { entry: 0, mirrored: false, predicted: [0.0; 3] });
+    brain.takedown_choice = Some(super::super::takedown::TakedownChoice { entry: 0, mirrored: false, predicted: [0.0; 3], trips: false });
     let settings = BrainSettings::default();
     let f = frame();
     let view = ChaseView { me: 7, groups: Some(&groups), wiping: Some(&wiping_of), ..Default::default() };
@@ -878,10 +1014,51 @@ fn end_chase_resets_the_end_reason_and_unsets_angrychase() {
     brain.raise_mood_want("angrychase", 100, true, settings.mood_want_memory_seconds);
     brain.chasee = Some(100);
     brain.end_reason = Some(super::super::chase::reason::AGGRESSIVE_CAPTURE);
+    brain.target_unreachable = true;
     let none = |_: u64| None;
     let mut h = BrainHost { behaviors: &behaviors, conditions: &[], brain: &mut brain, settings: &settings, position: [0.0; 3], heading: 0.0, skater: None, target_position: &none, chase: Default::default() };
     h.begin(0, [0; 6], &f);
     assert_eq!((h.brain.chasee, h.brain.end_reason), (None, None));
+    assert!(!h.brain.target_unreachable, "no stale CannotReachChaseTarget into the next chase");
     assert!(!h.brain.wants.contains_key("angrychase"));
     assert_eq!(h.brain.chase_requests, vec![ChaseRequest::Leave { chasee: 100 }, ChaseRequest::MoodReset { target: 100 }]);
+}
+
+#[test]
+fn ending_the_plugin_graph_clears_the_seat_flags() {
+    // The Plugin behaviour's End runs the plugin graph's EndAllBehaviours (`8269F310` -> `82E0CFA0`, controller vtable
+    // +0x10 = `82C13498`, b300): a ped that leaves its seat owns no plugin object, stands no longer locked and takes
+    // standing collisions again.
+    use crate::graph::controller::{ActiveBehavior, Controller};
+    let behaviors = ops(&[("OwnPluginObject", &[]), ("IgnoreStandingCollisions", &[]), ("LockToCurrentPosition", &[])]);
+    let mut brain = PedBrain::default();
+    let settings = BrainSettings::default();
+    let none = |_: u64| None;
+    let f = frame();
+    let mut controller = Controller::new(0);
+    let mut h = BrainHost { behaviors: &behaviors, conditions: &[], brain: &mut brain, settings: &settings, position: [1.0, 0.0, 2.0], heading: 0.0, skater: None, target_position: &none, chase: Default::default() };
+    for behavior in 0..behaviors.len() {
+        let instance = h.allocate(behavior, &f);
+        h.begin(behavior, [0; 6], &f);
+        controller.active.push(ActiveBehavior { behavior, instance });
+    }
+    assert!(h.brain.own_plugin_object && h.brain.ignore_standing_collisions && h.brain.position_locked);
+    controller.end_all_behaviors(&mut h);
+    assert!(controller.active.is_empty());
+    assert!(!brain.own_plugin_object && !brain.ignore_standing_collisions && !brain.position_locked);
+    assert_eq!(brain.locked_at, None);
+}
+
+#[test]
+fn trip_reaction_names_round_trip_for_mod_data() {
+    use super::super::skater_contact::{ReactionDirection, ReactionKind};
+    for k in [ReactionKind::Knockdown, ReactionKind::Standing] {
+        assert_eq!(ReactionKind::from_name(k.name()), Some(k));
+    }
+    for d in [ReactionDirection::FromFront, ReactionDirection::FromBack, ReactionDirection::FromLeft, ReactionDirection::FromRight] {
+        assert_eq!(ReactionDirection::from_name(d.name()), Some(d));
+    }
+    assert_eq!(ReactionKind::from_name("knockdown"), None, "names are exact, as the mod patch validates them");
+    let s = BrainSettings::default();
+    assert_eq!((s.trip_kind, s.trip_direction), (ReactionKind::Knockdown, ReactionDirection::FromBack), "retail 826A5068");
 }

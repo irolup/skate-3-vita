@@ -102,12 +102,23 @@ pub(crate) fn launch_input(
 
 ///82D32088..32108, after Skeleton has published its real processed fields.
 pub(crate) fn sync_grab(skater: &mut SkaterRuntime) {
+    let input = grab_input(skater);
+    super::grab::sync(
+        &mut skater.biped_ground.ground,
+        &mut skater.offboard_grab,
+        skater.biped_ground.grab_settings,
+        input,
+    );
+}
+
+/// The Ground grab decision's inputs from the skater (82D32088..32108).
+pub(crate) fn grab_input(skater: &SkaterRuntime) -> super::grab::Input {
     let p = &skater.player_input.processed;
     let bone = compose_affine(
         &skater.animated_skeleton.roots.animation_to_world,
         &skater.animated_skeleton.record.pose[23],
     )[3];
-    let input = super::grab::Input {
+    super::grab::Input {
         frame: p
             .effective_anim_transform_192
             .map(|v| v.map(f32::from_bits)),
@@ -122,13 +133,7 @@ pub(crate) fn sync_grab(skater: &mut SkaterRuntime) {
             selection_flags_2948: p.actor_query_2948,
             matching_id_2952: p.actor_query_2952 as i32,
         },
-    };
-    super::grab::sync(
-        &mut skater.biped_ground.ground,
-        &mut skater.offboard_grab,
-        skater.biped_ground.grab_settings,
-        input,
-    );
+    }
 }
 
 ///82D6CA58 copies the actual gravity vector and submits; consumption remains
@@ -149,7 +154,7 @@ pub(crate) fn submit_air(
     skater
         .offboard_air_selector
         .launch(
-            &physics.world,
+            physics.biped_world(),
             packet,
             [gravity.x, gravity.y, gravity.z, 0.],
             context,

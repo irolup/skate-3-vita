@@ -143,20 +143,20 @@ fn synchronous_results_remain_staged_until_native_consume() {
     let mut owner = owner();
     let mut out = TrajectoryResult::default();
     owner
-        .launch(&world, packet(), [0., -9.8, 0., 0.], context())
+        .launch((&world).into(), packet(), [0., -9.8, 0., 0.], context())
         .unwrap();
     assert!(owner.core.sampling.pending_8492);
     owner.sample(0, core::DT, &mut out);
     assert!(!out.valid_404);
     assert_eq!(out.position_272, packet().position_32);
-    assert_eq!(owner.consume(&world, &[], context(), 0.4).unwrap(), Some(0));
+    assert_eq!(owner.consume((&world).into(), &[], context(), 0.4).unwrap(), Some(0));
     assert!(!owner.core.sampling.pending_8492);
     assert!(owner.core.sampling.preinitialized_8494);
     //The actual mask0x6000 rejects the plane in trajectory requests.
     assert!(!owner.core.selected_candidate.valid_120);
-    assert!(owner.requery(&world, context(), 0, 0).unwrap());
+    assert!(owner.requery((&world).into(), context(), 0, 0).unwrap());
     assert!(owner.core.requery_pending_8499);
-    owner.consume(&world, &[], context(), 0.4).unwrap();
+    owner.consume((&world).into(), &[], context(), 0.4).unwrap();
     assert!(!owner.core.requery_pending_8499);
     assert!(owner.core.sampling.restart_allowed_8493);
     assert!(!owner.core.sampling.preinitialized_8494);
@@ -167,7 +167,7 @@ fn failed_world_submission_preserves_owner_and_never_returns_fake_completion() {
     let mut owner = owner();
     assert!(
         owner
-            .launch(&world, packet(), [0., -9.8, 0., 0.], context())
+            .launch((&world).into(), packet(), [0., -9.8, 0., 0.], context())
             .is_err()
     );
     assert!(!owner.core.sampling.pending_8492);
@@ -179,13 +179,13 @@ fn launch_and_requery_share_slot_zero_and_consume_in_native_order() {
     let world = world(&[(QueryPool::Ground, -1, 1)], 0);
     let mut owner = owner();
     owner
-        .launch(&world, packet(), [0., -9.8, 0., 0.], context())
+        .launch((&world).into(), packet(), [0., -9.8, 0., 0.], context())
         .unwrap();
-    assert!(owner.requery(&world, context(), 0, 0).unwrap());
+    assert!(owner.requery((&world).into(), context(), 0, 0).unwrap());
     assert!(owner.core.sampling.pending_8492 && owner.core.requery_pending_8499);
     assert!(owner.completed_launch.is_some() && owner.completed_requery.is_some());
-    assert!(!owner.requery(&world, context(), 0, 0).unwrap());
-    assert_eq!(owner.consume(&world, &[], context(), 0.3).unwrap(), Some(0));
+    assert!(!owner.requery((&world).into(), context(), 0, 0).unwrap());
+    assert_eq!(owner.consume((&world).into(), &[], context(), 0.3).unwrap(), Some(0));
     assert!(!owner.core.sampling.pending_8492 && !owner.core.requery_pending_8499);
     assert!(owner.completed_launch.is_none() && owner.completed_requery.is_none());
     assert!(owner.core.sampling.restart_allowed_8493);
@@ -195,9 +195,9 @@ fn native_suppression_returns_before_pending_host_completion() {
     let world = world(&[(QueryPool::Ground, -1, 1)], 0);
     let mut owner = owner();
     owner
-        .launch(&world, packet(), [0., -9.8, 0., 0.], context())
+        .launch((&world).into(), packet(), [0., -9.8, 0., 0.], context())
         .unwrap();
-    assert!(!owner.requery(&world, context(), 0x10000000, 0).unwrap());
-    assert!(!owner.requery(&world, context(), 0, 0x400000).unwrap());
+    assert!(!owner.requery((&world).into(), context(), 0x10000000, 0).unwrap());
+    assert!(!owner.requery((&world).into(), context(), 0, 0x400000).unwrap());
     assert!(owner.core.sampling.pending_8492);
 }

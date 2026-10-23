@@ -19,6 +19,8 @@ use skate_core::{
 pub struct StaticScene<'a> {
     world: &'a BoardWorld,
     metadata: &'a QueryMetadata,
+    /// The DMO prop world, queried as pool bit 2 (`82764AB0`: world+0x5580, "DMOPool"; b218 / b221).
+    props: Option<(&'a BoardWorld, &'a QueryMetadata)>,
 }
 impl<'a> StaticScene<'a> {
     ///82C20728/82764AB0: caller-sized lines, poolmask7, facing3, no mesh or
@@ -110,9 +112,19 @@ impl<'a> StaticScene<'a> {
         }
         Ok(nearest)
     }
-    pub fn new(world: &'a BoardWorld) -> Result<Self, &'static str> {
-        let metadata = world.query_metadata()?;
-        Ok(Self { world, metadata })
+    /// A plain map, or a `BipedWorld` with the prop world as pool bit 2 (a prop world without query metadata is left
+    /// out).
+    pub fn new(world: impl Into<crate::physics::offboard::BipedWorld<'a>>) -> Result<Self, &'static str> {
+        let world = world.into();
+        let metadata = world.map.query_metadata()?;
+        let props = world.props.and_then(|props| props.query_metadata().ok().map(|metadata| (props, metadata)));
+        Ok(Self { world: world.map, metadata, props })
+    }
+    /// The worlds that answer `pool`: the map's meshes of that pool, then for pool 2 the prop world's (tagged Ground
+    /// there). Earlier sources win ties (`8276EE88`).
+    fn sources(&self, pool: QueryPool) -> impl Iterator<Item = (&'a BoardWorld, &'a QueryMetadata, QueryPool)> {
+        let props = self.props.filter(|_| pool == QueryPool::Island).map(|(w, m)| (w, m, QueryPool::Ground));
+        std::iter::once((self.world, self.metadata, pool)).chain(props)
     }
     fn pools(&self) -> impl Iterator<Item = QueryPool> {
         [
@@ -164,17 +176,15 @@ impl<'a> StaticScene<'a> {
         let direction = vec3(delta);
         let mut nearest = f32::MAX;
         let mut output = None;
-        let bounds = self
-            .world
-            .line_candidate_bounds(start, vec3(probe.end), probe.radius);
-        let candidates: Vec<_> = self
-            .world
+        for (world, metadata, mesh_pool) in self.sources(pool) {
+        let bounds = world.line_candidate_bounds(start, vec3(probe.end), probe.radius);
+        let candidates: Vec<_> = world
             .line_candidates(start, vec3(probe.end), probe.radius)
             .map(|(index, _)| index)
             .collect();
-        for mesh_index in self.world.candidate_mesh_indices(bounds)? {
-            let mesh = &self.metadata.meshes[mesh_index];
-            if mesh.pool != pool
+        for mesh_index in world.candidate_mesh_indices(bounds)? {
+            let mesh = &metadata.meshes[mesh_index];
+            if mesh.pool != mesh_pool
                 || !matches(group, mesh.matching_group)
                 || mesh.rejection_flags & reject != 0
             {
@@ -183,7 +193,7 @@ impl<'a> StaticScene<'a> {
             let first = candidates.partition_point(|&i| i < mesh.triangle_range.start);
             let last = candidates.partition_point(|&i| i < mesh.triangle_range.end);
             for &index in &candidates[first..last] {
-                let vertices = self.world.triangles()[index].triangle.vertices;
+                let vertices = world.triangles()[index].triangle.vertices;
                 let mut hit = TriangleLineHit {
                     position: Vector3::ZERO,
                     normal: Vector3::ZERO,
@@ -208,7 +218,7 @@ impl<'a> StaticScene<'a> {
                         position: lanes(hit.position),
                         normal: face(vertices.map(lanes)),
                         fraction,
-                        surface: self.metadata.packed_surfaces[index],
+                        surface: metadata.packed_surfaces[index],
                         geometry: mesh.geometry,
                         mesh_frame: [
                             vector4(transform.basis.columns[0]),
@@ -219,6 +229,7 @@ impl<'a> StaticScene<'a> {
                     });
                 }
             }
+        }
         }
         if pool == QueryPool::Ground
             && let Some(hit) = self.world.external_line(start, vec3(probe.end), probe.radius)
@@ -255,23 +266,21 @@ impl<'a> StaticScene<'a> {
         };
         if output.len() >= 64 { return Ok(output); }
         //82770E00 does not apply the trajectory mesh rejection mask here.
-        let bounds = self
-            .world
-            .line_candidate_bounds(vec3(center), vec3(center), radius);
-        let candidates: Vec<_> = self
-            .world
+        for (world, metadata, mesh_pool) in self.sources(pool) {
+        let bounds = world.line_candidate_bounds(vec3(center), vec3(center), radius);
+        let candidates: Vec<_> = world
             .line_candidates(vec3(center), vec3(center), radius)
             .map(|(index, _)| index)
             .collect();
-        for mesh_index in self.world.candidate_mesh_indices(bounds)? {
-            let mesh = &self.metadata.meshes[mesh_index];
-            if mesh.pool != pool || !matches(group, mesh.matching_group) {
+        for mesh_index in world.candidate_mesh_indices(bounds)? {
+            let mesh = &metadata.meshes[mesh_index];
+            if mesh.pool != mesh_pool || !matches(group, mesh.matching_group) {
                 continue;
             }
             let first = candidates.partition_point(|&i| i < mesh.triangle_range.start);
             let last = candidates.partition_point(|&i| i < mesh.triangle_range.end);
             for &index in &candidates[first..last] {
-                let vertices = self.world.triangles()[index].triangle.vertices.map(lanes);
+                let vertices = world.triangles()[index].triangle.vertices.map(lanes);
                 if triangle_box(vertices, center, radius) {
                     output.push(vertices);
                     if output.len() == 64 {
@@ -279,6 +288,7 @@ impl<'a> StaticScene<'a> {
                     }
                 }
             }
+        }
         }
         Ok(output)
     }

@@ -29,6 +29,14 @@ pub(crate) const PROP_OWNER_TAG: u64 = 1 << 62;
 /// Owner tag of living-world car rail records: (car serial, rail index).
 pub(crate) const CAR_OWNER_TAG: u64 = 1 << 63;
 
+/// Owner tag of skate.Park piece rail records: (piece id, rail index). Below [`PROP_OWNER_TAG`]: the pieces are fixed,
+/// and owners from that tag up count as moving rails (air_trajectory/grind.rs, player_input/grind/pre.rs).
+pub(crate) const PIECE_OWNER_TAG: u64 = 1 << 61;
+
+pub(crate) fn piece_owner(piece: u32, rail: usize) -> u64 {
+    PIECE_OWNER_TAG | (u64::from(piece) << 16) | (rail as u64 & 0xFFFF)
+}
+
 pub(crate) fn prop_owner(prop: u32, rail: usize) -> u64 {
     PROP_OWNER_TAG | (u64::from(prop) << 16) | (rail as u64 & 0xFFFF)
 }
@@ -45,7 +53,9 @@ pub(crate) fn prop_of_owner(owner: u64) -> Option<u32> {
 /// `map rail=N`, `prop=ID rail=N` or `car=SERIAL rail=N` for logs.
 pub(crate) fn describe_owner(owner: u64) -> String {
     let (id, rail) = ((owner >> 16) & 0x3FFF_FFFF_FFFF, owner & 0xFFFF);
-    if owner & CAR_OWNER_TAG != 0 {
+    if owner & (PIECE_OWNER_TAG | PROP_OWNER_TAG | CAR_OWNER_TAG) == PIECE_OWNER_TAG {
+        format!("park piece={id} rail={rail}")
+    } else if owner & CAR_OWNER_TAG != 0 {
         format!("car={id} rail={rail}")
     } else if owner & PROP_OWNER_TAG != 0 {
         format!("prop={id} rail={rail}")

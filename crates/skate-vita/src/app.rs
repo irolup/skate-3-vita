@@ -15,7 +15,6 @@ use std::time::{Duration, Instant};
 
 use glam::{Mat4, Vec3};
 use skate_sim::live::{self, Snapshot};
-use skate_ui::crossbar::{Action as Cb, Event as CbEvent, MenuDef, OptionDef, Outcome};
 use vita_pack::skater::Skater;
 use vita_platform::controls::sce;
 use vita_platform::vita;
@@ -23,7 +22,6 @@ use vita_render::scene::{Frame, Scene};
 use vita_render::ui::*;
 use vita_render::{course, math};
 
-use crate::crossbar_ui::MenuUi;
 use crate::hud::{self, Names};
 use crate::lab::{self, Shared};
 use crate::menu::{self, Menu, Row};
@@ -35,9 +33,78 @@ const SKATER_PACK: &str = "ux0:data/SKATEVITA/skater.pak";
 /// Scripted builds (benchmark replay, soak) start in play and ignore Start.
 const AUTOPLAY: bool = cfg!(any(feature = "replay", feature = "soak"));
 const TRICK_NAMES: &str = "vfs:/assets/private/hud/trick-names.txt";
+/// The APT texture holding the world behind the pause menu, and the paused frames drawn before it is captured.
+const FROZEN_WORLD: &str = "frozen-world";
+const FREEZE_AFTER_FRAMES: u32 = 4;
+/// The APT texture of the loading screen's background, and how long the loading screen waits at most.
+const LOADING_BACKGROUND: &str = "loading-background";
+const LOADING_LIMIT: Duration = Duration::from_secs(180);
+/// The Trick Guide's 3D demo (vita-bake `trickguide`): read from the card when the guide opens.
+const TRICK_GUIDE_PACK: &str = "ux0:data/SKATEVITA/trickguide.pak";
+
+/// Mounts `trickguide.pak` from the card (its `.idx`, written by vita-bake, lists the files); false without it.
+fn mount_trick_guide() -> bool {
+    let started = Instant::now();
+    match crate::packs::mount_on_card(TRICK_GUIDE_PACK, crate::packs::ROOT) {
+        Ok(n) => {
+            println!("trickguide.pak: {n} files on the card in {:.0} ms", started.elapsed().as_secs_f32() * 1000.0);
+            true
+        }
+        Err(e) => {
+            println!("{TRICK_GUIDE_PACK}: {e}; the Trick Guide has no demo");
+            false
+        }
+    }
+}
+
+/// The loading screen's background: the LiveArea picture (`static/sce_sys/pic0.png`, 960 x 544), as opaque RGBA
+/// with the bottom row first.
+fn loading_background() -> Result<Vec<u8>, String> {
+    let mut decoder = png::Decoder::new(&include_bytes!("../../../static/sce_sys/pic0.png")[..]);
+    decoder.set_transformations(png::Transformations::EXPAND);
+    let mut reader = decoder.read_info().map_err(|e| e.to_string())?;
+    let mut buf = vec![0; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).map_err(|e| e.to_string())?;
+    let (w, h) = (info.width as usize, info.height as usize);
+    if (w, h) != (math::WIDTH as usize, math::HEIGHT as usize) {
+        return Err(format!("pic0.png is {w} x {h}, not the screen's size"));
+    }
+    let channels = match info.color_type {
+        png::ColorType::Rgb => 3,
+        png::ColorType::Rgba => 4,
+        other => return Err(format!("pic0.png: unexpected colour type {other:?}")),
+    };
+    let mut rgba = Vec::with_capacity(w * h * 4);
+    for y in (0..h).rev() {
+        for px in buf[y * w * channels..(y + 1) * w * channels].chunks_exact(channels) {
+            rgba.extend_from_slice(&[px[0], px[1], px[2], 255]);
+        }
+    }
+    Ok(rgba)
+}
+
+/// The loading circle at the bottom right: a ring whose bright head turns once a second, its tail fading.
+fn draw_spinner(g: &mut Gfx, seconds: f32) {
+    const SEGMENTS: usize = 24;
+    let (centre, radius) = ([912.0, 496.0], 16.0);
+    let head = seconds * core::f32::consts::TAU;
+    for i in 0..SEGMENTS {
+        let a = head - i as f32 / SEGMENTS as f32 * core::f32::consts::TAU;
+        let b = a - core::f32::consts::TAU / SEGMENTS as f32;
+        let fade = 1.0 - i as f32 / SEGMENTS as f32;
+        g.line(
+            [centre[0] + radius * a.cos(), centre[1] + radius * a.sin()],
+            [centre[0] + radius * b.cos(), centre[1] + radius * b.sin()],
+            4.0,
+            [1.0, 1.0, 1.0, 0.15 + 0.85 * fade * fade],
+        );
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Screen {
+    /// The loading screen at startup: the world and every UI loader, then straight into the game.
+    Loading,
     Main,
     Pause,
     Playing,
@@ -52,6 +119,7 @@ enum Screen {
 impl Screen {
     fn name(self) -> &'static str {
         match self {
+            Screen::Loading => "loading",
             Screen::Main => "main menu",
             Screen::Pause => "pause menu",
             Screen::Playing => "playing",
@@ -75,28 +143,6 @@ impl Screen {
     /// The simulation steps on these screens.
     fn live(self) -> bool {
         matches!(self, Screen::Playing | Screen::Calibration { .. })
-    }
-}
-
-/// Which menu a main/pause screen shows. While the retail menus are wanted but still
-/// loading, nothing is drawn but a loading line (never the plain menu: it would flash
-/// up and then be replaced); the plain menus show when they are chosen or the retail
-/// ones are missing or failed.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum MenuMode {
-    Retail,
-    Loading,
-    Plain,
-}
-
-fn menu_mode(settings: &Settings, ui: &MenuUi) -> MenuMode {
-    if !settings.retail_menus {
-        return MenuMode::Plain;
-    }
-    match ui {
-        MenuUi::Absent | MenuUi::Failed(_) => MenuMode::Plain,
-        ui if ui.busy() => MenuMode::Loading,
-        _ => MenuMode::Retail,
     }
 }
 
@@ -185,9 +231,21 @@ pub fn run() -> ! {
     let mut marker_tried = false;
     let mut meter: Option<crate::retail_hud::Meter> = None;
     let mut analyzer: Option<crate::retail_hud::Analyzer> = None;
-    // The retail crossbar for the main and pause menus (None-like states: plain menus).
-    let mut menu_ui = MenuUi::Idle;
-    let mut crossbar_open: Option<Screen> = None;
+    // R2: the retail front end on upstream's runtime, the main and pause menu (the plain menus without it).
+    let mut fe_menus = crate::fe_menus::FeMenus::Idle;
+    // The screen of the previous frame: entering the pause screen opens the front end.
+    let mut fe_prev_screen = Screen::Main;
+    // The world behind the pause menu, captured once it stands still (frames shown on the pause screen so far).
+    let mut paused_frames = 0u32;
+    // The pause screen asked for the front end before it was ready: it opens once it is.
+    let mut fe_waiting = false;
+    let mut fe_input: Option<vita::Input> = None;
+    // Retail teleporters (ui.pak), and the game's buttons last frame (D-pad Up asks).
+    let mut teleporters = crate::teleporters::Teleporters::default();
+    let mut teleporters_loaded = false;
+    // The zombie cheat's colour grade (colour_grade.rs), loaded the first time the cheat is on.
+    let mut zombie_grade: Option<Option<vita_render::scene::Grade>> = None;
+    let mut teleporter_buttons: u16 = 0;
     let started = Instant::now();
     let mut scene = Scene::new(&course::mesh(&live::course_surfaces()));
     let mut streamer = crate::district_stream::Streamer::default();
@@ -214,11 +272,23 @@ pub fn run() -> ! {
     println!("renderer ready in {:.1} s", started.elapsed().as_secs_f32());
     crate::alloc::stage("renderer ready, audio started");
 
-    let mut screen = if AUTOPLAY { Screen::Playing } else { Screen::Main };
+    let mut screen = if AUTOPLAY { Screen::Playing } else { Screen::Loading };
+    // The loading screen's background, rows bottom first like a frame read back (`Apt::draw_screen`).
+    match loading_background() {
+        Ok(rgba) => apt.add_texture(LOADING_BACKGROUND, math::WIDTH as u32, math::HEIGHT as u32, &rgba),
+        Err(e) => println!("loading screen background: {e}"),
+    }
     let mut menus = Menus { cursors: [0; 3], world, replay: 0, replay_request: None };
     let mut buttons = menu::Buttons::default();
     let mut names: Option<Names> = None;
     let mut binding: Option<Binding> = None;
+    // The simulation rig's bone names (the Trick Guide demo's clips are matched to them).
+    let mut rig_names: Vec<String> = Vec::new();
+    // The Trick Guide's 3D demo while its screen is open (its set in the scene's demo slot), its skin palette, and
+    // whether trickguide.pak is mounted (None: not tried, Some(false): missing).
+    let mut trick_demo: Option<crate::trick_demo::Demo> = None;
+    let mut demo_palette: Vec<Mat4> = Vec::new();
+    let mut demo_pack: Option<bool> = None;
     let mut binding_error: Option<String> = None;
     let (mut a, mut b) = (empty_snapshot(), empty_snapshot());
     let mut palette = Vec::new();
@@ -243,11 +313,16 @@ pub fn run() -> ! {
     let mut hand_frames: Vec<(u16, Mat4, f32)> = Vec::new();
     let mut playback: Option<crate::session_replay::Playback> = None;
     let mut replay_note = String::new();
-    let mut replay_ui = crate::replay_ui::ReplayUi::Idle;
     let mut replay_glyphs: Vec<(String, [f32; 4])> = Vec::new();
-    let mut help_ui = crate::replay_ui::HelpUi::Idle;
-    let mut popup_ui = crate::replay_ui::PopupUi::Idle;
     let mut help_open = false;
+    // The retail replay screen on the menu stage (FE 12 / FE 13) takes the replay (else P1's own screens), and the
+    // help's page turns asked since the replay opened.
+    let mut retail_replay = false;
+    let mut help_turns: u32 = 0;
+    // The Finished menu is up as the menu stage's popup (it takes the pad; the replay gets none).
+    let mut finish_popup = false;
+    // The replay camera's last accepted position (retail's constraint state), and the seek count it belongs to.
+    let mut camera_guard: Option<(glam::Vec3, u64, Option<crate::replay_camera::Kind>)> = None;
     let mut replay_origin = Screen::Playing;
     let mut pending_replay: Option<(String, usize)> = None;
     let mut replay_input: Option<vita::Input> = None;
@@ -279,9 +354,8 @@ pub fn run() -> ! {
         let marker_view;
         let manual_view;
         let score_view;
-        let retail_menu;
-        let loading_menu;
         let boot_note;
+        let loading_view;
         let hud_note;
         let pending_park;
         let pending_props;
@@ -304,14 +378,12 @@ pub fn run() -> ! {
             // The UI loaders run one after another, and only once the first park has loaded:
             // they allocate heavily and slow each other and the park load many times over
             // when they overlap (device log: the park load took 45 s instead of 8 s). The
-            // crossbar, then the trick display, then the marker overlay.
+            // trick display, the marker overlay, the replay screens, then the retail front end (`fe_menus`, the main
+            // and pause menu; the plain menus stand in when it is missing).
             if crate::packs::MOUNTED.load(std::sync::atomic::Ordering::Relaxed) && s.bone_names.is_some() && !s.loading {
-                menu_ui.start(crossbar_menus(Screen::Main, &settings, world, world));
-                if !menu_ui.loading() {
-                    retail.start();
-                }
+                retail.start();
                 // The marker overlay needs ui.pak too (mounted by now).
-                if !marker_tried && !menu_ui.busy() && !retail.booting() && crate::packs::UI.load(std::sync::atomic::Ordering::Relaxed) {
+                if !marker_tried && !retail.booting() && crate::packs::UI.load(std::sync::atomic::Ordering::Relaxed) {
                     marker_tried = true;
                     match crate::retail_hud::Marker::load(&mut apt) {
                         Ok(m) => marker = Some(m),
@@ -329,9 +401,6 @@ pub fn run() -> ! {
                             Err(e) => println!("trick analyzer off: {e}"),
                         }
                     }
-                    // The replay editor then loads in the background (about 4 s of card reads):
-                    // after the loads above, which run on this thread and would wait behind it.
-                    replay_ui.start();
                 }
             }
             if names.is_none() && s.bone_names.is_some() {
@@ -346,6 +415,7 @@ pub fn run() -> ! {
                         Ok(bound) => {
                             println!("skater bound: {} joints to the stock rig", bound.len());
                             binding = Some(bound);
+                            rig_names = bone_names.clone();
                         }
                         Err(e) => {
                             println!("skater binding failed: {e}");
@@ -371,10 +441,143 @@ pub fn run() -> ! {
                 };
             }
             // Playing from the main menu waits until the UI loaders are done.
-            let boot = menu_ui.busy() || retail.booting() || (!marker_tried && crate::packs::UI.load(std::sync::atomic::Ordering::Relaxed));
-            let mode = menu_mode(&settings, &menu_ui);
+            let boot = retail.booting() || (!marker_tried && crate::packs::UI.load(std::sync::atomic::Ordering::Relaxed));
             let screen_before = screen;
-            let changed = handle_input(&mut screen, &mut menus, &mut settings, &mut s, pad.buttons, pressed, &mut quit, mode, &mut menu_ui, boot);
+            // While the R2 front end is open it takes the pad (below); Triangle alone in the pause menu opens it.
+            let fe_screen = |screen: Screen| matches!(screen, Screen::Main | Screen::Pause);
+            let fe_shown = fe_screen(screen) && fe_menus.shown();
+            let mut changed = if fe_shown { false } else { handle_input(&mut screen, &mut menus, &mut settings, &mut s, pad.buttons, pressed, &mut quit, boot) };
+            // Entering the pause screen (from playing, the controls page, the replay...) opens the front end, which
+            // waits with a note while it loads; the plain menus style keeps the plain pause menu.
+            if fe_screen(screen) && fe_prev_screen != screen && settings.retail_menus && !AUTOPLAY {
+                fe_waiting = fe_menus.loading() || fe_menus.ready();
+            }
+            fe_prev_screen = screen;
+            // Leaving the menus (or the front end failing) cancels the wait.
+            fe_waiting &= fe_screen(screen) && (fe_menus.loading() || fe_menus.ready());
+            if fe_waiting && fe_menus.ready() {
+                fe_waiting = false;
+                fe_menus.open(&settings, &crate::session_replay::choices(), screen == Screen::Main);
+            }
+            if fe_screen(screen) && fe_menus.shown() && !settings.retail_menus {
+                fe_menus.close_now();
+            }
+            if fe_screen(screen) && fe_menus.shown() {
+                let paused = screen == Screen::Pause;
+                let input = fe_input.get_or_insert_with(vita::Input::new);
+                let sample = input.poll();
+                let mut mapping = settings.controls;
+                (mapping.rear_touch_bumpers, mapping.front_touch_thumbs, mapping.dpad_bumpers) = (true, true, false);
+                let values = skate_core::input::xbox::convert(&input.xbox(&sample, &mapping), 0);
+                let update = fe_menus.update(&values, frame_dt, &mut settings);
+                changed |= update.settings_changed;
+                let mut left = false;
+                for choice in update.choices {
+                    use crate::vita_menus::Choice;
+                    left = true;
+                    match choice {
+                        Choice::Skate => {
+                            fe_menus.close();
+                            changed |= start_playing(&mut screen, &menus, &mut settings, &mut s);
+                        }
+                        Choice::Respawn => {
+                            s.respawn = true;
+                            fe_menus.close();
+                            screen = Screen::Playing;
+                        }
+                        Choice::World(w) => {
+                            menus.world = w.min(WORLDS.len() - 1);
+                            fe_menus.close();
+                            changed |= start_playing(&mut screen, &menus, &mut settings, &mut s);
+                        }
+                        Choice::MainMenu => {
+                            fe_menus.close_now();
+                            screen = Screen::Main;
+                        }
+                        Choice::Quit => quit = true,
+                        Choice::Controls => {
+                            fe_menus.close_now();
+                            screen = Screen::Controls { paused };
+                        }
+                        Choice::Calibration => {
+                            fe_menus.close_now();
+                            screen = Screen::Calibration { paused };
+                        }
+                        Choice::Replay(k) => {
+                            fe_menus.close_now();
+                            menus.replay_request = Some(k);
+                        }
+                        Choice::TrickAnalyzer | Choice::ManualMeter => {
+                            if choice == Choice::TrickAnalyzer {
+                                settings.trick_analyzer = !settings.trick_analyzer;
+                            } else {
+                                settings.manual_meter = !settings.manual_meter;
+                            }
+                            fe_menus.set_facts(&settings);
+                            changed = true;
+                            left = false;
+                        }
+                    }
+                }
+                // A Challenge Map location: here, or once its world has loaded (the sim thread waits for the load).
+                for (map, matrix) in update.teleports {
+                    left = true;
+                    fe_menus.close();
+                    match WORLDS.iter().position(|w| *w == map) {
+                        Some(w) => {
+                            s.teleport = Some(matrix);
+                            menus.world = w;
+                            changed |= start_playing(&mut screen, &menus, &mut settings, &mut s);
+                        }
+                        None => println!("challenge map: no world {map} on the Vita"),
+                    }
+                }
+                if !update.open && !left {
+                    menus.world = s.world_loaded;
+                    screen = Screen::Playing;
+                }
+                fe_prev_screen = screen;
+            }
+            // Retail teleporters (teleporters.rs): inside a volume the action overlay prompts, D-pad Up (not with LB, the
+            // session marker's) asks to confirm, Yes moves the skater (here, or once its world has loaded).
+            if !teleporters_loaded && crate::packs::UI.load(std::sync::atomic::Ordering::Relaxed) {
+                teleporters_loaded = true;
+                teleporters = crate::teleporters::Teleporters::load(&|p: &str| {
+                    skate_data::vfs::read(&std::path::Path::new(crate::packs::ROOT).join(p)).map_err(|e| e.to_string())
+                });
+            }
+            {
+                let input = fe_input.get_or_insert_with(vita::Input::new);
+                let sample = input.poll();
+                let x = input.xbox(&sample, &settings.controls);
+                let values = skate_core::input::xbox::convert(&x, 0);
+                use vita_platform::controls::xbox;
+                let up = x.buttons & !teleporter_buttons & xbox::DPAD_UP != 0 && x.buttons & xbox::LEFT_SHOULDER == 0;
+                teleporter_buttons = x.buttons;
+                let playing = screen == Screen::Playing && !AUTOPLAY;
+                let world = (playing && !s.loading && !s.reload).then(|| WORLDS[s.world_loaded]);
+                if let Some(e) = s.frames.back() {
+                    teleporters.track(world, e.current.root.translation.to_array());
+                }
+                if !playing && teleporters.asking() {
+                    teleporters.cancel();
+                }
+                let popup = (playing && up && fe_menus.has_signup()).then(|| teleporters.ask()).flatten();
+                let prompt = teleporters.prompt().filter(|_| playing).map(str::to_owned);
+                if let Some(choice) = fe_menus.hud(prompt, popup, frame_dt, &values) {
+                    if let Some(exit) = teleporters.choose(choice) {
+                        println!("teleporter: to {} ({})", exit.map, exit.locator);
+                        match WORLDS.iter().position(|w| w.eq_ignore_ascii_case(&exit.map)) {
+                            Some(w) => {
+                                s.teleport = Some(exit.matrix);
+                                menus.world = w;
+                                changed |= start_playing(&mut screen, &menus, &mut settings, &mut s);
+                            }
+                            None => println!("teleporter: no world {} on the Vita", exit.map),
+                        }
+                    }
+                }
+            }
             // The pause menu's Replay Editor: the instant replay, or a saved replay (its park loads first).
             if let Some(choice) = menus.replay_request.take() {
                 if choice == 0 {
@@ -402,7 +605,6 @@ pub fn run() -> ! {
                             if playback.is_some() {
                                 screen = Screen::Replay;
                                 crate::retail_audio::set_replaying(true);
-                                replay_ui.start();
                                 replay_prev = u16::MAX;
                             }
                         }
@@ -426,7 +628,6 @@ pub fn run() -> ! {
                     Some(_) => {
                         crate::retail_audio::set_replaying(true);
                         replay_prev = u16::MAX;
-                        replay_ui.start();
                     }
                     None => screen = Screen::Pause,
                 }
@@ -435,21 +636,6 @@ pub fn run() -> ! {
                 crate::retail_audio::set_replaying(false);
             }
             let in_menu = matches!(screen, Screen::Main | Screen::Pause);
-            let mode = menu_mode(&settings, &menu_ui);
-            retail_menu = in_menu && mode == MenuMode::Retail;
-            loading_menu = in_menu && mode == MenuMode::Loading;
-            if retail_menu && crossbar_open != Some(screen) {
-                menu_ui.open(crossbar_menus(screen, &settings, menus.world, s.world_loaded), 0, 0);
-                crossbar_open = Some(screen);
-            } else if !retail_menu {
-                crossbar_open = None;
-            }
-            if retail_menu {
-                if changed && crossbar_open == Some(screen) {
-                    menu_ui.refresh(crossbar_menus(screen, &settings, menus.world, s.world_loaded));
-                }
-                menu_ui.update();
-            }
             if changed {
                 s.settings = settings.controls;
                 s.difficulty = settings.difficulty;
@@ -464,20 +650,37 @@ pub fn run() -> ! {
                 settings.save();
             }
             retail.frame(&mut apt, &mut s, screen == Screen::Playing);
-            replay_ui.poll(&mut apt);
-            if replay_ui.loaded() {
-                help_ui.start();
+            // The Trick Guide's demo pack (its index only: the files stay on the card), mounted while the loading screen
+            // shows so the guide opens without a wait.
+            if demo_pack.is_none() && screen == Screen::Loading && crate::packs::MOUNTED.load(std::sync::atomic::Ordering::Relaxed) {
+                demo_pack = Some(mount_trick_guide());
             }
-            help_ui.poll(&mut apt);
-            if help_ui.available() {
-                popup_ui.start();
+            // The R2 front end loads last (the loaders slow each other down when they overlap).
+            if fe_menus.idle() && marker_tried {
+                fe_menus.start(settings, menu_worlds());
             }
-            popup_ui.poll(&mut apt);
+            fe_menus.frame(&mut apt, frame_dt);
             // The simulation is held while the HUD movie of a new session is built.
             let hud_wait = screen == Screen::Playing && retail.building() && !AUTOPLAY;
-            s.paused = !screen.live() || hud_wait;
-            menu_ui.frame(&mut apt);
-            boot_note = in_menu && (menu_ui.busy() || retail.booting());
+            s.paused = !screen.live() || hud_wait || teleporters.asking();
+            s.want_camera_world = screen == Screen::Replay;
+            boot_note = in_menu && retail.booting();
+            // The loading screen: until the world and every UI loader are ready (the pause menu included), then
+            // straight into the game. A world that failed (or a load past the limit) shows the main menu and its
+            // message instead.
+            if screen == Screen::Loading {
+                let world_ready = !s.loading && !s.reload && s.bone_names.is_some() && !s.frames.is_empty() && uploading.is_none();
+                let ui_ready = !retail.booting() && marker_tried && !fe_menus.loading();
+                if world_ready && ui_ready {
+                    println!("loading screen: ready in {:.1} s", started.elapsed().as_secs_f32());
+                    screen = Screen::Playing;
+                } else if (s.error.is_some() && !s.loading) || started.elapsed() > LOADING_LIMIT {
+                    println!("loading screen: gave up after {:.1} s (error {:?})", started.elapsed().as_secs_f32(), s.error);
+                    screen = Screen::Main;
+                }
+            }
+            // A world loading (startup, or another park or district) shows the loading screen.
+            loading_view = screen == Screen::Loading || (screen == Screen::Playing && (s.loading || s.reload) && !AUTOPLAY);
             hud_note = hud_wait;
             marker_view = s.marker;
             manual_view = s.manual;
@@ -505,19 +708,23 @@ pub fn run() -> ! {
                     left: [axis(x.left[0]), axis(x.left[1])],
                     right: [axis(x.right[0]), axis(x.right[1])],
                 };
-                let (controls, dt) = if help_open {
+                // The menu stage's pad (the Finished popup), in the same Xbox layout.
+                let fe_pad = skate_core::input::xbox::convert(&x, 0);
+                let (controls, dt) = if retail_replay && pb.finish.is_some() {
+                    // The Finished popup has the pad; the replay holds still under it.
+                    (crate::session_replay::Controls { held: 0, pressed: 0, lt: false, rt: false, left: [0.0; 2], right: [0.0; 2] }, 0.0)
+                } else if help_open {
                     if xpressed & vita_platform::controls::xbox::A != 0 {
-                        help_ui.next_page();
+                        help_turns += 1;
                     }
                     if xpressed & (vita_platform::controls::xbox::B | vita_platform::controls::xbox::START) != 0 {
-                        help_ui.close();
                         help_open = false;
                     }
                     // The replay holds still under the help pages.
                     (crate::session_replay::Controls { held: 0, pressed: 0, lt: false, rt: false, left: [0.0; 2], right: [0.0; 2] }, 0.0)
                 } else {
-                    if xpressed & vita_platform::controls::xbox::START != 0 && help_ui.available() {
-                        help_ui.open(pb.help_mode());
+                    // The help pages are the retail screen's (FE 13); without it there is no help.
+                    if xpressed & vita_platform::controls::xbox::START != 0 && retail_replay {
                         help_open = true;
                     }
                     (controls, frame_dt)
@@ -534,18 +741,69 @@ pub fn run() -> ! {
                     }
                     crate::session_replay::Outcome::Frame(step) => {
                         view = Some(rec.pair(pb.pos, &mut a, &mut b));
+                        // The world as recorded at the same time (a loaded replay has none: the world stays frozen).
+                        if let Some(time) = rec.world_time(pb.pos) {
+                            crate::world_replay::fill(time, &mut car_poses, &mut npc_poses, &mut ped_poses, &mut hand_poses, &mut prop_poses);
+                        }
                         pb.apply_camera(&rec, &mut a, &mut b);
+                        // Retail's replay camera constraint (b449): the shown camera out of walls, where the paused
+                        // session lends its collision world (a district's: only its loaded window).
+                        match (pb.constrained_kind(), view, s.camera_world.as_ref()) {
+                            (Some(kind), Some(alpha), Some(world)) => {
+                                use crate::replay_camera::{constrain, CameraCollision, Hit};
+                                let eye = a.camera.translation.lerp(b.camera.translation, alpha);
+                                // The line of sight starts at the body, not the feet (a sweep from the ground hits it).
+                                let anchor = a.root.translation.lerp(b.root.translation, alpha) + glam::Vec3::Y;
+                                // A seek, a new camera or a jump of over a metre is a cut: no last position.
+                                let old = camera_guard
+                                    .filter(|(p, seeks, k)| *seeks == pb.seeks && *k == Some(kind) && p.distance(eye) < 1.0)
+                                    .map(|(p, ..)| p);
+                                let free = kind == crate::replay_camera::Kind::Free;
+                                let c = constrain(old, eye, anchor, free, &CameraCollision::default(), |from, to, r| {
+                                    world.sweep(from, to, r).map(|(fraction, normal)| Hit { fraction, normal })
+                                });
+                                for snap in [&mut a, &mut b] {
+                                    snap.camera.translation = c.position;
+                                    if c.relook {
+                                        snap.camera.rotation = glam::Mat4::look_at_rh(c.position, anchor, glam::Vec3::Y).inverse().to_scale_rotation_translation().1;
+                                    }
+                                }
+                                camera_guard = Some((c.position, pb.seeks, Some(kind)));
+                            }
+                            _ => camera_guard = None,
+                        }
                         let frame = rec.frame(pb.pos as usize);
                         crate::retail_audio::publish_replay(frame.riding, step.steps, frame.camera, frame.cuts.wrapping_add(pb.seeks << 40), step.silenced);
-                        replay_ui.frame(&mut apt, &rec, pb);
-                        popup_ui.frame(pb.finish, &crate::session_replay::FINISH_ITEMS);
+                        retail_replay = fe_menus.replay(Some(pb.screen_feed(&rec, help_open, help_turns)), frame_dt, &fe_pad);
+                        if retail_replay {
+                            // The Finished menu (B): Upload Video (not on the Vita), Save Replay, Exit; B closes it.
+                            // Upload and Save keep it open with the outcome under it, as P1.
+                            if pb.finish.is_some() && !finish_popup {
+                                fe_menus.replay_popup(&crate::session_replay::FINISH_ITEMS);
+                                finish_popup = true;
+                            }
+                            if let Some(choice) = fe_menus.take_replay_choice() {
+                                finish_popup = false;
+                                match choice {
+                                    0 => *crate::session_replay::SAVE_STATUS.lock().unwrap() = "Uploading is not available on the Vita.".into(),
+                                    1 => {
+                                        let world = WORLDS[s.world_loaded];
+                                        if let Err(e) = crate::session_replay::save(&rec, pb, world) {
+                                            *crate::session_replay::SAVE_STATUS.lock().unwrap() = format!("Save failed: {e}");
+                                        }
+                                    }
+                                    2 => screen = replay_origin,
+                                    _ => pb.finish = None,
+                                }
+                            }
+                        }
                         replay_finish = pb.finish;
                         replay_zones = pb.zones(&rec);
                         photo_request = std::mem::take(&mut pb.photo);
                         let [_, start, end] = pb.fractions(&rec);
-                        replay_band = (!pb.hidden && !help_open && pb.finish.is_none() && matches!(pb.mode, crate::session_replay::Mode::Scrub | crate::session_replay::Mode::Main)).then_some((start, end, pb.mode == crate::session_replay::Mode::Main));
-                        replay_markers = if pb.mode == crate::session_replay::Mode::Main && !pb.hidden && !help_open && pb.finish.is_none() { pb.marker_fractions(&rec) } else { (Vec::new(), Vec::new()) };
-                        replay_note = if replay_ui.ready() {
+                        replay_band = (!retail_replay && !pb.hidden && !help_open && pb.finish.is_none() && matches!(pb.mode, crate::session_replay::Mode::Scrub | crate::session_replay::Mode::Main)).then_some((start, end, pb.mode == crate::session_replay::Mode::Main));
+                        replay_markers = if !retail_replay && pb.mode == crate::session_replay::Mode::Main && !pb.hidden && !help_open && pb.finish.is_none() { pb.marker_fractions(&rec) } else { (Vec::new(), Vec::new()) };
+                        replay_note = if retail_replay {
                             String::new()
                         } else {
                             format!(
@@ -583,6 +841,14 @@ pub fn run() -> ! {
                     stats.holds_total += 1;
                 }
             }
+            // The replay ended (Exit, or the screen changed under it): the retail replay screen closes now, before
+            // anything draws, so it never shows over the pause menu.
+            if screen != Screen::Replay && fe_menus.replay_open() {
+                fe_menus.replay(None, frame_dt, &[0.0; 24]);
+                retail_replay = false;
+                help_turns = 0;
+                finish_popup = false;
+            }
             if s.score.line <= 0.0 {
                 line_peak = 0.0;
             }
@@ -597,7 +863,7 @@ pub fn run() -> ! {
                 animation_bytes: s.animation_bytes,
             };
             if !matches!(screen, Screen::Calibration { .. }) {
-                let overlay = Overlay { screen, menus: &menus, settings: &settings, names: names.as_ref(), line_peak, info: &info, stats: &stats, retail_hud: retail.active(), retail_menu, loading_menu, boot: boot_note, hud_wait: hud_note, replay: &replay_note };
+                let overlay = Overlay { screen, menus: &menus, settings: &settings, names: names.as_ref(), line_peak, info: &info, stats: &stats, retail_hud: retail.active(), fe_menu: matches!(screen, Screen::Main | Screen::Pause) && (fe_menus.shown() || (settings.retail_menus && (fe_menus.ready() || fe_menus.loading()))), fe_waiting, loading_view, boot: boot_note, hud_wait: hud_note, replay: &replay_note };
                 overlay.draw(&mut gfx, &s);
                 draw_glyphs(&mut gfx, &replay_glyphs);
                 if screen == Screen::Replay {
@@ -608,7 +874,7 @@ pub fn run() -> ! {
                         }
                     }
                     if let Some(item) = replay_finish {
-                        if popup_ui.available() {
+                        if retail_replay {
                             // The retail popup is drawn; the outcome of a save goes under it.
                             let status = crate::session_replay::SAVE_STATUS.lock().unwrap().clone();
                             shadow(&mut gfx, 480.0 - width(&status, 1.0) / 2.0, 372.0, 1.0, WHITE, &status);
@@ -682,6 +948,59 @@ pub fn run() -> ! {
         if matches!(screen, Screen::Calibration { .. }) {
             gfx.present();
         } else {
+            // The world stands still behind the pause menu (the simulation is held): after a few frames (the shown
+            // pair settles at alpha 1) it is captured once and the capture is drawn instead of the scene (DownTown's
+            // scene took about 15 ms of every paused frame).
+            let freeze = matches!(screen, Screen::Pause | Screen::Main) && !AUTOPLAY;
+            paused_frames = if freeze { paused_frames.saturating_add(1) } else { 0 };
+            let frozen = freeze && apt.has_texture(FROZEN_WORLD);
+            if !freeze && apt.has_texture(FROZEN_WORLD) {
+                apt.remove_texture(FROZEN_WORLD);
+            }
+            // The Trick Guide's demo: its set loads when the guide opens (the screen is black then) and goes with it.
+            let demo_wanted = if matches!(screen, Screen::Pause | Screen::Main) { fe_menus.trick_guide_demo() } else { None };
+            let read = |p: &str| skate_data::vfs::read(&std::path::Path::new(crate::packs::ROOT).join(p)).map_err(|e| format!("{p}: {e}"));
+            if demo_wanted.is_some() && trick_demo.is_none() && demo_pack != Some(false) {
+                if *demo_pack.get_or_insert_with(mount_trick_guide) {
+                    let started = Instant::now();
+                    let loaded = read(&format!("{}/TrickGuide.map", crate::trick_demo::ROOT))
+                        .and_then(|b| vita_pack::map::Map::from_pack(&b))
+                        .and_then(|set| crate::trick_demo::Demo::load(&read).map(|demo| (set, demo)));
+                    match loaded {
+                        Ok((set, demo)) => {
+                            scene.load_demo(set.render);
+                            trick_demo = Some(demo);
+                            println!("trick guide demo: set loaded in {:.0} ms", started.elapsed().as_secs_f32() * 1000.0);
+                        }
+                        Err(e) => {
+                            println!("trick guide demo off: {e}");
+                            demo_pack = Some(false);
+                        }
+                    }
+                }
+            } else if demo_wanted.is_none() && trick_demo.is_some() {
+                trick_demo = None;
+                scene.unload_demo();
+                demo_palette = Vec::new();
+            }
+            let demo_view = match (&demo_wanted, &mut trick_demo) {
+                (Some((clip, track)), Some(demo)) => {
+                    demo.update(clip, *track, frame_dt, &read);
+                    demo.view(&rig_names)
+                }
+                _ => None,
+            };
+            if loading_view {
+                apt.draw_screen(LOADING_BACKGROUND);
+                draw_spinner(&mut gfx, started.elapsed().as_secs_f32());
+            } else if let (Some(v), Some(binding)) = (&demo_view, &mut binding) {
+                binding.palette(&v.snapshot, &v.snapshot, 1.0, &mut demo_palette);
+                let view_proj = math::projection_far(v.fov.unwrap_or(1.0), 100.0) * math::view(v.camera);
+                let eye = v.camera.w_axis.truncate();
+                scene.draw_demo(&Frame { view_proj, eye, palette: &demo_palette, props: &[], cars: &[], npcs: &[], peds: &[], hand_props: &[] });
+            } else if frozen {
+                apt.draw_screen(FROZEN_WORLD);
+            } else {
             let mut eye = Vec3::ZERO;
             let mut view_proj = math::projection(1.0) * math::view(Mat4::from_translation(Vec3::new(0.0, 4.0, 14.0)));
             if let Some(alpha) = view {
@@ -775,7 +1094,19 @@ pub fn run() -> ! {
                 .iter()
                 .map(|(model, m, a)| vita_render::scene::PedInstance { model: *model, palette: std::slice::from_ref(m), center: m.w_axis.truncate() - glam::Vec3::Y, tint_a: [0.0; 4], tint_b: [0.0; 4], alpha: *a, lod: 0 })
                 .collect();
+            let grade = if settings.zombie {
+                *zombie_grade.get_or_insert_with(|| crate::colour_grade::zombie(std::path::Path::new(crate::packs::ROOT)))
+            } else {
+                None
+            };
+            scene.set_grade(grade.unwrap_or(vita_render::scene::Grade::IDENTITY));
             scene.draw(&Frame { view_proj, eye, palette: if skinned { &palette } else { &[] }, props: &prop_instances, cars: &car_instances, npcs: &npcs, peds: &peds, hand_props: &hand_instances });
+            if freeze && paused_frames >= FREEZE_AFTER_FRAMES {
+                let started = Instant::now();
+                apt.add_texture(FROZEN_WORLD, math::WIDTH as u32, math::HEIGHT as u32, &vita_render::read_rgba());
+                println!("pause: world captured in {:.1} ms", started.elapsed().as_secs_f32() * 1000.0);
+            }
+            }
             if photo_request {
                 // The picture without the editor's panels.
                 let text = match crate::session_replay::save_photo(vita_render::screenshot_bmp()) {
@@ -788,31 +1119,34 @@ pub fn run() -> ! {
             if let Some(m) = &mut marker {
                 m.advance();
             }
-            if retail_menu {
-                menu_ui.draw(&mut apt);
-            }
-            replay_glyphs = if screen == Screen::Replay { replay_ui.draw(&mut apt) } else { Vec::new() };
-            if screen == Screen::Replay {
-                help_ui.update();
-                let over = help_ui.draw(&mut apt);
-                if help_open {
-                    // The help pages cover the editor: only their glyphs show.
-                    replay_glyphs = over;
-                }
-                let finish = popup_ui.draw(&mut apt);
-                if !finish.is_empty() {
-                    replay_glyphs = finish;
-                }
-                // The face buttons and sticks as textured icons in their slots (the plates, the
-                // D-pad and the stick letters are drawn over them with the overlay).
+            // Open over the pause menu, or its outro over the game; the controller glyphs its prompts leave to us.
+            let fe_glyphs = fe_menus.draw(&mut apt);
+            let icons: Vec<_> = fe_glyphs
+                .iter()
+                .filter_map(|(name, [x, y, w, h])| crate::button_icons::Icon::of(name).map(|icon| crate::button_icons::draw(icon, *x, *y, w.min(*h))))
+                .collect();
+            apt.draw(&icons);
+            replay_glyphs = Vec::new();
+            // The menus' plates (L, R, the touch zones, the D-pad...) are drawn with the replay screens' (next overlay).
+            replay_glyphs.extend(fe_glyphs);
+            if screen == Screen::Replay && retail_replay {
+                // The retail screen, its help and the Finished popup drew with the menus (their glyphs came with them).
                 let icons: Vec<_> = replay_glyphs
                     .iter()
                     .filter_map(|(name, [x, y, w, h])| crate::button_icons::Icon::of(name).map(|icon| crate::button_icons::draw(icon, *x, *y, w.min(*h))))
                     .collect();
                 apt.draw(&icons);
-            } else if help_open {
-                help_ui.close();
+            } else if screen != Screen::Replay {
                 help_open = false;
+            }
+            if screen != Screen::Replay {
+                // The retail replay screen closes with the replay; the next one starts with the first help page.
+                if retail_replay {
+                    fe_menus.replay(None, frame_dt, &[0.0; 24]);
+                }
+                retail_replay = false;
+                help_turns = 0;
+                finish_popup = false;
             }
             if screen == Screen::Playing {
                 if let Some(m) = &mut marker {
@@ -843,12 +1177,12 @@ pub fn run() -> ! {
             }
             let damaged = crate::packs::DAMAGED.lock().unwrap().clone();
             if let Some(problem) = damaged.or_else(|| pack_error.clone()).or_else(|| binding_error.clone()).or_else(|| retail.failure().map(|e| format!("retail HUD off: {e}")))
-                .or_else(|| menu_ui.failure().map(|e| format!("retail menus off: {e}"))) {
+                .or_else(|| fe_menus.failure().map(|e| format!("retail menus off: {e}"))) {
                 gfx.text(12.0, 530.0, 1.0, RED, &lab::truncate(&problem, 110));
             }
             gfx.draw();
             stats.cpu_us_sum += frame_start.elapsed().as_micros() as u64;
-            vita_render::swap();
+            vita_render::swap(fe_menus.keyboard_running());
         }
         stats.frame(&info);
     }
@@ -874,8 +1208,6 @@ fn handle_input(
     held: u32,
     pressed: u32,
     quit: &mut bool,
-    mode: MenuMode,
-    ui: &mut MenuUi,
     boot: bool,
 ) -> bool {
     // Select + Triangle on any menu: the retail crossbar or the plain menus.
@@ -889,7 +1221,7 @@ fn handle_input(
         return false;
     }
     match *screen {
-        Screen::Replay => false,
+        Screen::Loading | Screen::Replay => false,
         Screen::Playing => {
             // Select alone (a tap, no other button during it): the replay, as in the retail game.
             use std::sync::atomic::{AtomicU8, Ordering};
@@ -934,9 +1266,6 @@ fn handle_input(
             }
             false
         }
-        Screen::Main | Screen::Pause if mode == MenuMode::Retail => handle_crossbar(ui, screen, menus, settings, s, pressed, quit, boot),
-        // Loading the retail menus: only the Select + Triangle chord (above) works.
-        Screen::Main | Screen::Pause if mode == MenuMode::Loading => false,
         Screen::Main | Screen::Pause | Screen::Settings { .. } => {
             let (slot, mut m, actions) = build_menu(*screen, s, settings, menus.world);
             m.cursor = menus.cursors[slot].min(m.rows.len() - 1);
@@ -1073,6 +1402,25 @@ fn handle_input(
 
 /// Starts (or resumes) play; loads another park when one is selected or the last load
 /// failed. Returns whether the settings changed (the selected park is saved).
+/// The worlds of the retail pause menu's lists (`vita_menus`): the parks, the districts, then Skate School and the
+/// course (the crossbar's column holds six rows).
+fn menu_worlds() -> crate::vita_menus::Worlds {
+    let at = |name: &str| WORLDS.iter().position(|w| *w == name).unwrap_or(0);
+    let list = |names: &[(&'static str, &'static str)]| names.iter().map(|(w, label)| (at(w), *label)).collect();
+    crate::vita_menus::Worlds {
+        parks: list(&[
+            ("StartPark", "Start Park"),
+            ("MegaPark", "Mega Park"),
+            ("BlackBoxPark", "Black Box"),
+            ("IndustrialSkatePark", "Industrial Park"),
+            ("DownTownSkatePark", "Downtown Park"),
+            ("MaloofMoneyCup", "Maloof Cup"),
+        ]),
+        districts: list(&[("Industrial", "Industrial"), ("University", "University"), ("DownTown", "Downtown")]),
+        training: list(&[("SkateSchool", "Skate School"), ("Course", "Course")]),
+    }
+}
+
 fn start_playing(screen: &mut Screen, menus: &Menus, settings: &mut Settings, s: &mut Shared) -> bool {
     *screen = Screen::Playing;
     if menus.world != s.world_loaded || s.error.is_some() && !s.loading {
@@ -1082,261 +1430,6 @@ fn start_playing(screen: &mut Screen, menus: &Menus, settings: &mut Settings, s:
         return true;
     }
     false
-}
-
-/// One frame of input on the retail crossbar (main and pause menu). Returns whether the
-/// settings changed.
-fn handle_crossbar(
-    ui: &mut MenuUi,
-    screen: &mut Screen,
-    menus: &mut Menus,
-    settings: &mut Settings,
-    s: &mut Shared,
-    pressed: u32,
-    quit: &mut bool,
-    boot: bool,
-) -> bool {
-    let event = [
-        (sce::UP, CbEvent::Up),
-        (sce::DOWN, CbEvent::Down),
-        (sce::LEFT, CbEvent::Left),
-        (sce::RIGHT, CbEvent::Right),
-        (sce::CROSS, CbEvent::Accept),
-        (sce::CIRCLE, CbEvent::Back),
-    ]
-    .into_iter()
-    .find(|(bit, _)| pressed & bit != 0)
-    .map(|(_, e)| e);
-    let Some(event) = event else { return false };
-    let paused = *screen == Screen::Pause;
-    match ui.event(event) {
-        Outcome::None => false,
-        Outcome::Close => {
-            if paused {
-                menus.world = s.world_loaded;
-                *screen = Screen::Playing;
-            }
-            false
-        }
-        Outcome::Chosen(action, value) => {
-            let on = value == Some(1);
-            match action {
-                // Starting from the main menu waits for the UI loaders (see `boot` in `run`).
-                Cb::Skate if boot => false,
-                Cb::Park | Cb::District if boot && !paused => false,
-                Cb::Skate | Cb::Resume => start_playing(screen, menus, settings, s),
-                Cb::Respawn => {
-                    s.respawn = true;
-                    *screen = Screen::Playing;
-                    false
-                }
-                Cb::MainMenu => {
-                    *screen = Screen::Main;
-                    false
-                }
-                Cb::Replay => {
-                    menus.replay_request = Some(value.unwrap_or(0));
-                    false
-                }
-                Cb::Quit => {
-                    *quit = true;
-                    false
-                }
-                Cb::District => {
-                    if let Some(k) = value {
-                        menus.world = (crate::packs::PARKS + k).min(WORLDS.len() - 1);
-                    }
-                    start_playing(screen, menus, settings, s)
-                }
-                Cb::Park => {
-                    if let Some(k) = value {
-                        menus.world = k.min(WORLDS.len() - 1);
-                    }
-                    start_playing(screen, menus, settings, s)
-                }
-                Cb::Difficulty => {
-                    settings.difficulty = match value {
-                        Some(0) => crate::settings::Difficulty::Easy,
-                        Some(2) => crate::settings::Difficulty::Hardcore,
-                        _ => crate::settings::Difficulty::Normal,
-                    };
-                    true
-                }
-                Cb::Physics => {
-                    settings.fast_physics = value != Some(1);
-                    true
-                }
-                Cb::AiSkaters => {
-                    settings.ai_skaters = value != Some(0);
-                    true
-                }
-                Cb::Pedestrians => {
-                    if let Some(k) = value {
-                        settings.pedestrians = (k as u8).min(crate::settings::PEDESTRIANS.len() as u8 - 1);
-                    }
-                    true
-                }
-                Cb::Traffic => {
-                    if let Some(k) = value {
-                        settings.traffic = (k as u8).min(crate::settings::TRAFFIC.len() as u8 - 1);
-                    }
-                    true
-                }
-                Cb::Controls => {
-                    *screen = Screen::Controls { paused };
-                    false
-                }
-                Cb::Calibration => {
-                    *screen = Screen::Calibration { paused };
-                    false
-                }
-                Cb::RearTouch => {
-                    settings.controls.rear_touch_bumpers = on;
-                    true
-                }
-                Cb::DpadBumpers => {
-                    settings.controls.dpad_bumpers = on;
-                    true
-                }
-                Cb::FrontTouch => {
-                    settings.controls.front_touch_thumbs = on;
-                    true
-                }
-                Cb::Volume => {
-                    settings.volume = (value.unwrap_or(4) * 2).min(10) as u8;
-                    true
-                }
-                Cb::DebugHud => {
-                    settings.debug_hud = on;
-                    true
-                }
-                Cb::Audio => {
-                    settings.retail_audio = value != Some(1);
-                    true
-                }
-                Cb::OnScreenHelp => {
-                    match value {
-                        Some(0) => settings.trick_analyzer = !settings.trick_analyzer,
-                        Some(1) => settings.manual_meter = !settings.manual_meter,
-                        _ => {}
-                    }
-                    true
-                }
-                Cb::MenuStyle => {
-                    settings.retail_menus = value == Some(0);
-                    true
-                }
-            }
-        }
-    }
-}
-
-/// The crossbar's menus for the main or the pause menu.
-fn crossbar_menus(screen: Screen, settings: &Settings, world: usize, world_loaded: usize) -> Vec<MenuDef> {
-    let option = |name: &str, icon: &'static str, help: &str, action: Cb, values: &[&str], current: usize| OptionDef {
-        name: name.to_owned(),
-        icon,
-        help: help.to_owned(),
-        action,
-        values: values.iter().map(|v| (*v).to_owned()).collect(),
-        current,
-    };
-    let paused = screen == Screen::Pause;
-    let parks: Vec<&str> = WORLDS[..crate::packs::PARKS].to_vec();
-    let districts: Vec<&str> = WORLDS[crate::packs::PARKS..].to_vec();
-    let on_off = |b: bool| usize::from(b);
-    let state = |b: bool| if b { "On" } else { "Off" };
-    let help_a = format!("Enable Trick Analyzer: {}", state(settings.trick_analyzer));
-    let help_b = format!("Manual Meter: {}", state(settings.manual_meter));
-    let mut skate = Vec::new();
-    if paused {
-        skate.push(option("Resume", "freeskate", "Back to skating.", Cb::Resume, &[], 0));
-        skate.push(option("Respawn", "restart", "Return to this park's spawn point.", Cb::Respawn, &[], 0));
-        let replays = crate::session_replay::choices();
-        let replays: Vec<&str> = replays.iter().map(String::as_str).collect();
-        skate.push(option("Replay Editor", "view", "Watch and edit the last minute (Instant replay) or a saved replay.", Cb::Replay, &replays, 0));
-    } else {
-        skate.push(option("Skate", "freeskate", "Start skating.", Cb::Skate, &[], 0));
-    }
-    skate.push(option(
-        "Park",
-        "skatepark",
-        if world == world_loaded { "Choose where to skate." } else { "Loads the selected park and starts skating." },
-        Cb::Park,
-        &parks,
-        world.min(crate::packs::PARKS - 1),
-    ));
-    skate.push(option(
-        "District",
-        "skatepark",
-        "A campaign district, loaded in pieces while you skate (University, DownTown, Industrial).",
-        Cb::District,
-        &districts,
-        world.saturating_sub(crate::packs::PARKS),
-    ));
-    skate.push(option(
-        "Difficulty",
-        "settings",
-        "How forgiving the board is. Easy, Normal or Hardcore.",
-        Cb::Difficulty,
-        &["Easy", "Normal", "Hardcore"],
-        match settings.difficulty {
-            crate::settings::Difficulty::Easy => 0,
-            crate::settings::Difficulty::Normal => 1,
-            crate::settings::Difficulty::Hardcore => 2,
-        },
-    ));
-    skate.push(option(
-        "Physics",
-        "settings",
-        "Fast solves the board and body in fewer steps (smooth on the Vita); Retail matches the game exactly but can slow down.",
-        Cb::Physics,
-        &["Fast", "Retail"],
-        usize::from(!settings.fast_physics),
-    ));
-    if paused {
-        skate.push(option("Main menu", "quitsession", "Back to the main menu.", Cb::MainMenu, &[], 0));
-    }
-    skate.push(option("Quit", "quit", "Leave the game.", Cb::Quit, &[], 0));
-    let c = &settings.controls;
-    // The living world's densities in a WORLD menu (like retail's Free Play options; a menu
-    // shows at most nine options).
-    let traffic: Vec<&str> = crate::settings::TRAFFIC.iter().map(|t| t.0).collect();
-    let pedestrians: Vec<&str> = crate::settings::PEDESTRIANS.iter().map(|t| t.0).collect();
-    vec![
-        MenuDef { name: "SKATE", icon: "singleplayer", options: skate },
-        MenuDef {
-            name: "LEARN",
-            icon: "learn",
-            options: vec![
-                option("Controls", "trickguide", "Which button does what.", Cb::Controls, &[], 0),
-                option("On Screen Help", "onscreenhelp", "Pick Enable Trick Analyzer or Manual Meter to switch it on or off.", Cb::OnScreenHelp, &[help_a.as_str(), help_b.as_str()], 0),
-                option("Stick calibration", "onscreenhelp", "Check that both sticks reach every direction.", Cb::Calibration, &[], 0),
-            ],
-        },
-        MenuDef {
-            name: "WORLD",
-            icon: "options",
-            options: vec![
-                option("Traffic", "settings", "Cars on the district streets. Retail is the game's density (up to 15 cars; can slow down on the Vita); Low and Medium fewer.", Cb::Traffic, &traffic, usize::from(settings.traffic)),
-                option("Pedestrians", "settings", "People walking the districts. Retail is the game's density (can slow down on the Vita); Low and Medium fewer.", Cb::Pedestrians, &pedestrians, usize::from(settings.pedestrians)),
-                option("AI Skaters", "settings", "Other skaters riding the districts' lines (the game's three).", Cb::AiSkaters, &["Off", "On"], on_off(settings.ai_skaters)),
-            ],
-        },
-        MenuDef {
-            name: "OPTIONS",
-            icon: "options",
-            options: vec![
-                option("Rear touch", "settings", "Rear touch left and right act as LB and RB.", Cb::RearTouch, &["Off", "On"], on_off(c.rear_touch_bumpers)),
-                option("D-pad bumpers", "settings", "D-pad left and right act as LB and RB.", Cb::DpadBumpers, &["Off", "On"], on_off(c.dpad_bumpers)),
-                option("Front touch", "settings", "Front touch left and right act as L3 and R3.", Cb::FrontTouch, &["Off", "On"], on_off(c.front_touch_thumbs)),
-                option("Volume", "settings", "Sound level, 0 to 10.", Cb::Volume, &["0", "2", "4", "6", "8", "10"], usize::from(settings.volume / 2)),
-                option("Audio", "settings", "Retail: the game's own board sounds (about 50 MB of memory). Synth: the light procedural sounds. Back to Synth frees the memory at the next launch.", Cb::Audio, &["Retail", "Synth"], usize::from(!settings.retail_audio)),
-                option("Debug overlay", "view", "Frame rate, tick time and memory (Select + Start).", Cb::DebugHud, &["Off", "On"], on_off(settings.debug_hud)),
-                option("Menu style", "view", "Retail menus or the plain menus. Select + Triangle switches any time.", Cb::MenuStyle, &["Retail", "Plain"], usize::from(!settings.retail_menus)),
-            ],
-        },
-    ]
 }
 
 /// A menu screen's rows and their actions, and the index of its remembered cursor.
@@ -1419,10 +1512,12 @@ struct Overlay<'a> {
     stats: &'a Stats,
     /// The original HUD movie is drawing: the basic HUD stays off.
     retail_hud: bool,
-    /// The retail crossbar is the menu shown: the plain menu stays off.
-    retail_menu: bool,
-    /// The retail menu is wanted but still loading: only a loading line shows.
-    loading_menu: bool,
+    /// The R2 front end is open over the pause menu.
+    fe_menu: bool,
+    /// Triangle asked for the R2 front end, still loading.
+    fe_waiting: bool,
+    /// The loading screen shows (startup, a world loading).
+    loading_view: bool,
     /// The UI loaders are still running: starting play waits.
     boot: bool,
     /// The HUD movie of the new session is being built: the simulation is held.
@@ -1445,16 +1540,19 @@ fn width(text: &str, scale: f32) -> f32 {
 
 impl Overlay<'_> {
     fn draw(&self, g: &mut Gfx, s: &Shared) {
+        // The loading screen is the picture and its circle only.
+        if self.loading_view {
+            return;
+        }
+        if self.fe_waiting {
+            shadow(g, 40.0, 496.0, 1.0, WHITE, "Loading the retail pause menu... (it opens when ready)");
+        }
         match self.screen {
+            Screen::Loading => {}
             Screen::Playing if self.retail_hud => {}
             Screen::Playing => self.hud(g, &s.score),
             Screen::Controls { .. } => controls_page(g),
-            Screen::Main | Screen::Pause if self.loading_menu => {
-                shadow(g, 40.0, 516.0, 1.0, GREY, "Select + Triangle: plain menus");
-            }
-            Screen::Main | Screen::Pause if self.retail_menu => {
-                shadow(g, 40.0, 516.0, 1.0, GREY, "D-pad move  Cross choose  Circle back  Select+Triangle: plain menus");
-            }
+            Screen::Main | Screen::Pause if self.fe_menu => {}
             Screen::Main | Screen::Pause | Screen::Settings { .. } => self.menu(g, s),
             Screen::Replay => {
                 shadow(g, 12.0, 516.0, 1.0, WHITE, self.replay);
@@ -1481,8 +1579,6 @@ impl Overlay<'_> {
             Some(format!("Loading {}...", WORLDS[s.world]))
         } else if self.hud_wait {
             Some("Loading the HUD...".to_owned())
-        } else if self.loading_menu {
-            Some("Loading the menu...".to_owned())
         } else if self.boot && self.screen == Screen::Main {
             Some("Loading the menus and the HUD...".to_owned())
         } else {
@@ -1704,6 +1800,7 @@ fn draw_glyphs(g: &mut Gfx, glyphs: &[(String, [f32; 4])]) {
             "L_Bumper_hud" => plate(g, "rL"),
             "R_Bumper_hud" => plate(g, "rR"),
             "L3_Click_hud" => plate(g, "fL"),
+            "R3_Click_hud" => plate(g, "fR"),
             "Stick_Left_hud" => fitted(g, "L", sw),
             "Stick_Right_hud" => fitted(g, "R", sw),
             "DPad_Left_hud" | "DPad_Right_hud" | "DPad_Up_hud" | "DPad_Down_hud" | "DPad_UpDown_hud" | "DPad_Arrows_hud" => {

@@ -1,0 +1,16 @@
+[package]
+name = "menu-tables"
+description = "Writes menu-tables.json from your own default.xex with the skate-3-rust-engine checkout's extractor"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+publish = false
+
+# Its own workspace: it builds against the reference checkout next to this repo
+# (scripts/setup-references.sh), not against this repo's crates.
+[workspace]
+
+[dependencies]
+# The extractor and the executable unpacker live only in the reference checkout: this repo
+# contains neither (README, "Making your own game data").
+skate-data = { path = "../../../skate-3-rust-engine/crates/skate-data" }

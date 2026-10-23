@@ -34,10 +34,23 @@ pub fn init() {
     }
 }
 
-/// Shows the frame (waits for vblank).
+/// Shows the frame (waits for vblank); `dialog`: a system dialog (the keyboard) runs and draws over it.
 #[cfg(target_os = "vita")]
-pub fn swap() {
-    unsafe { vgl::vglSwapBuffers(vgl::GL_FALSE) };
+pub fn swap(dialog: bool) {
+    unsafe { vgl::vglSwapBuffers(if dialog { vgl::GL_TRUE } else { vgl::GL_FALSE }) };
+}
+
+#[cfg(target_os = "vita")]
+/// The frame buffer as RGBA8, opaque (alpha 255), bottom row first (GL's order): `WIDTH` x `HEIGHT`.
+pub fn read_rgba() -> Vec<u8> {
+    use vgl::*;
+    let (w, h) = (math::WIDTH as usize, math::HEIGHT as usize);
+    let mut rgba = vec![0u8; w * h * 4];
+    unsafe { glReadPixels(0, 0, w as GLsizei, h as GLsizei, GL_RGBA, GL_UNSIGNED_BYTE, rgba.as_mut_ptr().cast()) };
+    for px in rgba.chunks_exact_mut(4) {
+        px[3] = 255;
+    }
+    rgba
 }
 
 #[cfg(target_os = "vita")]

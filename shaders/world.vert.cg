@@ -3,16 +3,17 @@
 uniform float4x4 viewproj;
 uniform float3 eye;
 uniform float2 fog; // start, end distance in metres
+uniform float2 gradeDepth; // the grade's near distance and 1 / (far - near)
 
 void main(
 	float3 aPosition,
 	float4 aColor,
 	float4 out vColor : COLOR,
-	float out vFog : TEXCOORD0,
+	float2 out vFog : TEXCOORD0, // fog, grade weight
 	float4 out gl_Position : POSITION
 ) {
 	gl_Position = mul(float4(aPosition, 1.0f), viewproj);
 	vColor = aColor;
 	float d = distance(aPosition, eye);
-	vFog = saturate((fog.y - d) / (fog.y - fog.x));
+	vFog = float2(saturate((fog.y - d) / (fog.y - fog.x)), saturate((gl_Position.w - gradeDepth.x) * gradeDepth.y));
 }

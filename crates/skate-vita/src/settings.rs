@@ -92,6 +92,9 @@ pub struct Settings {
     pub ai_skaters: bool,
     /// The pedestrian density, an index into `PEDESTRIANS` (Off, Low, Medium, Retail).
     pub pedestrians: u8,
+    /// The zombie cheat (Extras > Enter Cheat Code `zombie`): for the session only, never saved (retail keeps it on
+    /// the simulation, not in the profile, b304).
+    pub zombie: bool,
 }
 
 /// The Pedestrians setting's choices: (label, density), retail's Free Play scale semantics
@@ -100,6 +103,9 @@ pub const PEDESTRIANS: [(&str, f32); 4] = [("Off", 0.0), ("Low", 0.25), ("Medium
 /// Off on the Vita: peds cost about 0.5 ms a tick each and 25-30 MB of data, and DownTown with
 /// traffic and NPC skaters ran out of heap with them on the device; switchable in WORLD.
 const PEDESTRIANS_DEFAULT: u8 = 0;
+/// The peds at most under the zombie cheat (retail's pool is 31). NOT RETAIL: the Vita's frame time with angry peds
+/// (device-tuned).
+const ZOMBIE_PEDS: u32 = 8;
 
 /// The Traffic setting's choices: (label, density). The density scales each census area's
 /// car cap as retail's Free Play traffic scale does (DownTown's is 30; at most 15 cars live).
@@ -122,6 +128,13 @@ impl Settings {
         living.skaters.enabled = self.ai_skaters;
         let (_, peds) = PEDESTRIANS[usize::from(self.pedestrians).min(PEDESTRIANS.len() - 1)];
         living.pedestrians = skate_sim::KindSetting { enabled: peds > 0.0, density: peds };
+        // The zombie cheat: peds whatever the setting (retail ignores the density then), bounded by the Vita's pool;
+        // the sim drops the traffic and the NPC skaters itself.
+        if self.zombie {
+            living.zombie = true;
+            living.pedestrians.enabled = true;
+            living.ped_pool = Some(ZOMBIE_PEDS);
+        }
         living
     }
 
@@ -150,6 +163,7 @@ impl Default for Settings {
             traffic: TRAFFIC_DEFAULT,
             ai_skaters: true,
             pedestrians: PEDESTRIANS_DEFAULT,
+            zombie: false,
         }
     }
 }
@@ -222,6 +236,7 @@ impl Settings {
             traffic: if v1 || v2 || v3 || v4 || v5 { TRAFFIC_DEFAULT } else { b[20].min(TRAFFIC.len() as u8 - 1) },
             ai_skaters: v1 || v2 || v3 || v4 || v5 || v6 || b[21] != 0,
             pedestrians: if v1 || v2 || v3 || v4 || v5 || v6 || v7 || v8 { PEDESTRIANS_DEFAULT } else { b[22].min(PEDESTRIANS.len() as u8 - 1) },
+            zombie: false,
         })
     }
 

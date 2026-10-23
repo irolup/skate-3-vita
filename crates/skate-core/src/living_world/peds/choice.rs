@@ -120,6 +120,26 @@ impl PedCatalog {
         self.models.iter().filter(|(_, m)| m.parent.as_deref() == Some(model) && !m.recipe.is_empty()).map(|(k, _)| k.as_str()).collect()
     }
 
+    /// The models an entity's look can use: its model record when that has a recipe, else the group record's
+    /// children with one (`look_for` draws among them). Empty: no usable model (retail: no spawn).
+    pub fn model_candidates(&self, entity: &str, overrides: &PedOverrides) -> Vec<&str> {
+        let record = self.entities.get(entity);
+        let Some(model_key) = overrides.entity_model.get(entity).or_else(|| record.and_then(|e| e.model.as_ref())) else { return Vec::new() };
+        let Some((key, model)) = self.models.get_key_value(model_key) else { return Vec::new() };
+        if model.recipe.is_empty() { self.model_children(model_key) } else { vec![key.as_str()] }
+    }
+
+    /// Every recipe a census spawn of any category can get (the entity lists as `choose` reads them, each entity's
+    /// `model_candidates`): the models to have loaded before peds spawn.
+    pub fn reachable_recipes(&self, overrides: &PedOverrides) -> std::collections::BTreeSet<String> {
+        let lists = self.categories.iter().filter(|(c, _)| !overrides.category_entities.contains_key(*c)).chain(overrides.category_entities.iter());
+        lists
+            .flat_map(|(_, entities)| entities.iter())
+            .flat_map(|entity| self.model_candidates(entity, overrides))
+            .filter_map(|key| self.models.get(key).map(|m| m.recipe.clone()))
+            .collect()
+    }
+
     /// The look of a census spawn: category + the spawn record's seed. `None` when the category
     /// has no entities or the entity has no usable model (retail: no spawn).
     pub fn choose(&self, category: &str, seed: u64, overrides: &PedOverrides) -> Option<PedLook> {
@@ -133,17 +153,12 @@ impl PedCatalog {
     /// The look of a given entity (placed spawns, mods): draws for the group child and tints.
     pub fn look_for(&self, entity: &str, child_draw: u32, tint_draw: u32, overrides: &PedOverrides) -> Option<PedLook> {
         let record = self.entities.get(entity);
-        let model_key = overrides.entity_model.get(entity).cloned().or_else(|| record.and_then(|e| e.model.clone()))?;
-        let mut model_key = model_key;
-        let mut model = self.models.get(&model_key)?;
-        if model.recipe.is_empty() {
-            let children = self.model_children(&model_key);
-            if children.is_empty() {
-                return None;
-            }
-            model_key = children[(child_draw % children.len() as u32) as usize].to_string();
-            model = &self.models[&model_key];
+        let candidates = self.model_candidates(entity, overrides);
+        if candidates.is_empty() {
+            return None;
         }
+        let model_key = candidates[(child_draw % candidates.len() as u32) as usize].to_string();
+        let model = &self.models[&model_key];
         let (tint_a, tint_b) = match overrides.model_tints.get(&model_key) {
             Some((a, b)) => tints(&PedModel { tints_a: a.clone(), tints_b: b.clone(), ..PedModel::default() }, tint_draw),
             None => tints(model, tint_draw),

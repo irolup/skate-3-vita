@@ -412,12 +412,90 @@ fn a_knock_down_falls_lies_for_the_ground_time_gets_up_and_walks_on() {
     let first = |c: &str| log.iter().position(|(_, x)| x == c).unwrap_or_else(|| panic!("{c} never played"));
     let (fall, ground, getup) = (first("FALL"), first("GROUND"), first("GETUP"));
     assert!(fall < ground && ground < getup);
-    // The fall clip is 1 s; the ground cycle lasts the set's ground time (1.5 s at 60 Hz).
+    // The fall clip is 1 s; retail's ground time (1.5 s) counts from the hit (b372), so the get-up starts
+    // 1.5 s after it and the ground cycle lasts about 0.5 s.
+    assert!((89..=91).contains(&(getup - fall)), "get-up {} frames after the hit", getup - fall);
     let ground_frames = getup - ground;
-    assert!((89..=91).contains(&ground_frames), "{ground_frames} frames on the ground");
+    assert!((28..=32).contains(&ground_frames), "{ground_frames} frames on the ground");
     assert!(log[..getup].iter().all(|(s, _)| *s == Locomotion::Reaction), "no walking while reacting");
     assert!(log.iter().skip(getup).any(|(s, _)| *s != Locomotion::Reaction), "back to locomotion after the get-up");
     assert_eq!(p.reaction_anim(), None);
+}
+
+/// Retail's knock-down Colliding state machine (b372): a contact while down re-arms the ground timer at its expiry
+/// (the get-up comes one ground time later); a contact while getting up re-hits from the posture the get-up clip has
+/// reached; more than `block_after` expiries block contacts.
+#[test]
+fn a_knocked_down_ped_stays_down_when_hit_again_and_is_rehit_while_getting_up() {
+    use super::anim::KnockdownContact;
+    use super::skater_contact::{reaction_steps, Posture, ReactionDirection, ReactionKind};
+    let (_, mut set, mut clips) = fixture();
+    let r = |c: &str| vec![RemapClip { clip: c.into(), windows: vec![] }];
+    for (name, frames, looping) in [("FALL", 31, false), ("GROUND", 21, true), ("GETUP", 121, false), ("CROUCH", 31, false)] {
+        clips.insert(name.into(), clip(name, frames, 0.0, 0.0, looping, 0.0, vec![]));
+    }
+    set.entries.insert("WipeoutBackFall".into(), r("FALL"));
+    set.entries.insert("WipeoutBackGroundCyc".into(), r("GROUND"));
+    set.entries.insert("WipeoutBackGetUp".into(), r("GETUP"));
+    set.entries.insert("WipeoutBackCrouch".into(), r("CROUCH"));
+    set.entries.insert("WipeoutLeftCrouch".into(), r("CROUCH"));
+    let dt = 1.0 / 60.0;
+    let knock = |p: &mut PedAnimPlayer| {
+        assert!(p.react(&set, reaction_steps(ReactionKind::Knockdown, ReactionDirection::FromFront), 1.5));
+        p.begin_knockdown(ReactionDirection::FromFront);
+    };
+    let run_until = |p: &mut PedAnimPlayer, clip: &str, limit: usize| -> usize {
+        (0..limit).find(|_| {
+            p.intent = Intent::Walk;
+            p.step(dt, &set, &clips);
+            p.current_clip() == clip
+        }).unwrap_or(limit)
+    };
+
+    // Posture choice (`sub_8269E460`) by the stored direction's intervals.
+    let rules = set.collision;
+    assert_eq!(rules.posture(1.9, ReactionDirection::FromFront), Posture::LyingDown);
+    assert_eq!(rules.posture(2.5, ReactionDirection::FromFront), Posture::Crouched);
+    assert_eq!(rules.posture(3.3, ReactionDirection::FromBack), Posture::Standing);
+    assert_eq!(rules.posture(1.7, ReactionDirection::FromLeft), Posture::Crouched);
+
+    // A contact while down waits for the expiry and re-arms the timer: the get-up comes 3.0 s after the hit.
+    let mut p = PedAnimPlayer::new(&set, 3).unwrap();
+    knock(&mut p);
+    let before = run_until(&mut p, "GROUND", 600);
+    assert_eq!(p.knockdown_contact(&set, ReactionDirection::FromBack), KnockdownContact::Pending);
+    let getup = before + 1 + run_until(&mut p, "GETUP", 600);
+    assert!((179..=181).contains(&getup), "get-up {getup} ticks after the hit");
+
+    // A contact while getting up re-hits: early in the get-up lying down (fall restarted, stored direction), later
+    // crouched (the crouch clip, the new direction).
+    let mut p = PedAnimPlayer::new(&set, 3).unwrap();
+    knock(&mut p);
+    run_until(&mut p, "GETUP", 600);
+    assert_eq!(p.knockdown_contact(&set, ReactionDirection::FromBack), KnockdownContact::ReHit(Posture::LyingDown, ReactionDirection::FromFront));
+    assert_eq!(p.current_clip(), "FALL");
+    assert!((p.current_time() - rules.ground_restart[0]).abs() < 1e-4, "fall restarted at {}", p.current_time());
+    run_until(&mut p, "GETUP", 600);
+    for _ in 0..(2.2 / dt) as usize {
+        p.step(dt, &set, &clips);
+    }
+    assert_eq!(p.knockdown_contact(&set, ReactionDirection::FromLeft), KnockdownContact::ReHit(Posture::Crouched, ReactionDirection::FromLeft));
+    assert_eq!(p.reaction_anim(), Some("WipeoutLeftCrouch"));
+
+    // Contacts at every expiry keep the ped down until more than `block_after` expiries, then are dropped.
+    let mut p = PedAnimPlayer::new(&set, 3).unwrap();
+    knock(&mut p);
+    let mut results = Vec::new();
+    for _ in 0..(12.0 / dt) as usize {
+        if p.knocked_down() && p.reaction_anim() != Some("WipeoutBackGetUp") {
+            let r = p.knockdown_contact(&set, ReactionDirection::FromFront);
+            if results.last() != Some(&r) {
+                results.push(r);
+            }
+        }
+        p.step(dt, &set, &clips);
+    }
+    assert_eq!(results, vec![KnockdownContact::Pending, KnockdownContact::Ignored], "blocked after {} expiries", rules.block_after);
 }
 
 /// The sit plugin state (`motiongraph_sit.xml` via `plugin_motion`): Stand2Sit, then SitIdleCyc held for as long as the
@@ -571,4 +649,25 @@ fn turn_buckets_pick_the_stand_and_walk_turn_clips() {
     }
     assert!(entered, "the walk turn played in the branch window");
     assert_eq!(p.state, Locomotion::Walk, "back on the walk cycle");
+}
+
+#[test]
+fn reachable_recipes_hold_every_look_a_census_spawn_can_get() {
+    let c = catalog();
+    let mut o = PedOverrides::default();
+    let reachable = c.reachable_recipes(&o);
+    // The group record's three children, the two plain models; the empty category adds none.
+    let want: std::collections::BTreeSet<String> = ["male_jock_2", "male_bum_2", "female_skater_1", "female_skater_2", "female_skater_3"].map(String::from).into();
+    assert_eq!(reachable, want);
+    for seed in 0..2000 {
+        let look = c.choose("aletown", seed, &o).unwrap();
+        assert!(reachable.contains(&look.recipe), "seed {seed}: {} missing", look.recipe);
+    }
+    // A mod's category list replaces the stock one, and a mod's entity model is followed.
+    o.category_entities.insert("aletown".into(), s(&["bum02"]));
+    o.entity_model.insert("bum02".into(), "jock02".into());
+    assert_eq!(c.reachable_recipes(&o), ["male_jock_2".to_string()].into());
+    for seed in 0..200 {
+        assert!(c.reachable_recipes(&o).contains(&c.choose("aletown", seed, &o).unwrap().recipe));
+    }
 }

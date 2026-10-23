@@ -2,12 +2,18 @@
 #![forbid(unsafe_code)]
 mod manifest;
 pub use manifest::{AssetError, GameAssets};
+pub mod trick_guide;
+pub mod challenge_map;
+pub mod ice_camera;
+pub mod scene_clip;
 pub mod abin;
 pub mod animation_banks;
 pub mod animation_frames;
 pub mod animation_metadata;
 pub mod collections;
 pub mod scoring;
+// R2: the retail front-end menu tables (data side).
+pub mod menu_tables;
 mod scoring_fields;
 pub mod attrib_hash;
 pub mod input_config;

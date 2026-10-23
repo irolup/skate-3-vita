@@ -1,5 +1,5 @@
-//! The retail HUD: draws the batches of the original APT movie
-//! (`skate_ui::apt_scene::draw`): triangles with texture coordinates in the movie's
+//! The retail HUD and menus: draws the batches of the original APT movies
+//! (`skate_ui::fe::apt_scene::draw`): triangles with texture coordinates in the movie's
 //! 1280 × 720 stage space, each batch with a multiply/add colour transform. The stage is
 //! scaled to the 960 × 544 screen (0.75, centred vertically). Plain alpha blending onto
 //! the frame equals the reference's offscreen target plus premultiplied composite
@@ -8,7 +8,35 @@
 use core::ffi::{CStr, c_void};
 use std::collections::BTreeMap;
 
-use skate_ui::apt_scene::Draw;
+/// One batch of [`Apt::draw`]: a draw of the APT runtime (`skate_ui::fe`: the HUD, the meters, the front end).
+pub trait Batch {
+    /// The uploaded texture's key.
+    fn texture(&self) -> &str;
+    /// (position, uv) per vertex, in stage space.
+    fn vertices(&self) -> impl Iterator<Item = ([f32; 2], [f32; 2])>;
+    fn vertex_count(&self) -> usize;
+    fn multiply(&self) -> [f32; 4];
+    fn add(&self) -> [f32; 4];
+}
+
+impl Batch for skate_ui::fe::apt_scene::Draw {
+    /// A solid fill has no texture key: the white texture (upstream's `white` image).
+    fn texture(&self) -> &str {
+        if self.texture.is_empty() { "white" } else { &self.texture }
+    }
+    fn vertices(&self) -> impl Iterator<Item = ([f32; 2], [f32; 2])> {
+        self.vertices.iter().map(|v| (v.position, v.uv))
+    }
+    fn vertex_count(&self) -> usize {
+        self.vertices.len()
+    }
+    fn multiply(&self) -> [f32; 4] {
+        self.multiply
+    }
+    fn add(&self) -> [f32; 4] {
+        self.add
+    }
+}
 
 use crate::math::{HEIGHT, WIDTH};
 use crate::vgl::*;
@@ -51,7 +79,7 @@ impl Apt {
             glGenBuffers(1, &mut vbo);
             let (multiply, add) = (program.uniform(c"colorMultiply"), program.uniform(c"colorAdd"));
             let mut apt = Self { program, vbo, textures: BTreeMap::new(), verts: Vec::with_capacity(16 * 1024), multiply, add };
-            // Untextured fills of the movies (`skate_ui::apt_scene::WHITE`).
+            // Untextured fills of the movies (an empty texture key).
             apt.add_texture("white", 1, 1, &[255; 4]);
             apt
         }
@@ -76,22 +104,48 @@ impl Apt {
         }
     }
 
+    /// Frees an uploaded texture.
+    pub fn remove_texture(&mut self, key: &str) {
+        if let Some(id) = self.textures.remove(key) {
+            unsafe { glDeleteTextures(1, &id) };
+        }
+    }
+
+    /// Draws an uploaded `WIDTH` x `HEIGHT` texture over the whole screen (a frame read back with
+    /// [`crate::read_rgba`]: bottom row first).
+    pub fn draw_screen(&mut self, key: &str) {
+        // The stage maps to the screen at `scale` with a vertical offset (see `new`): the screen's edges in stage space.
+        let scale = WIDTH as f32 / STAGE.0;
+        let offset = (HEIGHT as f32 - STAGE.1 * scale) / 2.0;
+        let (x0, x1) = (0.0, WIDTH as f32 / scale);
+        let (y0, y1) = (-offset / scale, (HEIGHT as f32 - offset) / scale);
+        let v = |x: f32, y: f32, u: f32, w: f32| skate_ui::fe::apt_scene::Vertex { position: [x, y], uv: [u, w] };
+        let quad = skate_ui::fe::apt_scene::Draw {
+            texture: key.to_owned(),
+            vertices: vec![v(x0, y0, 0.0, 1.0), v(x1, y0, 1.0, 1.0), v(x1, y1, 1.0, 0.0), v(x0, y0, 0.0, 1.0), v(x1, y1, 1.0, 0.0), v(x0, y1, 0.0, 0.0)],
+            multiply: [1.0; 4],
+            add: [0.0; 4],
+            fill: skate_ui::fe::apt_scene::Fill::TextureClamped,
+        };
+        self.draw(std::slice::from_ref(&quad));
+    }
+
     pub fn has_texture(&self, key: &str) -> bool {
         self.textures.contains_key(key)
     }
 
     /// Draws one frame of the movie over whatever is on screen (no clear, no swap).
     /// Batches whose texture was not uploaded are skipped.
-    pub fn draw(&mut self, draws: &[Draw]) {
+    pub fn draw<D: Batch>(&mut self, draws: &[D]) {
         self.verts.clear();
-        let mut batches: Vec<(GLuint, GLint, GLsizei, &Draw)> = Vec::with_capacity(draws.len());
+        let mut batches: Vec<(GLuint, GLint, GLsizei, &D)> = Vec::with_capacity(draws.len());
         for d in draws {
-            let Some(&texture) = self.textures.get(&d.texture) else { continue };
+            let Some(&texture) = self.textures.get(d.texture()) else { continue };
             let first = (self.verts.len() / FLOATS) as GLint;
-            for v in &d.vertices {
-                self.verts.extend_from_slice(&[v.position[0], v.position[1], v.uv[0], v.uv[1]]);
+            for (position, uv) in d.vertices() {
+                self.verts.extend_from_slice(&[position[0], position[1], uv[0], uv[1]]);
             }
-            batches.push((texture, first, d.vertices.len() as GLsizei, d));
+            batches.push((texture, first, d.vertex_count() as GLsizei, d));
         }
         if batches.is_empty() {
             return;
@@ -115,8 +169,9 @@ impl Apt {
             }
             for (texture, first, count, d) in batches {
                 glBindTexture(GL_TEXTURE_2D, texture);
-                glUniform4f(self.multiply, d.multiply[0], d.multiply[1], d.multiply[2], d.multiply[3]);
-                glUniform4f(self.add, d.add[0], d.add[1], d.add[2], d.add[3]);
+                let (multiply, add) = (d.multiply(), d.add());
+                glUniform4f(self.multiply, multiply[0], multiply[1], multiply[2], multiply[3]);
+                glUniform4f(self.add, add[0], add[1], add[2], add[3]);
                 glDrawArrays(GL_TRIANGLES, first, count);
             }
             glDisable(GL_BLEND);

@@ -3,7 +3,7 @@
 //! scoring input, checking the clean/sketchy timelines, the line timer playing
 //! consecutive frames, the x3 glow and flicker ranges, the native shadow/heavy font
 //! pair and finite geometry. Needs the user's prepared data (SKATE3_ASSET_ROOT).
-use crate::{apt_scene, apt_vm::Value, hud_runtime};
+use crate::{fe::apt_scene, fe::apt_vm::Value, hud_runtime};
 
 #[test]
 #[ignore = "requires the user's prepared HUD data (SKATE3_ASSET_ROOT)"]

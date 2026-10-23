@@ -75,14 +75,14 @@ pub(crate) fn update(
     let context = input::context(skater);
     skater
         .offboard_air_selector
-        .requery(&physics.world, context, p.flags_2472, p.flags_2488)
+        .requery(physics.biped_world(), context, p.flags_2472, p.flags_2488)
         .map_err(str::to_owned)?;
     skeleton(physics, skater)?;
     skater.biped_air.state.update_cadence(
         &mut skater.biped_ground.controller.state,
         skater.animation_input.fields.cadence_end_percent,
     );
-    let scene = super::super::offboard::contact_toolkit::StaticScene::new(&physics.world)
+    let scene = super::super::offboard::contact_toolkit::StaticScene::new(physics.biped_world())
         .map_err(str::to_owned)?;
     skater.landing_deck.assist(
         &scene,

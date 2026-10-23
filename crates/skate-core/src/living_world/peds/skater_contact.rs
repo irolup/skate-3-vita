@@ -34,6 +34,23 @@ impl ReactionKind {
             Self::Standing => "Standing",
         }
     }
+    /// The inverse of `name` (mod data).
+    pub fn from_name(name: &str) -> Option<Self> {
+        [Self::Knockdown, Self::Standing].into_iter().find(|k| k.name() == name)
+    }
+}
+
+/// A contact reaction stored for later (retail: the collision component's begin-colliding byte +8 with the reaction
+/// `ped+0x9C0` / direction `ped+0x9C4`): a contact during a takedown attempt, or the failed takedown's trip (b326).
+/// It plays when the ped's graph next enters `PedestrianColliding`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StoredReaction {
+    pub kind: ReactionKind,
+    pub direction: ReactionDirection,
+    /// The contact's closing speed (m/s; 0 for a trip).
+    pub closing: f32,
+    /// Who touched the ped (`None` for a trip).
+    pub toucher: Option<u64>,
 }
 
 /// Retail hit direction (`ped+2500`).
@@ -54,6 +71,10 @@ impl ReactionDirection {
             Self::FromRight => "FromRight",
         }
     }
+    /// The inverse of `name` (mod data).
+    pub fn from_name(name: &str) -> Option<Self> {
+        [Self::FromFront, Self::FromBack, Self::FromLeft, Self::FromRight].into_iter().find(|d| d.name() == name)
+    }
 }
 
 /// The animation set's collision values [data] (`livingworld_entity_animation`).
@@ -65,15 +86,95 @@ pub struct CollisionRules {
     pub ped_knockdown_speed: [f32; 2],
     /// Byte 17: the set allows knock-downs (false for the marquee sets).
     pub can_knock_down: bool,
-    /// Seconds on the ground before getting up (1.5; security 0.5).
+    /// Seconds on the ground before getting up, counted from the hit (1.5; security 0.5).
     pub ground_seconds: f32,
+    /// Get-up clip times (lying down until, crouched until) that pick a re-hit's posture, by the stored
+    /// knock-down direction (`sub_8269E460`, b372): FromFront `recovery_intervals_b`, FromBack
+    /// `recovery_intervals`, the sides `recovery_intervals_left` (2.0 / 3.167, 2.0 / 3.167, 1.667 / 2.334).
+    pub recovery_front: [f32; 2],
+    pub recovery_back: [f32; 2],
+    pub recovery_side: [f32; 2],
+    /// Where a lying-down re-hit restarts the fall clip (`Wipeout{Back,Fwd,Left}GroundRestartTime`, 0.667 / 0.833 /
+    /// 0.833 s, `template/knockdown.xml`).
+    pub ground_restart: [f32; 3],
+    /// Contacts on a downed ped are dropped once its ground timer has run out more than this many times
+    /// (`sub_82E38FB8`: `c+4 > 5`; a code constant in retail, data here).
+    pub block_after: u8,
 }
 
 impl Default for CollisionRules {
     /// The stock `default` set's values (used only when the export has no set).
     fn default() -> Self {
-        Self { knockdown_speed: [3.0, 3.0], ped_knockdown_speed: [6.0, 6.0], can_knock_down: true, ground_seconds: 1.5 }
+        Self {
+            knockdown_speed: [3.0, 3.0],
+            ped_knockdown_speed: [6.0, 6.0],
+            can_knock_down: true,
+            ground_seconds: 1.5,
+            recovery_front: [2.0, 3.167],
+            recovery_back: [2.0, 3.167],
+            recovery_side: [1.667, 2.334],
+            ground_restart: [0.667, 0.833, 0.833],
+            block_after: 5,
+        }
     }
+}
+
+/// The posture a re-hit while getting up starts from ([code] `sub_8269E460`, b372).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Posture {
+    LyingDown,
+    Crouched,
+    Standing,
+}
+
+impl Posture {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::LyingDown => "LyingDown",
+            Self::Crouched => "Crouched",
+            Self::Standing => "Standing",
+        }
+    }
+}
+
+impl CollisionRules {
+    /// [code] `sub_8269E460`: the get-up clip's time against the stored knock-down direction's interval pair.
+    pub fn posture(&self, getup_time: f32, stored: ReactionDirection) -> Posture {
+        let [lying, crouched] = match stored {
+            ReactionDirection::FromFront => self.recovery_front,
+            ReactionDirection::FromBack => self.recovery_back,
+            _ => self.recovery_side,
+        };
+        if getup_time < lying {
+            Posture::LyingDown
+        } else if getup_time < crouched {
+            Posture::Crouched
+        } else {
+            Posture::Standing
+        }
+    }
+}
+
+/// A re-hit of a ped getting up (`template/knockdown.xml` `Falling` from `RecoveryCollision`) [data]: LyingDown
+/// plays the fall from the set's ground restart time, Crouched the crouch clip, Standing the whole fall (all blend
+/// 0.4); then the ground cycle and the get-up as for a knock-down. Returns the steps and the first step's start time.
+/// The direction is the stored one for LyingDown and the new hit's otherwise (the caller picks it, b372).
+pub fn rehit_steps(posture: Posture, direction: ReactionDirection, rules: &CollisionRules) -> (Vec<ReactionStep>, f32) {
+    let mut steps = reaction_steps(ReactionKind::Knockdown, direction);
+    let side = match direction {
+        ReactionDirection::FromFront => 0,
+        ReactionDirection::FromBack => 1,
+        _ => 2,
+    };
+    let start = match posture {
+        Posture::LyingDown => rules.ground_restart[side],
+        Posture::Crouched => {
+            steps[0].anim = ["WipeoutBackCrouch", "WipeoutFwdCrouch", "WipeoutLeftCrouch"][side];
+            0.0
+        }
+        Posture::Standing => 0.0,
+    };
+    (steps, start)
 }
 
 /// [code] `sub_82E38FB8` direction buckets: `normal` is the contact normal and `forward` the ped's
@@ -186,6 +287,7 @@ pub const REACTION_ANIMS: &[&str] = &[
     "WipeoutBackFall", "WipeoutBackGroundCyc", "WipeoutBackGetUp",
     "WipeoutFwdFall", "WipeoutFwdGroundCyc", "WipeoutFwdGetUp",
     "WipeoutLeftFall", "WipeoutLeftGroundCyc", "WipeoutLeftGetUp",
+    "WipeoutBackCrouch", "WipeoutFwdCrouch", "WipeoutLeftCrouch",
 ];
 
 #[cfg(test)]

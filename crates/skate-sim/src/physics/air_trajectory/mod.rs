@@ -35,6 +35,12 @@ impl AirTrajectoryRuntime {
             |position, radius| world::nearby(world, position, radius),
         )
     }
+    /// A new actor on a pooled body (b299): the selector and its pending batch as a fresh body has them.
+    pub(crate) fn reset_for_new_actor(&mut self) {
+        self.selector = TrajectorySelector::new();
+        self.pending_results = None;
+        self.nearby_grinds.clear();
+    }
     pub fn load(collections: &Collections) -> Result<Self, String> {
         Ok(Self {
             selector: TrajectorySelector::new(),

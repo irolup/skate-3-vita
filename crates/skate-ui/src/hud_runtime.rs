@@ -1,5 +1,5 @@
 //! Native HUD bindings and the original ActionScript-driven movie lifecycle.
-use crate::{
+use crate::fe::{
     apt_movie::Movie,
     apt_vm::{Host, ObjectKind, Value, Vm},
 };
@@ -58,6 +58,10 @@ impl Host for Bindings {
     fn property_changed(&mut self, vm: &mut Vm, object: usize, key: &str) -> Result<(), String> {
         if key == "text" || key == "autoSize" {
             self.movie.text_changed(vm, object)?;
+        }
+        // AS2 scale / rotation writes, as on the front-end stage (one APT player in retail).
+        if ["_xscale", "_yscale", "_rotation", "_width", "_height"].iter().any(|k| key.eq_ignore_ascii_case(k)) {
+            self.movie.transform_changed(vm, object, key)?;
         }
         Ok(())
     }
@@ -118,7 +122,7 @@ impl Host for Bindings {
             ("Tricks", "GetCurrentTrickStance") => array(vm, self.input.stance.map(Value::Bool)),
             ("Tricks", "GetCurrentTrickName") => Ok(Value::Text(format!(
                 "#{}",
-                crate::trick_names::localize_trick(
+                crate::fe::apt_text::localize_trick(
                     &self.input.trick_name,
                     Some(&self.movie.text_assets)
                 )
@@ -127,7 +131,7 @@ impl Host for Bindings {
                 let mut metrics = self.input.trick_metrics.clone();
                 metrics[0] = Value::Text(format!(
                     "#{}",
-                    crate::trick_names::localize_trick(
+                    crate::fe::apt_text::localize_trick(
                         &self.input.trick_name,
                         Some(&self.movie.text_assets)
                     )
@@ -195,13 +199,12 @@ impl Runtime {
     }
     fn drain(&mut self) -> Result<(), String> {
         let mut calls = 0;
-        while let Some((object, offset)) = self.bindings.movie.pending.pop_front() {
+        while let Some(crate::fe::apt_movie::Pending { object, offset, .. }) =
+            self.bindings.movie.next_action()
+        {
             calls += 1;
             if calls > 4096 {
                 return Err("HUD frame action limit".into());
-            }
-            if !self.bindings.movie.instances.contains_key(&object) {
-                continue;
             }
             let code = self
                 .bindings

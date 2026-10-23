@@ -2,6 +2,7 @@
 uniform float4x4 viewproj;
 uniform float3 eye;
 uniform float2 fog; // start, end distance in metres
+uniform float2 gradeDepth; // the grade's near distance and 1 / (far - near)
 
 void main(
 	float3 aPosition,
@@ -9,11 +10,11 @@ void main(
 	float2 aLightmapUv,
 	float2 out vUv : TEXCOORD0,
 	float2 out vLightmapUv : TEXCOORD1,
-	float out vFog : TEXCOORD2,
+	float2 out vFog : TEXCOORD2, // fog, grade weight
 	float4 out gl_Position : POSITION
 ) {
 	gl_Position = mul(float4(aPosition, 1.0f), viewproj);
 	vUv = aUv;
 	vLightmapUv = aLightmapUv;
-	vFog = saturate((fog.y - distance(aPosition, eye)) / (fog.y - fog.x));
+	vFog = float2(saturate((fog.y - distance(aPosition, eye)) / (fog.y - fog.x)), saturate((gl_Position.w - gradeDepth.x) * gradeDepth.y));
 }

@@ -32,6 +32,8 @@ pub struct TakedownEntry {
     pub min_speed: f32,
     /// The entry may be mirrored (byte `+36`).
     pub mirrors: bool,
+    /// The ped may trip when this takedown fails (byte `+38` bit 0, read by `826A49D8`; every stock entry 0, b326).
+    pub trips: bool,
 }
 
 /// A ped type's takedown table.
@@ -59,6 +61,8 @@ pub struct TakedownChoice {
     pub entry: usize,
     pub mirrored: bool,
     pub predicted: Vec3,
+    /// The chosen entry's trip flag ([`TakedownEntry::trips`]).
+    pub trips: bool,
 }
 
 /// `82E3C000`: the first takedown in `table` that fits a ped at `ped` facing `forward` (flat
@@ -96,7 +100,7 @@ pub fn choose(table: &TakedownTable, ped: Vec3, forward: [f32; 2], ped_speed: f3
         } else {
             return None;
         };
-        Some(TakedownChoice { entry: i, mirrored, predicted: [p[0], ped[1], p[2]] })
+        Some(TakedownChoice { entry: i, mirrored, predicted: [p[0], ped[1], p[2]], trips: e.trips })
     })
 }
 
@@ -105,7 +109,7 @@ mod tests {
     use super::*;
 
     fn entry(min: f32, reach: f32, side: u32, min_speed: f32) -> TakedownEntry {
-        TakedownEntry { anim_name: "t".into(), lead: 0.3, min, reach, angle_min: -30.0, angle_max: 30.0, side, min_speed, mirrors: true }
+        TakedownEntry { anim_name: "t".into(), lead: 0.3, min, reach, angle_min: -30.0, angle_max: 30.0, side, min_speed, mirrors: true, trips: false }
     }
 
     #[test]

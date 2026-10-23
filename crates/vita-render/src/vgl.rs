@@ -161,6 +161,7 @@ unsafe extern "C" {
     );
     pub fn glUniform3f(location: GLint, v0: GLfloat, v1: GLfloat, v2: GLfloat);
     pub fn glUniform4f(location: GLint, v0: GLfloat, v1: GLfloat, v2: GLfloat, v3: GLfloat);
+    pub fn glUniform4fv(location: GLint, count: GLsizei, value: *const GLfloat);
     pub fn glUniformMatrix4fv(location: GLint, count: GLsizei, transpose: GLboolean, value: *const GLfloat);
     /// Loads a GXP, or vitaGL's (matrix-uniform table + GXP) from `vglGetShaderBinary`.
     pub fn glShaderBinary(

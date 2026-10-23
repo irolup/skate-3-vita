@@ -7,7 +7,10 @@
 //!   desktop.
 //! - [`vita`] (Vita only): pad/touch polling, power clocks, thread placement, idle
 //!   timers and the data root.
+//! - [`ime`] (Vita only): the system keyboard.
 pub mod controls;
+#[cfg(target_os = "vita")]
+pub mod ime;
 #[cfg(target_os = "vita")]
 pub mod vita;
 

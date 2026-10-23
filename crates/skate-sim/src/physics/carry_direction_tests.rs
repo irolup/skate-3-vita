@@ -35,6 +35,8 @@ fn move_object_with_the_board_hidden() {
 }
 
 fn carry(hide_board: bool) {
+    // As in the game (`LivingWorldPlugin`): props are in the grab scene and Move Object binds their authored records.
+    crate::physics::prop_dynamics::set_prop_grab_enabled(true);
     let root_dir = std::path::PathBuf::from(std::env::var_os("SKATE3_ASSET_ROOT").unwrap());
     let map_path = std::path::PathBuf::from(std::env::var_os("SKATE3_MAP").unwrap());
     let map = skate_data::skate_map::SkateMap::load(&map_path).unwrap();
@@ -43,6 +45,15 @@ fn carry(hide_board: bool) {
     let mut physics =
         GamePhysics::load_with_difficulty(&root_dir, Some(&map), crate::difficulty::Difficulty::Easy)
             .unwrap();
+    // The map's authored grab splines and DMO types, as the world loader adds them (skate_world.rs).
+    {
+        let dynamics = physics.prop_dynamics_mut().expect("map props");
+        if let Some(types) = crate::skate_world::load_dmo_types(&root_dir, "DownTown") {
+            dynamics.set_type_data(&types);
+        }
+        let splines = crate::skate_world::load_dmo_grab_splines(&root_dir, "DownTown").expect("DownTown grab splines");
+        assert!(dynamics.set_grab_splines(&splines) > 0, "no prop got grab splines");
+    }
     let mut skater = SkaterRuntime::load(&root_dir, &graphs, &physics, "easy").unwrap();
     let mut camera = crate::camera::CameraRuntime::load(&root_dir).unwrap();
     let mut controls = PlayerControls::default();
@@ -110,6 +121,13 @@ fn carry(hide_board: bool) {
         target[2] + (0..3).map(|i| local[i] * nb[i][2]).sum::<f32>(),
     );
     dynamics.teleport(id, moved, basis);
+    // Every prop with authored grab splines is in the grab scene, also with a 32-bit map instance id (only ids below
+    // 2^24 were, so nothing on DownTown could be grabbed, laptop 2026-10-18).
+    physics.refresh_grab_props().unwrap();
+    let d = physics.prop_dynamics().unwrap();
+    assert!(id >= 1 << 24, "the test prop should have a full 32-bit id ({id})");
+    assert!(d.grab_object(id).is_some(), "prop {id} ({}) has no grab object", d.describe_template(id));
+    assert!(d.grab_objects().len() > 100, "only {} props in the grab scene", d.grab_objects().len());
     let mut flips = 0;
     let mut last = skater.player_state.current();
     for _ in 0..60 {
@@ -163,7 +181,8 @@ fn carry(hide_board: bool) {
             step(&mut physics, &mut skater, &mut controls, &mut camera, pad(RB, [0; 2], [0; 2]));
         }
         let (start, f) = root(&skater);
-        let r = [f[2], 0.0, -f[0]];
+        // The skater's right facing `f` (+Y up, right-handed): stick right moves the pair there, as in retail.
+        let r = [-f[2], 0.0, f[0]];
         let prop_start = physics.prop_dynamics().unwrap().position_of(id).unwrap();
         for _ in 0..45 {
             step(&mut physics, &mut skater, &mut controls, &mut camera, pad(RB, [0; 2], stick));

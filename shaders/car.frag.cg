@@ -7,10 +7,20 @@ uniform float4 tint;
 uniform float4 red;
 uniform float4 blue;
 
+// The colour grade (retail post FX colour matrix, `skate_core::colour_matrix`): near and far 3x4 rows, blended by
+// the vertex's depth weight; identity unless a record (the zombie cheat) is on.
+uniform float4 grade[6];
+float3 graded(float3 c, float w) {
+	float4 x = float4(c, 1.0f);
+	float3 n = float3(dot(grade[0], x), dot(grade[1], x), dot(grade[2], x));
+	float3 f = float3(dot(grade[3], x), dot(grade[4], x), dot(grade[5], x));
+	return lerp(n, f, w);
+}
+
 float4 main(float2 vTexcoord : TEXCOORD0, float4 vColor : COLOR) : COLOR {
 	float4 c = tex2D(tex, vTexcoord) * tint;
 	float3 lin = c.rgb * c.rgb;
 	if (lin.g < 0.001225)
 		lin = lin.r * red.rgb + lin.b * blue.rgb;
-	return float4(sqrt(lin) * vColor.rgb, 1.0f);
+	return float4(graded(sqrt(lin) * vColor.rgb, vColor.a), 1.0f);
 }

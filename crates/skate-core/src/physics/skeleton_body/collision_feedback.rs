@@ -38,7 +38,8 @@ pub struct SkeletonContactReport {
     pub point: V,
     pub tag: u32,
     pub other_group: u32,
-    pub other_entity: Option<i32>,
+    /// The other body's owner (a stable peer id: a player or a simulated NPC skater), when known.
+    pub other_entity: Option<u64>,
     pub body_a: SkeletonContactBody,
     pub body_b: SkeletonContactBody,
     pub side_a: bool,
@@ -156,7 +157,8 @@ pub struct SkeletonCollisionFeedback {
     pub maximum_priority: f32,
     pub wipeout_times: [f32; 3],
     pub maximum_skater_force: f32,
-    pub other_skater: i32,
+    /// The owner of the last skater contact this step (retail audio state `+604`, the other skater).
+    pub other_skater: Option<u64>,
     pub maximum_group_8_force: f32,
     pub maximum_group_11_force: f32,
     pub material_12_height: f32,
@@ -197,7 +199,7 @@ impl SkeletonCollisionFeedback {
             maximum_priority: 0.0,
             wipeout_times: [0.0; 3],
             maximum_skater_force: 0.0,
-            other_skater: -1,
+            other_skater: None,
             maximum_group_8_force: 0.0,
             maximum_group_11_force: 0.0,
             material_12_height: 0.0,

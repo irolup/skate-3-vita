@@ -3,7 +3,7 @@
 use skate_core::{camera::FatLineResult, math::Vector3,
     physics::{board_world::BoardWorld, triangle_query::{TriangleLineHit, triangle_segment}}};
 
-pub(super) fn line(world: &BoardWorld, start: [f32; 4], end: [f32; 4], radius: f32)
+pub(crate) fn line(world: &BoardWorld, start: [f32; 4], end: [f32; 4], radius: f32)
     -> Result<FatLineResult, String> {
     if !radius.is_finite() || radius < 0.0 {
         return Err("Invalid stock camera collision radius".into());

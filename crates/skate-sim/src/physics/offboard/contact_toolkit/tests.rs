@@ -256,3 +256,50 @@ fn indexed_clusters_preserve_rejection_identity_surface_and_pool_ties() {
         assert_eq!(hit.surface, 101);
     }
 }
+
+/// b218: the walker's queries see the DMO prop world as pool bit 2, so a bench is step geometry. The plain lines ask
+/// with mask 0 (like the air selector's), so a light prop's type flag does not hide it there.
+#[test]
+fn biped_lines_see_the_prop_world_as_pool_two() {
+    let raised = |height: f32, geometry: u32| {
+        let vertices = [Vector3::new(-10., height, -10.), Vector3::new(-10., height, 10.), Vector3::new(10., height, 0.)];
+        let material = RetailContactMaterial { static_friction: 0., dynamic_friction: 0., restitution: 0. };
+        let triangle = WorldTriangle::from_vertices(vertices, material, 999, 0, [0.; 3], 0.).unwrap();
+        BoardWorld::with_query_metadata(
+            vec![triangle],
+            QueryMetadata {
+                packed_surfaces: vec![5],
+                meshes: vec![QueryMesh {
+                    triangle_range: 0..1,
+                    local_to_world: RetailAffineTransform::IDENTITY,
+                    world_to_local: RetailAffineTransform::IDENTITY,
+                    local_bounds: Bounds::from_points(vertices).unwrap(),
+                    matching_group: -1,
+                    rejection_flags: 0,
+                    geometry,
+                    pool: QueryPool::Ground,
+                }],
+                static_edges: vec![],
+                island_flags: 0,
+            },
+        )
+        .unwrap()
+    };
+    let map = plane(0);
+    let bench = raised(0.45, 74);
+    let down = [skate_core::player::offboard::ground_query::Line { start: Vector3::new(0., 2., 0.), end: Vector3::new(0., -1., 0.), radius: 0. }];
+    let height = |scene: &StaticScene| scene.lines(&down, -1).unwrap()[0].as_ref().map(|h| h.position.y);
+    fn with<'a>(map: &'a BoardWorld, props: &'a BoardWorld) -> StaticScene<'a> {
+        StaticScene::new(crate::physics::offboard::BipedWorld { map, props: Some(props) }).unwrap()
+    }
+    assert!((height(&StaticScene::new(&map).unwrap()).unwrap() - 0.).abs() < 1e-4, "map only: the floor");
+    assert!((height(&with(&map, &bench)).unwrap() - 0.45).abs() < 1e-4, "the bench top through pool 2");
+    let mut light = raised(0.45, 76);
+    assert!(light.set_rejection_flags(0..1, 1 << 14));
+    assert!((height(&with(&map, &light)).unwrap() - 0.45).abs() < 1e-4, "mask 0: a light prop still answers these lines");
+    // The same height in both: the map (pool 1) wins the tie.
+    let level = raised(0.0, 75);
+    let tie = StaticScene::new(crate::physics::offboard::BipedWorld { map: &map, props: Some(&level) }).unwrap();
+    let picked = tie.lines(&down, -1).unwrap()[0].clone().unwrap();
+    assert_eq!(picked.packed_surface, 17, "ties keep the earlier pool: the map");
+}

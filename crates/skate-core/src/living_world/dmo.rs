@@ -184,6 +184,14 @@ impl DmoStream {
     /// One census pass for `observers` (each with its score view). `exempt` ids (held or carried props) are never
     /// culled or evicted. `fill` uses the larger spawn budget (a map load).
     pub fn step(&mut self, observers: &[(Observer, DmoView)], settings: &DmoStreamSettings, fill: bool, exempt: &dyn Fn(u32) -> bool) -> Vec<DmoDecision> {
+        self.step_kept(observers, settings, fill, exempt, &|_| false)
+    }
+
+    /// [`Self::step`] with the live objects' keep state: a live object for which `kept` is true is scored as kept
+    /// (retail's live score `sub_82C55160` sets the keep flag from the object's own state, research b184), so it is
+    /// never the eviction queue's front while unkept objects are live. Retail still evicts the front every pass; only
+    /// untouched props go, and they come back where they already were.
+    pub fn step_kept(&mut self, observers: &[(Observer, DmoView)], settings: &DmoStreamSettings, fill: bool, exempt: &dyn Fn(u32) -> bool, kept: &dyn Fn(u32) -> bool) -> Vec<DmoDecision> {
         let mut out = Vec::new();
         let circles: Vec<_> = observers.iter().map(|(o, v)| (settings.range.around(o), *v)).filter(|((c, centre), _)| c.cull.is_finite() && centre.iter().all(|x| x.is_finite())).collect();
         if circles.is_empty() {
@@ -210,15 +218,21 @@ impl DmoStream {
         // The best score over the observers' views.
         let best = |p: &DmoPlacement| circles.iter().map(|(_, v)| score_value(score(p, v, &settings.weights))).fold(f32::MIN, f32::max);
         // skate_vita (performance): a placement's score at most once per pass, when first needed (it reads only
-        // the views), and the live, non-exempt objects ordered by (score in `total_cmp` order, id): the eviction
+        // the views), and the live, non-exempt objects ordered by (live score in `total_cmp` order, id): the eviction
         // front is the first, the same minimum as scanning them; upstream rescanned every placement per spawn attempt.
-        let mut memo: Vec<Option<f32>> = vec![None; self.placements.len()];
+        // `score(i, true)` is upstream's live score (a kept object scores like a keep placement, flag 0x10: s1 = 2^31,
+        // the keep weight), `score(i, false)` its `best` (a spawn candidate's).
+        let mut memo: Vec<[Option<f32>; 2]> = vec![[None; 2]; self.placements.len()];
         let placements = &self.placements;
-        let mut score = |i: usize| *memo[i].get_or_insert_with(|| best(&placements[i]));
+        let mut score = |i: usize, live: bool| {
+            let p = &placements[i];
+            let as_kept = live && kept(p.id) && !p.keep;
+            *memo[i][as_kept as usize].get_or_insert_with(|| if as_kept { best(&DmoPlacement { keep: true, ..p.clone() }) } else { best(p) })
+        };
         let mut queue: BTreeSet<(u32, u32, usize)> = BTreeSet::new();
         for (i, p) in placements.iter().enumerate() {
             if self.live.contains(&p.id) && !exempt(p.id) {
-                queue.insert((total_key(score(i)), p.id, i));
+                queue.insert((total_key(score(i, true)), p.id, i));
             }
         }
         // One eviction per pass while the pool is full.
@@ -264,7 +278,7 @@ impl DmoStream {
                 }
                 if self.live.len() >= settings.cap {
                     match queue.first().copied() {
-                        Some((key, victim, v)) if score(i) > score(v) => {
+                        Some((key, victim, v)) if score(i, false) > score(v, true) => {
                             queue.remove(&(key, victim, v));
                             self.live.remove(&victim);
                             out.push(DmoDecision::Evict(victim));
@@ -274,7 +288,7 @@ impl DmoStream {
                 }
                 self.live.insert(p.id);
                 if !exempt(p.id) {
-                    queue.insert((total_key(score(i)), p.id, i));
+                    queue.insert((total_key(score(i, true)), p.id, i));
                 }
                 out.push(DmoDecision::Spawn(p.id));
                 budget -= 1;

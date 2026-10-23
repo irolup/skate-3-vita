@@ -124,7 +124,7 @@ fn a_simulated_skater_rides_a_recorded_line_from_its_ai_record() {
         let deck = physics.board.part_transforms()[BodyId::Deck.index()];
         let forward = [deck.basis.columns[2][0], deck.basis.columns[2][1], deck.basis.columns[2][2]];
         let record = skate_core::living_world::ai_record::build(&target, forward, &Default::default());
-        npc.runtime.ai_physics = Some(super::skater::AiPhysicsSource { record, fresh: true });
+        npc.runtime.ai_physics = Some(super::skater::AiPhysicsSource { record, fresh: true, cursor: None });
         // Retail spawn push while still on the start node (824701F8 -> 82C04168, every part).
         let node = &line.nodes[cursor.node as usize];
         let deck_at = [deck.translation.x, deck.translation.y, deck.translation.z];
@@ -427,7 +427,7 @@ fn controller_b_steps_off_and_walks_the_skater_onto_the_node() {
     // The goal as the only corner: what the peds' navmesh returns on open ground.
     struct Corner;
     impl PathService for Corner {
-        fn solve(&self, _from: [f32; 3], to: [f32; 3]) -> Option<Vec<PathElement>> {
+        fn solve(&self, _from: [f32; 3], to: [f32; 3], _goal_radius: f32, _start_radius: f32) -> Option<Vec<PathElement>> {
             Some(vec![PathElement { entry: to, exit: to }])
         }
     }
@@ -448,7 +448,7 @@ fn controller_b_steps_off_and_walks_the_skater_onto_the_node() {
         [0.0, 0.0, 1.0],
         &Default::default(),
     );
-    runtime.ai_physics = Some(super::skater::AiPhysicsSource { record, fresh: false });
+    runtime.ai_physics = Some(super::skater::AiPhysicsSource { record, fresh: false, cursor: None });
     for _ in 0..30 {
         physics.advance_npc_skater(&mut context, &mut runtime, &mut controls, &graphs, &mut camera, &[]).unwrap();
     }
@@ -878,3 +878,54 @@ fn a_simulated_npc_skaters_audio_record_is_its_own() {
     assert!(d(state.board_position, player) > 1.0, "not at the player's board");
     assert!(state.wheel_count > 0, "the rolling NPC has its wheels down");
 }
+
+#[test]
+#[ignore = "requires private stock graphs and an installed map (SKATE3_ASSET_ROOT, SKATE3_MAP=<maps/DownTown.skate>)"]
+fn a_teleport_resets_the_grind_lock_and_a_new_actor_gets_a_fresh_input_cache() {
+    let root_dir = std::path::PathBuf::from(std::env::var_os("SKATE3_ASSET_ROOT").unwrap());
+    let map_path = std::path::PathBuf::from(std::env::var_os("SKATE3_MAP").unwrap());
+    let map = skate_data::skate_map::SkateMap::load(&map_path).unwrap();
+    let assets = skate_data::GameAssets::load(&root_dir).unwrap();
+    let rig = Rig { graphs: crate::graph_runtime::StockGraphs::load(&root_dir, &assets).unwrap(), root_dir: root_dir.clone() };
+    let mut physics = GamePhysics::load_with_difficulty(&root_dir, Some(&map), crate::difficulty::Difficulty::Easy).unwrap();
+    let mut s = rig.skater(&physics);
+    for _ in 0..30 {
+        rig.step(&mut physics, &mut s, pad());
+    }
+    // A grind lock (engagement past 151, 90-tick cooldown) and a cached "lands in grind" from an earlier jump.
+    s.runtime.player_input.grind.set_lock_for_test(200, 90);
+    s.runtime.player_input.player.external_physics_cache_1008.flags |= 1 << 27;
+    let deck = physics.board.part_transforms()[BodyId::Deck.index()];
+    let mut target = [[0.0; 4]; 4];
+    for (dst, src) in target[..3].iter_mut().zip(deck.basis.columns) {
+        dst[..3].copy_from_slice(&src);
+    }
+    target[3] = [deck.translation.x, deck.translation.y, deck.translation.z, 0.0];
+    s.runtime.player_input.request_teleport(target).unwrap();
+    rig.step(&mut physics, &mut s, pad());
+    // ResetSystems 82DB92D0 ends with the grind manager reset 82D8A638 (b297).
+    let (counter, cooldown) = s.runtime.player_input.grind.lock_for_test();
+    assert!(counter < 200 && cooldown == 0, "grind lock survived the teleport: {counter} / {cooldown}");
+    // The same actor keeps its processed-input cache across the reset (b295).
+    assert_ne!(s.runtime.player_input.player.external_physics_cache_1008.flags & (1 << 27), 0);
+    // A new actor on a pooled body starts from 82DB18A0's cache and the other ctor-built parts (b299).
+    s.runtime.player_input.grind.set_lock_for_test(200, 90);
+    s.runtime.player_state.post.jump_fix_frames = 3;
+    s.runtime.skitch_release_trace = 5;
+    s.runtime.reset_for_new_actor(physics.collections()).unwrap();
+    assert_eq!(s.runtime.player_input.grind.lock_for_test(), (0, 0));
+    assert_eq!(s.runtime.player_state.post.jump_fix_frames, 1000);
+    assert_eq!(s.runtime.skitch_release_trace, 0);
+    assert!(s.runtime.takedown.is_none() && s.runtime.ai_physics.is_none());
+    let cache = s.runtime.player_input.player.external_physics_cache_1008;
+    assert_eq!(cache.flags, 0);
+    assert_eq!(cache.vectors[8], [(-1.0f32).to_bits(); 4]);
+    assert!(cache.vectors.iter().enumerate().all(|(i, v)| i == 8 || *v == [0; 4]));
+    // The trajectory selector's reset waits for the placement's Exit / Enter (a body pooled in KnownAir exits it
+    // there and reads the old selection, b310); the next placement does it.
+    assert!(s.runtime.trajectory_reset_pending);
+    s.runtime.player_input.request_teleport(target).unwrap();
+    rig.step(&mut physics, &mut s, pad());
+    assert!(!s.runtime.trajectory_reset_pending, "the placement reset the selector");
+}
+

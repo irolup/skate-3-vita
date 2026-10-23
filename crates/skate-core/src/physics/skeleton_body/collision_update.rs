@@ -128,7 +128,7 @@ impl SkeletonCollisionFeedback {
                     };
                     self.maximum_skater_force = maximum(self.maximum_skater_force, force);
                     if let Some(entity) = report.other_entity {
-                        self.other_skater = entity;
+                        self.other_skater = Some(entity);
                     }
                     self.flags.nonboard = true;
                 }
@@ -181,7 +181,7 @@ impl SkeletonCollisionFeedback {
         self.planes.clear();
         self.maximum_priority = 0.0;
         self.maximum_skater_force = 0.0;
-        self.other_skater = -1;
+        self.other_skater = None;
         self.maximum_group_8_force = 0.0;
         self.maximum_group_11_force = 0.0;
         self.material_12_height = 0.0;

@@ -21,6 +21,8 @@ skate-audio = { path = "../skate-audio", features = ["no-fma"] }
 # The original HUD movie.
 skate-ui = { path = "../skate-ui" }
 serde_json.workspace = true
+# The loading screen's background (static/sce_sys/pic0.png, decoded once at startup).
+png = "0.17"
 serde.workspace = true
 # The same glam as skate-sim (presentation snapshots are glam types).
 glam = { version = "=0.30.10", default-features = false, features = ["std"] }
@@ -43,6 +45,8 @@ state-log = []
 # skate-core stage timers (the prop paths) and the sim's tracing spans: ms per tick in STAGES and
 # SPANS log lines every 600 ticks.
 stage-profile = ["skate-sim/stage-profile", "dep:tracing"]
+# R2: the retail front end's phase times in a FE_MENUS spans log line (skate-ui `fe::profile`).
+fe-profile = ["skate-ui/fe-profile"]
 
 [target.'cfg(target_os = "vita")'.dependencies]
 vitasdk-sys = { version = "0.3.3", features = ["SceCtrl_stub", "SceLibKernel_stub", "SceProcessmgr_stub"] }

@@ -116,6 +116,10 @@ impl KindState {
         }
     }
 
+    /// The serial the next spawn of this kind gets.
+    pub fn next_serial(&self) -> u32 {
+        self.next_serial
+    }
     pub fn len(&self) -> usize {
         self.live.len()
     }
@@ -198,6 +202,16 @@ impl LivingWorld {
             skater_pool: Vec::new(),
             peds: KindState::new(Kind::Pedestrian, seed),
             vehicles: KindState::new(Kind::Vehicle, seed),
+        }
+    }
+
+    /// Continue each kind's serial counter from an earlier world of this session (a map change builds a new
+    /// `LivingWorld`), so ids never repeat within a session (`LivingWorldId`).
+    pub fn continue_serials_from(&mut self, earlier: &LivingWorld) {
+        for k in Kind::ALL {
+            let next = earlier.state(k).next_serial;
+            let st = self.state_mut(k);
+            st.next_serial = st.next_serial.max(next);
         }
     }
 

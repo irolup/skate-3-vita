@@ -9,7 +9,7 @@ mod lab;
 #[cfg(target_os = "vita")]
 mod packs;
 #[cfg(target_os = "vita")]
-mod crossbar_ui;
+mod fe_menus;
 #[cfg(target_os = "vita")]
 mod retail_hud;
 mod alloc;
@@ -23,9 +23,13 @@ mod menu;
 mod button_icons;
 mod replay_camera;
 mod session_replay;
+mod world_replay;
+mod teleporters;
 #[cfg(target_os = "vita")]
-mod replay_ui;
+mod colour_grade;
 mod settings;
+mod vita_menus;
+mod trick_demo;
 mod skin;
 #[cfg(feature = "stage-profile")]
 mod span_profile;

@@ -337,6 +337,32 @@ fn steps_cross_tile_seams_and_never_jump_layers() {
     assert!(ok && (edge[0] - 4.0).abs() < 1e-4);
 }
 
+/// b331 (retail mover `82EA5C40` / `82EA4C20`): a ped walking into a straight wall at 80 degrees slides along it every
+/// tick and gets where the slide leads; each slide is about 17 % of the wanted step, which the old 25 % progress rule
+/// refused (the ped stood pinned, b325). Head-on the slide is nothing: the ped stays on the edge.
+#[test]
+fn a_ped_walking_into_a_wall_at_an_angle_slides_along_it() {
+    // A 10 x 4 m strip: the wall is its edge at z = 4.
+    let m = mesh(&grid(10, 4, 1.0, |_, _| Some(AREA_DEFAULT)));
+    let (dir, speed) = (80f32.to_radians(), 0.044);
+    let step = [dir.cos() * speed, 0.0, dir.sin() * speed];
+    let mut pos = [1.0, 0.0, 3.95];
+    for _ in 0..300 {
+        let to = [pos[0] + step[0], 0.0, pos[2] + step[2]];
+        let (next, ok) = constrain_step(&m, pos, to);
+        assert!(ok, "the slide is applied: {pos:?} -> {next:?}");
+        let (wanted, got) = (speed, ((next[0] - pos[0]).powi(2) + (next[2] - pos[2]).powi(2)).sqrt());
+        if pos[2] >= 4.0 - 1e-4 {
+            assert!(got < 0.25 * wanted, "against the wall the slide is short ({got} of {wanted}), the case the old rule refused");
+        }
+        pos = next;
+    }
+    assert!(pos[0] > 3.0 && (pos[2] - 4.0).abs() < 1e-3, "slid along the wall: {pos:?}");
+    // Head-on: no slide, the ped stands on the edge.
+    let (still, ok) = constrain_step(&m, [5.0, 0.0, 4.0], [5.0, 0.0, 4.044]);
+    assert!(ok && (still[0] - 5.0).abs() < 1e-4 && (still[2] - 4.0).abs() < 1e-4, "{still:?}");
+}
+
 /// `82E2A500` (b167): 25 / 70 / 115 / 160 degree edges pick 45 / 90 / 135 / 180; below 25 no turn; both sides.
 #[test]
 fn turn_bucket_edges_follow_retail() {
@@ -346,8 +372,47 @@ fn turn_bucket_edges_follow_retail() {
     assert_eq!([b(-30.0), b(-100.0), b(-170.0)], [Some(45), Some(90), Some(180)]);
 }
 
-/// The stuck watch (ours; retail's reverse = goal event 4, b158 item 9): a walking ped that stays within 0.3 m for 2 s
-/// gives up its target and plans the next one away from it, skipping the long fan.
+/// Ours with the still timer's values (`82E97118`, mode 4 only in retail, b336): a walking ped still within 0.13 m for 0.5 s re-paths ONCE to the same target;
+/// moving on clears it. Then our NOT RETAIL give-up (2.0 s) gives the target up and plans away from it.
+#[test]
+fn a_still_walking_ped_repaths_to_its_target_once_then_gives_up() {
+    let m = mesh(&grid(20, 20, 2.0, |_, _| Some(AREA_DEFAULT)));
+    let p = WanderParams::default();
+    assert_eq!((p.stuck_distance, p.stuck_seconds, p.yield_patience), (0.13, 0.5, 2.0), "the still timer's and mode 0's values");
+    let mut nav = PedNav::default();
+    let pos = [20.0, 0.0, 20.0];
+    let dt = 1.0 / 30.0;
+    nav.step(&m, &p, CrosswalkRule::Off, &NoSignals, 1, pos, 0.0, Locomotion::Walk, &[], dt);
+    let first = nav.target.unwrap();
+    let mut ticks = 0;
+    while nav.repaths == 0 && ticks < 60 {
+        nav.step(&m, &p, CrosswalkRule::Off, &NoSignals, 1, pos, 0.0, Locomotion::Walk, &[], dt);
+        ticks += 1;
+    }
+    assert_eq!(nav.repaths, 1, "re-pathed after {ticks} ticks");
+    assert!((ticks as f32 * dt - p.stuck_seconds).abs() < 0.1, "after {} s", ticks as f32 * dt);
+    assert_eq!((nav.target, nav.stuck_count), (Some(first), 0), "same target, not given up");
+    // Still longer: no second re-path in the same still spell.
+    for _ in 0..20 {
+        nav.step(&m, &p, CrosswalkRule::Off, &NoSignals, 1, pos, 0.0, Locomotion::Walk, &[], dt);
+    }
+    assert_eq!(nav.repaths, 1, "once per still spell");
+    // Moving more than 0.13 m starts a new spell; still again for 0.5 s re-paths again.
+    let moved = [pos[0], 0.0, pos[2] + 0.2];
+    for _ in 0..20 {
+        nav.step(&m, &p, CrosswalkRule::Off, &NoSignals, 1, moved, 0.0, Locomotion::Walk, &[], dt);
+    }
+    assert_eq!((nav.repaths, nav.target), (2, Some(first)));
+    // The give-up switched off (a mod): never gives up.
+    let off = WanderParams { give_up_seconds: 0.0, ..p };
+    for _ in 0..200 {
+        nav.step(&m, &off, CrosswalkRule::Off, &NoSignals, 1, moved, 0.0, Locomotion::Walk, &[], dt);
+    }
+    assert_eq!((nav.stuck_count, nav.target), (0, Some(first)), "no give-up when off");
+}
+
+/// Our NOT RETAIL safety net (`give_up_seconds`, 2 s; retail's reverse = goal event 4, b158 item 9): a walking ped
+/// still pinned gives up its target and plans the next one away from it, skipping the long fan.
 #[test]
 fn a_pinned_walking_ped_gives_up_and_plans_away_from_its_target() {
     let m = mesh(&grid(20, 20, 2.0, |_, _| Some(AREA_DEFAULT)));
@@ -366,7 +431,72 @@ fn a_pinned_walking_ped_gives_up_and_plans_away_from_its_target() {
         ticks += 1;
     }
     assert_eq!(nav.stuck_count, 1, "gave up after {ticks} ticks");
-    assert!((ticks as f32 * dt - p.stuck_seconds).abs() < 0.1, "after {} s", ticks as f32 * dt);
+    assert!((ticks as f32 * dt - p.give_up_seconds).abs() < 0.1, "after {} s", ticks as f32 * dt);
     let next = nav.target.unwrap();
     assert!(next[2] < pos[2], "planned away from the old target: {next:?}");
+}
+
+/// b277: the path goal is the nearest point the start can reach (retail `82933A48`, unbounded), not the peds' 0.5 m
+/// point query; B's plan acceptance (2.0 h / 1.0 v) then decides.
+#[test]
+fn path_goal_snaps_to_the_nearest_reachable_point() {
+    use crate::living_world::controller_b::{BInput, ControllerB, ControllerBSettings, PathService};
+    // Two strips, x 0..5 and x 6..10 (a hole at 5..6): two components.
+    let m = mesh(&grid(10, 1, 1.0, |i, _| (i != 5).then_some(AREA_DEFAULT)));
+    let start = m.locate([0.5, 0.0, 0.5]).unwrap();
+    // 1.2 m off the mesh: the point query misses it, the goal search snaps to the edge.
+    let off = [-1.2, 0.0, 0.5];
+    assert!(m.locate(off).is_none());
+    let at = m.locate_nearest(off, start.poly, f32::MAX).unwrap();
+    assert_eq!((at.poly, at.position), (0, [0.0, 0.0, 0.5]));
+    // A mod cap below the distance: no goal.
+    assert!(m.locate_nearest(off, start.poly, 1.0).is_none());
+    // On the other strip: only the start's component counts, so the near edge of the first strip wins.
+    let far = m.locate_nearest([6.2, 0.0, 0.5], start.poly, f32::MAX).unwrap();
+    assert_eq!((far.poly, far.position), (4, [5.0, 0.0, 0.5]));
+    // Under the mesh: straight up onto the polygon above it (distance 7.86).
+    let under = m.locate_nearest([2.5, -7.86, 0.5], start.poly, f32::MAX).unwrap();
+    assert_eq!((under.poly, under.position), (2, [2.5, 0.0, 0.5]));
+    // The plan: a 1.2 m snap is accepted, a 2.67 m snap is rejected (stall #5 at node 152).
+    let s = ControllerBSettings::default();
+    let input = BInput { position: start.position, body: [1.0, 0.0, 0.0], can_move: true, ..Default::default() };
+    let path = PathService::solve(&m, start.position, [-1.2, 0.0, 0.5], s.goal_locate_radius, s.start_locate_radius).unwrap();
+    assert_eq!(path.last().unwrap().entry, [0.0, 0.0, 0.5]);
+    assert!(ControllerB::activate(&s, &m, [-1.2, 0.0, 0.5], [1.0, 0.0, 0.0], &input).is_some());
+    assert!(ControllerB::activate(&s, &m, [-2.67, 0.0, 0.5], [1.0, 0.0, 0.0], &input).is_none());
+}
+
+/// b324: a walk-back start off the mesh (a skater stalled on a grind block, inside the block's navmesh cut, 2-3 m up)
+/// snaps to the nearest walkable polygon at any distance (retail `829338B0`), not the peds' 0.5 m; laptop 2026-10-19
+/// nodes 69 / 36 / 29 / 23 all failed with "no plan".
+#[test]
+fn walk_back_start_snaps_from_an_obstacle_cut() {
+    use crate::living_world::controller_b::{BInput, ControllerB, ControllerBSettings};
+    // 10 x 10 m with a 4 x 4 m cut (x, z 3..7) where the block stands.
+    let m = mesh(&grid(10, 10, 1.0, |i, j| (!((3..=6).contains(&i) && (3..=6).contains(&j))).then_some(AREA_DEFAULT)));
+    let on_block = [5.0, 2.8, 5.2];
+    assert!(m.locate(on_block).is_none(), "2 m inside the cut, 2.8 m up: the peds' query refuses it");
+    let start = m.locate_start_nearest(on_block, f32::MAX).unwrap();
+    // Nearest: the cut's edge at z 7 (1.8 m away horizontally), straight across at ground height.
+    assert_eq!(start.position, [5.0, 0.0, 7.0]);
+    assert!(m.locate_start_nearest(on_block, 3.0).is_none(), "3.4 m away: a mod cap of 3 m refuses it");
+    // Same answer as a scan of every polygon, from points around and inside the cut and off the mesh.
+    let brute = |p: [f32; 3]| {
+        (0..m.polys_len() as u32).filter_map(|k| m.closest_point(k, p).map(|q| (q, k))).fold(None::<(f32, u32, [f32; 3])>, |best, (q, k)| {
+            let d2 = (0..3).map(|i| (q[i] - p[i]).powi(2)).sum::<f32>();
+            if best.is_none_or(|(b, bk, _)| d2 < b || (d2 == b && k < bk)) { Some((d2, k, q)) } else { best }
+        })
+    };
+    for p in [[5.0, 2.8, 5.2], [5.0, 0.0, 5.0], [3.1, 1.0, 6.9], [-4.0, 0.0, 12.5], [20.0, -3.0, 4.0], [1.5, 0.0, 1.5]] {
+        let got = m.locate_start_nearest(p, f32::MAX).unwrap();
+        let (_, k, q) = brute(p).unwrap();
+        assert_eq!((got.poly, got.position), (k, q), "{p:?}");
+    }
+    // The plan: today's start plans and is accepted; with the peds' 0.5 m (the old behaviour) it does not.
+    let s = ControllerBSettings::default();
+    let input = BInput { position: on_block, body: [1.0, 0.0, 0.0], can_move: true, ..Default::default() };
+    let goal = [9.5, 0.0, 9.5];
+    assert!(ControllerB::activate(&s, &m, goal, [1.0, 0.0, 0.0], &input).is_some());
+    let old = ControllerBSettings { start_locate_radius: 0.5, ..s };
+    assert!(ControllerB::activate(&old, &m, goal, [1.0, 0.0, 0.0], &input).is_none());
 }

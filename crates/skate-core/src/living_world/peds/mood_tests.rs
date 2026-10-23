@@ -5,8 +5,8 @@ const PLAYER: u64 = 99;
 
 fn tables() -> MoodTables {
     let mut t = MoodTables::default();
-    t.categories.insert("collision".into(), MoodCategory { magnitude: 0.0, lifetime: 30.0, near: 10.0, far: 10.0 });
-    t.categories.insert("presence".into(), MoodCategory { magnitude: 0.5, lifetime: 30.0, near: 10.0, far: 10.0 });
+    t.categories.insert("collision".into(), MoodCategory { magnitude: 0.0, lifetime: 30.0, near: 10.0, far: 10.0, priority: 0 });
+    t.categories.insert("presence".into(), MoodCategory { magnitude: 0.5, lifetime: 30.0, near: 10.0, far: 10.0, priority: 0 });
     t.entity_parents.insert("skater".into(), "pedestrians".into());
     t.entity_parents.insert("adult_male".into(), "regular".into());
     t.entity_parents.insert("regular".into(), "pedestrians".into());
@@ -34,7 +34,7 @@ fn tables() -> MoodTables {
 }
 
 fn ctx<'a>(entity: &'a dyn Fn(u64) -> Option<(String, Vec3)>) -> MoodContext<'a> {
-    MoodContext { ped: PED, ped_type: "adult_male", position: [0.0; 3], entity, zombie: false, busy: &|_| false, own_plugin_object: false, chasing: false }
+    MoodContext { ped: PED, ped_type: "adult_male", position: [0.0; 3], entity, zombie: false, busy: &|_| false, own_plugin_object: false, chasing: false, flee_pending: false }
 }
 
 fn collision() -> MoodEvent {
@@ -105,6 +105,36 @@ fn records_bump_age_expire_and_a_full_store_drops_targeted_events() {
     assert_eq!(s.records.len(), MAX_RECORDS);
 }
 
+/// `sub_82E441C8` (research b189): a full store evicts the record whose category Priority is numerically highest, the
+/// oldest on a tie and the first in slot order on an exact tie, not simply the oldest.
+#[test]
+fn a_full_store_evicts_by_priority_then_age() {
+    let prio = |c: &str| match c {
+        "collision" | "beingchased" => 1,
+        "nearbychase" | "skaterskitch" => 3,
+        "litter" => 6,
+        _ => 5,
+    };
+    let fill = |seventh: &str| {
+        let mut s = MoodStore::default();
+        let slots = [("collision", 25.0), ("presence", 3.0), ("presence", 8.0), ("greeted", 1.0), ("nearbychase", 12.0), ("presence", 8.0), ("skatertrick", 2.0), (seventh, 0.5), ("skaterskitch", 4.0), ("beingchased", 20.0)];
+        for (i, (c, age)) in slots.iter().enumerate() {
+            assert!(s.post_ranked(MoodEvent { category: (*c).into(), instigator: Some(100 + i as u64), ..collision() }, 0.0, &prio));
+            s.records[i].age = *age;
+        }
+        s
+    };
+    let incoming = || MoodEvent { category: "presence".into(), instigator: Some(7), second: None, ..collision() };
+    let mut s = fill("litter");
+    assert!(s.post_ranked(incoming(), 0.5, &prio));
+    assert!(s.records.iter().all(|r| r.category != "litter"), "the youngest record goes: litter has the highest Priority");
+    assert!(s.records.iter().any(|r| r.category == "collision"), "the oldest record (collision, Priority 1) stays");
+    let mut s = fill("skaterslam");
+    assert!(s.post_ranked(incoming(), 0.5, &prio));
+    let left: Vec<u64> = s.records.iter().filter(|r| r.category == "presence").filter_map(|r| r.instigator).collect();
+    assert_eq!(left, [101, 105, 7], "of the two age-8 presence records, the first in slot order goes");
+}
+
 #[test]
 fn presence_sees_players_within_35_m() {
     let near = presence(PED, [0.0; 3], &[], &[(7, [30.0, 0.0, 10.0]), (8, [35.0, 0.0, 1.0])]);
@@ -125,7 +155,7 @@ fn presence_posts_other_peds_then_players() {
 #[test]
 fn the_zombie_broadcast_raises_the_zombie_chase_on_the_skater() {
     let mut t = tables();
-    t.categories.insert("zombiemode".into(), MoodCategory { magnitude: 0.5, lifetime: 30.0, near: 10.0, far: 10.0 });
+    t.categories.insert("zombiemode".into(), MoodCategory { magnitude: 0.5, lifetime: 30.0, near: 10.0, far: 10.0, priority: 0 });
     t.results.insert(
         "skaterzombiechase".into(),
         MoodResult { category: Some("zombiemode".into()), instigator_type: Some("skater".into()), want_flag: true, wants: vec!["angrychase".into()], ..Default::default() },
@@ -165,4 +195,17 @@ fn prerequisites_read_the_peds_own_state_and_the_event_position() {
     assert!(t.accepts("adult_male", &event("presence", 5, 11.0), &c));
     assert!(!t.accepts("adult_male", &event("presence", 5, 20.0), &c), "measured to the event, not to the instigator");
     assert!(!t.accepts("adult_male", &event("greeted", 5, 0.0), &c));
+}
+
+/// Kind 8 (`sub_82BFEA60`, research b176): the `flee` want (slot 10) pending, as stock `greeted` uses it ("not
+/// fleeing", comparator 1): a fleeing ped is not greeted.
+#[test]
+fn prerequisite_kind_8_reads_the_pending_flee_want() {
+    let mut t = tables();
+    t.reactions.get_mut("adult_male").unwrap().prerequisites =
+        vec![Prerequisite { category: "greeted".into(), kind: 8, comparator: 1, value: 0.0 }];
+    let near = |id: u64| (id == PLAYER).then(|| ("skater".to_string(), [1.0, 0.0, 0.0]));
+    let greeted = MoodEvent { category: "greeted".into(), instigator: Some(PLAYER), second: Some(5), position: [0.0; 3] };
+    assert!(t.accepts("adult_male", &greeted, &ctx(&near)));
+    assert!(!t.accepts("adult_male", &greeted, &MoodContext { flee_pending: true, ..ctx(&near) }), "fleeing: not greeted");
 }

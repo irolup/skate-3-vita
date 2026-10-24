@@ -46,9 +46,23 @@ pub fn bake(install: &Path, out: &Path, names: &[String]) -> Result<(), String> 
         } else {
             None
         };
-        let render = build_render(&source, props.as_ref())?;
+        // Phase 2: the park's Fullpark layout, posed into its render and baked into its sim (park_layout.rs).
+        let layout = crate::park_layout::fullpark(&assets, name);
+        let pieces = match &layout {
+            Some(layout) => Some(crate::park_layout::posed(&assets, layout, sun(&assets, name))?),
+            None => None,
+        };
+        let render = build_render(&source, props.as_ref(), pieces.as_ref())?;
         let (authored_spawn, authored_heading) = (source.spawn, source.heading);
         let mut sim = map::strip_render(source);
+        if let Some(layout) = &layout {
+            let (extension, stats) = skate_sim::park_bake::bake(&assets, layout)?;
+            println!(
+                "  layout {layout}: {} fused triangles over {} pieces, {} railed, {} KiB in the sim map",
+                stats.triangles, stats.pieces, stats.railed, extension.payload.len() / 1024
+            );
+            sim.extensions.push(extension);
+        }
         let (spawn, heading, how) = choose_spawn(&assets, &sim)?;
         sim.spawn = spawn;
         sim.heading = heading;
@@ -97,7 +111,7 @@ pub fn bake_trick_guide(install: &Path, out: &Path) -> Result<(), String> {
     let scene = install.join("assets/private/hud/scene");
     let read = |p: &Path| std::fs::read(p).map_err(|e| format!("{}: {e}", p.display()));
     let set = SkateMap::parse_render_only(&read(&scene.join("TrickGuide.skate"))?)?;
-    let render = build_render(&set, None)?;
+    let render = build_render(&set, None, None)?;
     let (spawn, heading) = (set.spawn, set.heading);
     let set_pack = Map { sim: map::strip_render(set), authored_spawn: spawn, authored_heading: heading, render }.to_pack();
     let root = "private/hud/scene";
@@ -390,6 +404,7 @@ pub(crate) fn family(definition: &[u8]) -> Option<(String, u32)> {
 
 struct Group {
     source: usize,
+    cell: (i32, i32),
     albedo: u32,
     lightmap: u32,
     cutoff: Option<f32>,
@@ -398,9 +413,23 @@ struct Group {
 }
 
 /// Material draw groups of the map and its render-only props package.
-fn build_render(map: &SkateMap, props: Option<&SkateMap>) -> Result<Render, String> {
-    let sources: Vec<&SkateMap> = std::iter::once(map).chain(props).collect();
+/// The park's sun direction (its sky's environment, `native-skies/<map>.json`; the parks' common one without it).
+fn sun(assets: &Path, name: &str) -> [f32; 3] {
+    std::fs::read(assets.join("private/native-skies").join(format!("{name}.json")))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| {
+            let s: Vec<f32> = v["environment"]["sun_direction"].as_array()?.iter().filter_map(|x| x.as_f64().map(|x| x as f32)).collect();
+            <[f32; 3]>::try_from(s).ok()
+        })
+        .unwrap_or([-0.4787, 0.736, 0.4787])
+}
+
+fn build_render(map: &SkateMap, props: Option<&SkateMap>, pieces: Option<&SkateMap>) -> Result<Render, String> {
+    let sources: Vec<&SkateMap> = std::iter::once(map).chain(props).chain(pieces).collect();
     let mut builder = RenderBuilder::default();
+    // A layout's pieces draw per area as well as per material, so that they cull.
+    builder.cells = pieces.map(|_| sources.len() - 1);
     let triangles: Vec<(usize, [u32; 3])> = sources
         .iter()
         .enumerate()
@@ -452,6 +481,8 @@ struct RenderBuilder {
     draws: Vec<Draw>,
     textures: Vec<Texture>,
     texture_keys: Vec<(usize, u32, bool)>,
+    /// The source whose draws split on the layout grid (`park_layout::CELL`).
+    cells: Option<usize>,
 }
 
 impl RenderBuilder {
@@ -486,11 +517,12 @@ impl RenderBuilder {
                 _ => Some(0.5),
             };
             let color = [material.color[0], material.color[1], material.color[2], 1.0];
-            let key = (s, material.textures[0], material.textures[1], cutoff.map(f32::to_bits), color.map(f32::to_bits));
-            let group = match groups.iter().position(|g| (g.source, g.albedo, g.lightmap, g.cutoff.map(f32::to_bits), g.color.map(f32::to_bits)) == key) {
+            let cell = if self.cells == Some(s) { crate::park_layout::cell(src.geometry.vertices[tri[0] as usize].position) } else { (0, 0) };
+            let key = (s, cell, material.textures[0], material.textures[1], cutoff.map(f32::to_bits), color.map(f32::to_bits));
+            let group = match groups.iter().position(|g| (g.source, g.cell, g.albedo, g.lightmap, g.cutoff.map(f32::to_bits), g.color.map(f32::to_bits)) == key) {
                 Some(i) => i,
                 None => {
-                    groups.push(Group { source: s, albedo: material.textures[0], lightmap: material.textures[1], cutoff, color, triangles: Vec::new() });
+                    groups.push(Group { source: s, cell, albedo: material.textures[0], lightmap: material.textures[1], cutoff, color, triangles: Vec::new() });
                     groups.len() - 1
                 }
             };

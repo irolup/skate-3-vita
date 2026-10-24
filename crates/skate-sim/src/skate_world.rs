@@ -4,7 +4,7 @@
 //! (`validate_runtime`, `collision_world` and their helpers), unchanged. The render
 //! adapter (meshes, textures, shadows) is not copied. `bevy::prelude::Vec3` is
 //! `glam::Vec3`, the same type bevy re-exports.
-use glam::Vec3;
+use glam::{Vec2, Vec3};
 use tracing::info_span;
 use skate_core::{
     math::Vector3,
@@ -51,6 +51,10 @@ pub(crate) fn validate_runtime(map: &SkateMap) -> Result<(), String> {
         }
         if extension.tag == crate::park_layout::EXTENSION_TAG {
             // The in-memory skate.Park layout mark (park_layout::attach), never in a package file.
+            continue;
+        }
+        if extension.tag == crate::park_bake::EXTENSION_TAG && extension.schema == 1 {
+            // skate_vita: a park pack's baked layout (park_bake.rs), appended to the static world and the rails.
             continue;
         }
         if extension.tag == *b"SKYB" && extension.schema == 1 {
@@ -142,7 +146,7 @@ fn retail_archive(map: &SkateMap) -> Result<Option<&[u8]>, String> {
 fn retail_collision_world(
     archive: &[u8],
     material: RetailContactMaterial,
-    pieces: Option<&crate::park_layout::Pieces>,
+    pieces: Option<LayoutPieces>,
 ) -> Result<BoardWorld, String> {
     let mut triangles = Vec::new();
     let mut packed_surfaces = Vec::new();
@@ -206,7 +210,7 @@ fn retail_collision_world(
         meshes.len()
     );
     if let Some(pieces) = pieces {
-        append_pieces(&mut triangles, &mut packed_surfaces, &mut meshes, pieces, material)?;
+        pieces.append(&mut triangles, &mut packed_surfaces, &mut meshes, material)?;
     }
     BoardWorld::with_query_metadata(
         triangles,
@@ -229,12 +233,13 @@ pub(crate) fn collision_world(
 
 /// [`collision_world`] plus a skate.Park layout's placed pieces (crate::park_layout::Pieces): their posed triangles
 /// after the map's own, one query range per piece (retail registers each piece in the static set, b431).
+/// skate_vita: or a baked layout's fused rows ([`LayoutPieces::Baked`]).
 pub(crate) fn collision_world_with(
     map: &SkateMap,
     material: RetailContactMaterial,
-    pieces: Option<&crate::park_layout::Pieces>,
+    pieces: Option<LayoutPieces>,
 ) -> Result<BoardWorld, String> {
-    let pieces = pieces.filter(|p| !p.collision.is_empty());
+    let pieces = pieces.filter(|p| !p.is_empty());
     if let Some(archive) = retail_archive(map)? {
         return retail_collision_world(archive, material, pieces);
     }
@@ -242,7 +247,7 @@ pub(crate) fn collision_world_with(
         return portable_world(&map.geometry.collision, &map.materials, material, None);
     };
     let (mut triangles, mut packed_surfaces, mut meshes) = portable_parts(&map.geometry.collision, &map.materials, material, None, false)?;
-    append_pieces(&mut triangles, &mut packed_surfaces, &mut meshes, pieces, material)?;
+    pieces.append(&mut triangles, &mut packed_surfaces, &mut meshes, material)?;
     BoardWorld::with_query_metadata(triangles, QueryMetadata { packed_surfaces, meshes, static_edges: vec![], island_flags: 0 })
         .map_err(str::to_owned)
 }
@@ -254,7 +259,12 @@ fn append_pieces(
     pieces: &crate::park_layout::Pieces,
     material: RetailContactMaterial,
 ) -> Result<(), String> {
-    let (more, surfaces, piece_meshes) = portable_parts(&pieces.collision, &pieces.materials, material, Some(&pieces.ranges), true)?;
+    // 828728B8 / 827765C0: docs/hails-additions/39-skatepark-layouts.md#code-reference-skate_worldrs
+    let (fused, unfused) = split_unfused(pieces);
+    let (more, surfaces, piece_meshes) =
+        portable_parts_fused(&fused.0, &pieces.materials, material, Some(&fused.1), true, Some((&pieces.fuse, &fused.2)))?;
+    info!("SKATE_PARK_FUSE weld={} m triangles={} kept={} unfused_pieces={} rules={:?} (collapsed and back-to-back faces dropped, seams paired, edge bytes as retail's fuser)",
+        pieces.fuse.weld, fused.0.len(), more.len(), unfused.1.len(), pieces.fuse);
     let offset = triangles.len();
     triangles.extend(more);
     packed_surfaces.extend(surfaces);
@@ -263,6 +273,81 @@ fn append_pieces(
         mesh
     }));
     Ok(())
+}
+/// skate_vita: what [`append_pieces`] appends, as rows with one range per piece (for the bake, crate::park_bake).
+pub(crate) fn fused_piece_rows(pieces: &crate::park_layout::Pieces) -> Result<(Vec<FusedTriangle>, Vec<std::ops::Range<usize>>), String> {
+    let (fused, _) = split_unfused(pieces);
+    let (rows, splits) = fuse_rows(&fused.0, &pieces.materials, Some(&fused.1), true, Some((&pieces.fuse, &fused.2)))?;
+    Ok((rows, splits.unwrap_or_default()))
+}
+
+/// skate_vita: [`append_pieces`] from a baked layout's rows (no fuse at load).
+fn append_baked(
+    triangles: &mut Vec<WorldTriangle>,
+    packed_surfaces: &mut Vec<u16>,
+    meshes: &mut Vec<QueryMesh>,
+    baked: &crate::park_bake::Baked<'_>,
+    material: RetailContactMaterial,
+) -> Result<(), String> {
+    let piece_meshes = append_rows(baked.rows(), Some(&baked.ranges), material, triangles, packed_surfaces)?;
+    info!("SKATE_PARK_BAKED triangles={} pieces={}", baked.len(), baked.ranges.len());
+    meshes.extend(piece_meshes);
+    Ok(())
+}
+
+/// The pieces a static world takes beside the map's own: a layout's loaded pieces (fused at load, upstream) or a baked
+/// layout's rows (skate_vita, crate::park_bake).
+#[derive(Clone, Copy)]
+pub(crate) enum LayoutPieces<'a> {
+    Loaded(&'a crate::park_layout::Pieces),
+    Baked(&'a crate::park_bake::Baked<'a>),
+}
+
+impl LayoutPieces<'_> {
+    fn append(self, triangles: &mut Vec<WorldTriangle>, packed_surfaces: &mut Vec<u16>, meshes: &mut Vec<QueryMesh>, material: RetailContactMaterial) -> Result<(), String> {
+        match self {
+            Self::Loaded(pieces) => append_pieces(triangles, packed_surfaces, meshes, pieces, material),
+            Self::Baked(baked) => append_baked(triangles, packed_surfaces, meshes, baked, material),
+        }
+    }
+
+    fn is_empty(self) -> bool {
+        match self {
+            Self::Loaded(pieces) => pieces.collision.is_empty(),
+            Self::Baked(baked) => baked.len() == 0,
+        }
+    }
+}
+
+/// The layout's IgnoreFuser pieces as a world of their own, which only props collide with:
+/// docs/hails-additions/39-skatepark-layouts.md#props-and-ignorefuser-pieces
+pub(crate) fn props_only_world(
+    pieces: &crate::park_layout::Pieces,
+    material: RetailContactMaterial,
+) -> Result<Option<BoardWorld>, String> {
+    let (_, unfused) = split_unfused(pieces);
+    if unfused.0.is_empty() {
+        return Ok(None);
+    }
+    let (triangles, packed_surfaces, meshes) = portable_parts(&unfused.0, &pieces.materials, material, Some(&unfused.1), true)?;
+    info!("SKATE_PARK_PROPS_ONLY pieces={} triangles={}", unfused.1.len(), triangles.len());
+    BoardWorld::with_query_metadata(triangles, QueryMetadata { packed_surfaces, meshes, static_edges: vec![], island_flags: 0 })
+        .map(Some)
+        .map_err(str::to_owned)
+}
+type PieceSet =(Vec<skate_data::skate_map::Collision>, Vec<std::ops::Range<usize>>, Vec<FuseTag>);
+/// The layout's pieces split into the fused set and the IgnoreFuser pieces, each with its own triangles and one range
+/// per piece (layout order kept, so both are deterministic).
+fn split_unfused(pieces: &crate::park_layout::Pieces) -> (PieceSet, PieceSet) {
+    let (mut fused, mut unfused): (PieceSet, PieceSet) = Default::default();
+    for (index, range) in pieces.ranges.iter().enumerate() {
+        let set = if pieces.unfused.get(index).copied().unwrap_or(false) { &mut unfused } else { &mut fused };
+        let start = set.0.len();
+        set.0.extend_from_slice(&pieces.collision[range.clone()]);
+        set.1.push(start..set.0.len());
+        set.2.extend(range.clone().map(|i| pieces.tags.get(i).copied().unwrap_or_default()));
+    }
+    (fused, unfused)
 }
 
 /// skate_vita: a prop stands on the floor with its base plane (its template's lowest points, where
@@ -286,22 +371,46 @@ fn floor_base_edges(points: &[[[f32; 3]; 3]], range: std::ops::Range<usize>, fla
     }
 }
 
-/// Welded vertices and reconstructed edge features (flags, cosines) of a
-/// triangle soup: the 1 mm welding and edge pairing shared by the portable map
-/// world and prop instances created mid-game. `reconstruct` = false keeps the
-/// default features (fully native maps decode theirs per triangle).
+/// Welded vertices and reconstructed edge features: docs/hails-additions/39-skatepark-layouts.md#code-reference-skate_worldrs
 fn welded_edge_features(
     triangles: &[[[f32; 3]; 3]],
     reconstruct: bool,
 ) -> Result<(Vec<Vec3>, Vec<[usize; 3]>, Vec<u32>, Vec<[f32; 3]>), String> {
+    welded_edge_features_within(triangles, reconstruct, None)
+}
+/// [`welded_edge_features`] with `merge` = a distance weld (a vertex joins the first earlier vertex within `merge`
+/// metres, in triangle order, so the result is deterministic): the fused park pieces (b478). A triangle whose corners
+/// merge together has repeated vertex ids; its edges pair with nothing and the caller drops it.
+fn welded_edge_features_within(
+    triangles: &[[[f32; 3]; 3]],
+    reconstruct: bool,
+    merge: Option<f32>,
+) -> Result<(Vec<Vec3>, Vec<[usize; 3]>, Vec<u32>, Vec<[f32; 3]>), String> {
     // Match the reference RW mesh compiler's 1 mm vertex welding and reversed
     // edge pairing. Triangle diagonals are adjacency, never authored ledges.
     let mut welded = HashMap::<[i64; 3], usize>::new();
+    let mut cells = HashMap::<[i64; 3], Vec<usize>>::new();
     let mut positions = Vec::<Vec3>::new();
     let mut vertices = Vec::new();
     let mut normals = Vec::new();
     for points in triangles {
         let ids = points.map(|p| {
+            if let Some(merge) = merge {
+                let cell = p.map(|v| (f64::from(v) / f64::from(merge)).floor() as i64);
+                let point = Vec3::from_array(p);
+                let near = (-1..=1).flat_map(|x| (-1..=1).flat_map(move |y| (-1..=1).map(move |z| [x, y, z])))
+                    .filter_map(|d| cells.get(&[cell[0] + d[0], cell[1] + d[1], cell[2] + d[2]]))
+                    .flatten()
+                    .copied()
+                    .filter(|&id| positions[id].distance(point) <= merge)
+                    .min();
+                return near.unwrap_or_else(|| {
+                    let id = positions.len();
+                    positions.push(point);
+                    cells.entry(cell).or_default().push(id);
+                    id
+                });
+            }
             let inverse = 1.0 / f64::from(0.001_f32);
             let key = p.map(|v| (f64::from(v) * inverse).round() as i64);
             *welded.entry(key).or_insert_with(|| {
@@ -311,10 +420,12 @@ fn welded_edge_features(
             })
         });
         let [a, b, c] = points.map(Vec3::from_array);
-        let normal = (b - a)
-            .cross(c - a)
-            .try_normalize()
-            .ok_or("Invalid SKATE collision triangle normal")?;
+        // 82AC2010: the fused path drops zero-area triangles after the merge instead of failing the set.
+        let normal = match ((b - a).cross(c - a).try_normalize(), merge) {
+            (Some(n), _) => n,
+            (None, Some(_)) => Vec3::ZERO,
+            (None, None) => return Err("Invalid SKATE collision triangle normal".into()),
+        };
         vertices.push(ids);
         normals.push(normal);
     }
@@ -328,6 +439,10 @@ fn welded_edge_features(
         for (i, ids) in vertices.iter().enumerate() {
             for edge in 0..3 {
                 let (a, b) = (ids[edge], ids[(edge + 1) % 3]);
+                // A collapsed edge of a fused triangle (dropped by the caller); the 1 mm path keeps its old pairing.
+                if a == b && merge.is_some() {
+                    continue;
+                }
                 if let Some((other, oe)) = open.remove(&(b, a)) {
                     let cosine = normals[i].dot(normals[other]).clamp(-1., 1.);
                     let orientation =
@@ -369,6 +484,471 @@ fn welded_edge_features(
     }
     Ok((positions, vertices, flags, cosines))
 }
+/// Retail's fused-mesh edge score (`82AC00A0`): d = n1.n2; a convex or flat edge (edge . (n1 x n2) > -1e-6) scores
+/// max(d, -1) in [-1, 1], a concave one min(2 - d, 3) in [1, 3]. Faces folded flat onto each other score 3 (concave)
+/// or -1 (a convex knife edge).
+fn fused_edge_score(n1: Vec3, n2: Vec3, edge: Vec3) -> f32 {
+    // 82AC00A0's fmadds / fmsubs order, so a coplanar pair can reach exactly 1.0.
+    let d = n2.z.mul_add(n1.z, n2.x.mul_add(n1.x, n2.y * n1.y));
+    let cx = n1.y.mul_add(n2.z, -(n2.y * n1.z));
+    let cy = n2.x.mul_add(n1.z, -(n1.x * n2.z));
+    let cz = n1.x.mul_add(n2.y, -(n2.x * n1.y));
+    let orientation = edge.x.mul_add(cx, edge.z.mul_add(cz, edge.y * cy));
+    if orientation > -1.0e-6 { d.max(-1.0) } else { (2.0 - d).min(3.0) }
+}
+/// Retail's back-to-back cull thresholds (`828755B8`: 2.99 `822F90E8`, -0.99 `822F8E60`).
+const FUSED_FOLD_ABOVE: f32 = 2.99;
+const FUSED_FOLD_BELOW: f32 = -0.99;
+/// 82876188: docs/hails-additions/39-skatepark-layouts.md#code-reference-skate_worldrs. `pieces[i]` = triangle i's
+/// piece; also returns `dropped[i]`.
+#[allow(clippy::type_complexity)]
+fn fused_edge_features(
+    triangles: &[[[f32; 3]; 3]],
+    rules: &crate::park_layout::FuseRules,
+    pieces: &[usize],
+    tags: &[FuseTag],
+) -> Result<(Vec<Vec3>, Vec<[usize; 3]>, Vec<u32>, Vec<[f32; 3]>, Vec<bool>), String> {
+    let (positions, vertices, mut flags, mut cosines) = welded_edge_features_within(triangles, false, Some(rules.weld))?;
+    let n = vertices.len();
+    // 82872D70: one builder triangle per unit, docs/hails-additions/39-skatepark-layouts.md#fused-vertex-order
+    let excluded: Vec<bool> = (0..n).map(|i| rules.quad_first_half_only && tags.get(i).is_some_and(|t| t.second_half)).collect();
+    let normals: Vec<Option<Vec3>> = vertices
+        .iter()
+        .zip(&excluded)
+        .map(|(v, &excluded)| {
+            let [a, b, c] = v.map(|id| positions[id]);
+            (!excluded && v[0] != v[1] && v[1] != v[2] && v[0] != v[2]).then(|| fused_normal(a, b, c)).flatten()
+        })
+        .collect();
+    let mut dropped: Vec<bool> = normals.iter().map(Option::is_none).collect();
+    let mut users = vec![Vec::new(); positions.len()];
+    let ranked = fused_vertex_ranks(&vertices, positions.len(), pieces, tags);
+    let order: Vec<(u32, u32)> = match &ranked {
+        // 82AC21D8 -> 82AC4A40.
+        Some(rank) => {
+            let mut table: Vec<(u32, u32)> = (0..n)
+                .filter(|&i| !excluded[i])
+                .flat_map(|i| vertices[i].map(|id| (rank[id], i as u32)))
+                .collect();
+            eastl_quick_sort(&mut table);
+            table
+        }
+        None => vertices.iter().enumerate().flat_map(|(i, v)| v.map(|id| (id as u32, i as u32))).collect(),
+    };
+    let vertex_of_rank: Vec<usize> = match &ranked {
+        Some(rank) => {
+            let mut back = vec![0; positions.len()];
+            for (id, &r) in rank.iter().enumerate() {
+                back[r as usize] = id;
+            }
+            back
+        }
+        None => (0..positions.len()).collect(),
+    };
+    for (r, i) in order {
+        let (id, i) = (vertex_of_rank[r as usize], i as usize);
+        if !dropped[i] && users[id].last() != Some(&i) {
+            users[id].push(i);
+        }
+    }
+    let normal = |i: usize| normals[i].unwrap_or(Vec3::ZERO);
+    // 82875438: the live triangle of `t`'s piece across `t`'s edge (from, to), and its third vertex.
+    let partner = |dropped: &[bool], t: usize, from: usize, to: usize| {
+        users[from].iter().copied().filter(|&u| u != t && !dropped[u] && pieces[u] == pieces[t]).find_map(|u| {
+            (0..3).find(|&j| vertices[u][j] == from && vertices[u][(j + 2) % 3] == to).map(|j| (u, vertices[u][(j + 1) % 3]))
+        })
+    };
+    // 828755B8: back-to-back faces of different pieces.
+    for t in 0..n {
+        if dropped[t] {
+            continue;
+        }
+        for e in 0..3 {
+            let (a, b, c) = (vertices[t][e], vertices[t][(e + 1) % 3], vertices[t][(e + 2) % 3]);
+            for &u in &users[a] {
+                if u <= t || dropped[u] || pieces[u] == pieces[t] {
+                    continue;
+                }
+                for k in 0..3 {
+                    if vertices[u][k] != a || vertices[u][(k + 2) % 3] != b {
+                        continue;
+                    }
+                    let score = fused_edge_score(normal(t), normal(u), positions[b] - positions[a]);
+                    if !(score > FUSED_FOLD_ABOVE || score < FUSED_FOLD_BELOW) {
+                        continue;
+                    }
+                    let x = vertices[u][(k + 1) % 3];
+                    if c == x {
+                        dropped[t] = true;
+                        dropped[u] = true;
+                    } else if let (Some((t2, t2_third)), Some((u2, u2_third))) =
+                        (partner(&dropped, t, b, c), partner(&dropped, u, a, x))
+                    {
+                        if t2_third == x && u2_third == c {
+                            for i in [t, t2, u, u2] {
+                                dropped[i] = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // 82875B20 / 82875CA8: best-score pairing; unpaired edges keep score 1.
+    let mut neighbour = vec![[usize::MAX; 3]; n];
+    let mut best = vec![[1.0f32; 3]; n];
+    let unlink = |neighbour: &mut Vec<[usize; 3]>, best: &mut Vec<[f32; 3]>, x: usize, from: usize| {
+        if let Some(j) = (0..3).find(|&j| neighbour[x][j] == from) {
+            neighbour[x][j] = usize::MAX;
+            best[x][j] = 1.0;
+        }
+    };
+    for t in 0..n {
+        if dropped[t] {
+            continue;
+        }
+        for e in 0..3 {
+            let (a, b) = (vertices[t][e], vertices[t][(e + 1) % 3]);
+            for ui in 0..users[a].len() {
+                let u = users[a][ui];
+                if u >= t || dropped[u] {
+                    continue;
+                }
+                let Some(ue) = (0..3).find(|&k| vertices[u][k] == b && vertices[u][(k + 1) % 3] == a) else { continue };
+                let score = fused_edge_score(normal(t), normal(u), positions[b] - positions[a]);
+                let (tn, un) = (neighbour[t][e], neighbour[u][ue]);
+                let replace = match (tn == usize::MAX, un == usize::MAX) {
+                    (true, true) => true,
+                    (true, false) => best[u][ue] < score,
+                    (false, true) => best[t][e] < score,
+                    (false, false) => tn != u && un != t && best[t][e] < score && best[u][ue] < score,
+                };
+                if !replace {
+                    continue;
+                }
+                if tn != usize::MAX {
+                    unlink(&mut neighbour, &mut best, tn, t);
+                }
+                if un != usize::MAX {
+                    unlink(&mut neighbour, &mut best, un, u);
+                }
+                neighbour[t][e] = u;
+                neighbour[u][ue] = t;
+                best[t][e] = score;
+                best[u][ue] = score;
+            }
+        }
+    }
+    // 82874248 / 82874070: docs/hails-additions/39-skatepark-layouts.md#ground-plane-pass
+    for plane in rules.ground_planes.iter().flatten() {
+        let np = Vec3::from_array(plane.normal);
+        let (lo, hi) = (Vec3::from_array(plane.min), Vec3::from_array(plane.max));
+        let tiny = f32::from_bits(0x3400_0000);
+        let boxed = lo.abs().max_element() > tiny || hi.abs().max_element() > tiny;
+        for t in (0..n).filter(|&t| !dropped[t]) {
+            let p = vertices[t].map(|id| positions[id]);
+            if boxed && !p.iter().any(|q| q.cmpge(lo).all() && q.cmple(hi).all()) {
+                continue;
+            }
+            if (-normal(t) - np).abs().max_element() > rules.plane_normal || (np.dot(p[1]) - plane.d).abs() > rules.plane_distance {
+                continue;
+            }
+            for e in 0..3 {
+                let u = neighbour[t][e];
+                if u == usize::MAX || best[t][e] >= rules.plane_score_limit {
+                    continue;
+                }
+                let s = fused_edge_score(np, normal(u), p[(e + 1) % 3] - p[e]);
+                if let Some(j) = (0..3).find(|&j| neighbour[u][j] == t) {
+                    best[u][j] = s;
+                }
+                best[t][e] += s;
+            }
+        }
+    }
+    // 82873EA0 / 82890E20: docs/hails-additions/39-skatepark-layouts.md#mesh-floor-pass
+    if rules.mesh_floor_pass {
+        let up = Vec3::from_array(rules.mesh_floor_up);
+        let mut floors: Vec<(f32, usize)> = (0..n)
+            .filter(|&g| !dropped[g] && (1.0 - normal(g).dot(up)).abs() <= rules.plane_normal)
+            .map(|g| (positions[vertices[g][0]].dot(up), g))
+            .collect();
+        floors.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        for t in (0..n).filter(|&t| !dropped[t]) {
+            let p = vertices[t].map(|id| positions[id]);
+            if (-1.0 - normal(t).dot(up)).abs() > rules.plane_normal || p[0].dot(up).abs() <= rules.plane_distance {
+                continue;
+            }
+            for e in 0..3 {
+                let u = neighbour[t][e];
+                if u == usize::MAX || best[t][e] >= -rules.plane_score_limit {
+                    continue;
+                }
+                let (a, b) = (p[e], p[(e + 1) % 3]);
+                let h = a.dot(up);
+                let start = floors.partition_point(|f| f.0 < h - rules.mesh_floor_gap);
+                let on_floor = floors[start..].iter().take_while(|f| f.0 <= h + rules.mesh_floor_gap).any(|&(_, g)| {
+                    pieces[g] != pieces[t] && xz_segment_meets_triangle(vertices[g].map(|id| positions[id]), a, b)
+                });
+                if on_floor {
+                    let s = fused_edge_score(up, normal(u), b - a);
+                    if let Some(j) = (0..3).find(|&j| neighbour[u][j] == t) {
+                        best[u][j] = s;
+                    }
+                    best[t][e] += s;
+                }
+            }
+        }
+    }
+    // 82AC2438: docs/hails-additions/39-skatepark-layouts.md#fused-edge-bytes-and-vertex-bits
+    let mut edges = vec![[0u8; 3]; n];
+    for t in (0..n).filter(|&t| !dropped[t]) {
+        for e in 0..3 {
+            edges[t][e] = fused_edge_byte(best[t][e], neighbour[t][e] != usize::MAX, rules.concave_tolerance);
+        }
+    }
+    // 82875200: docs/hails-additions/39-skatepark-layouts.md#fused-edge-bytes-and-vertex-bits
+    for (v, faces) in users.iter().enumerate() {
+        let faces: Vec<usize> = faces.iter().copied().filter(|&i| !dropped[i]).collect();
+        let Some((&first, rest)) = faces.split_first() else { continue };
+        let coplanar = rest.iter().all(|&i| (normal(first).dot(normal(i)) - 1.).abs() <= rules.coplanar);
+        if coplanar || fused_vertex_not_convex(&positions, &vertices, normal(first), v, first, rest, rules) {
+            for &i in &faces {
+                for corner in 0..3 {
+                    if vertices[i][corner] == v {
+                        edges[i][corner] |= 0x40;
+                    }
+                }
+            }
+        }
+    }
+    for t in (0..n).filter(|&t| !dropped[t]) {
+        let (decoded, decoded_cosines) = decode_native_edges(edges[t])?;
+        flags[t] = decoded & !1;
+        cosines[t] = decoded_cosines;
+    }
+    Ok((positions, vertices, flags, cosines, dropped))
+}
+/// 82873270 / 828731A8: the segment a-b and the triangle overlap in xz (four separating axes; touching counts).
+fn xz_segment_meets_triangle(tri: [Vec3; 3], a: Vec3, b: Vec3) -> bool {
+    let flat = |v: Vec3| Vec2::new(v.x, v.z);
+    let (t, s) = (tri.map(flat), [flat(a), flat(b)]);
+    let axes = [t[1] - t[0], t[0] - t[2], t[2] - t[1], s[1] - s[0]];
+    axes.iter().filter_map(|d| d.perp().try_normalize()).all(|axis| {
+        let span = |points: &[Vec2]| points.iter().fold((f32::MAX, f32::MIN), |(lo, hi), p| (lo.min(p.dot(axis)), hi.max(p.dot(axis))));
+        let ((tl, th), (sl, sh)) = (span(&t), span(&s));
+        (sl - th).max(tl - sh) <= 0.0
+    })
+}
+/// 82875CA8: a builder triangle's normal, in retail's fmsubs / fmadds order (b506).
+fn fused_normal(a: Vec3, b: Vec3, c: Vec3) -> Option<Vec3> {
+    let (e1, e2) = (b - a, c - a);
+    let x = e1.y.mul_add(e2.z, -(e1.z * e2.y));
+    let y = e1.z.mul_add(e2.x, -(e2.z * e1.x));
+    let z = e2.y.mul_add(e1.x, -(e1.y * e2.x));
+    let length = x.mul_add(x, z.mul_add(z, y * y)).sqrt();
+    if !(length > 0.0) || !length.is_finite() {
+        return None;
+    }
+    let inverse = 1.0 / length;
+    Some(Vec3::new(x * inverse, y * inverse, z * inverse))
+}
+/// 82AC10E8: a merged vertex's rank is that of its smallest raw key (piece, mesh, cluster, index); `None` without
+/// keys for every triangle. docs/hails-additions/39-skatepark-layouts.md#fused-vertex-order
+fn fused_vertex_ranks(vertices: &[[usize; 3]], count: usize, pieces: &[usize], tags: &[FuseTag]) -> Option<Vec<u32>> {
+    if tags.len() != vertices.len() {
+        return None;
+    }
+    let mut smallest = vec![u64::MAX; count];
+    for ((v, tag), &piece) in vertices.iter().zip(tags).zip(pieces) {
+        let keys = tag.keys?;
+        for (&id, key) in v.iter().zip(keys) {
+            smallest[id] = smallest[id].min((piece as u64) << 40 | key);
+        }
+    }
+    let mut ids: Vec<usize> = (0..count).collect();
+    ids.sort_by_key(|&id| (smallest[id], id));
+    let mut rank = vec![0; count];
+    for (r, id) in ids.into_iter().enumerate() {
+        rank[id] = r as u32;
+    }
+    Some(rank)
+}
+/// EASTL quick_sort on the first field, as 82AC4A40 / 82AC52D0 / 82AC5418 / 82AC6660 run it (unstable).
+fn eastl_quick_sort(v: &mut [(u32, u32)]) {
+    const LIMIT: usize = 28;
+    fn insertion(v: &mut [(u32, u32)]) {
+        for i in 1..v.len() {
+            let temp = v[i];
+            let mut j = i;
+            while j > 0 && temp.0 < v[j - 1].0 {
+                v[j] = v[j - 1];
+                j -= 1;
+            }
+            v[j] = temp;
+        }
+    }
+    fn adjust_heap(v: &mut [(u32, u32)], top: usize, size: usize, mut position: usize, value: (u32, u32)) {
+        let mut child = 2 * position + 2;
+        while child < size {
+            if v[child].0 < v[child - 1].0 {
+                child -= 1;
+            }
+            v[position] = v[child];
+            position = child;
+            child = 2 * child + 2;
+        }
+        if child == size {
+            v[position] = v[child - 1];
+            position = child - 1;
+        }
+        while position > top {
+            let parent = (position - 1) >> 1;
+            if value.0 <= v[parent].0 {
+                break;
+            }
+            v[position] = v[parent];
+            position = parent;
+        }
+        v[position] = value;
+    }
+    fn heap_sort(v: &mut [(u32, u32)]) {
+        let n = v.len();
+        if n >= 2 {
+            let mut parent = ((n - 2) >> 1) + 1;
+            while parent != 0 {
+                parent -= 1;
+                let value = v[parent];
+                adjust_heap(v, parent, n, parent, value);
+            }
+        }
+        let mut last = n;
+        while last > 1 {
+            let value = v[last - 1];
+            v[last - 1] = v[0];
+            adjust_heap(v, 0, last - 1, 0, value);
+            last -= 1;
+        }
+    }
+    fn introsort(v: &mut [(u32, u32)], mut depth: i32) {
+        let mut last = v.len();
+        while last > LIMIT && depth > 0 {
+            let (a, b, c) = (v[0].0, v[last / 2].0, v[last - 1].0);
+            let pivot = if a < b {
+                if b < c { b } else if a < c { c } else { a }
+            } else if a < c {
+                a
+            } else if b < c {
+                c
+            } else {
+                b
+            };
+            let (mut first, mut end) = (0, last);
+            loop {
+                while v[first].0 < pivot {
+                    first += 1;
+                }
+                end -= 1;
+                while pivot < v[end].0 {
+                    end -= 1;
+                }
+                if end <= first {
+                    break;
+                }
+                v.swap(first, end);
+                first += 1;
+            }
+            depth -= 1;
+            introsort(&mut v[first..last], depth);
+            last = first;
+        }
+        if depth == 0 {
+            heap_sort(&mut v[..last]);
+        }
+    }
+    let n = v.len();
+    if n == 0 {
+        return;
+    }
+    let bits = usize::BITS - n.leading_zeros();
+    introsort(v, 2 * bits as i32 - 2);
+    if n > LIMIT {
+        insertion(&mut v[..LIMIT]);
+        for i in LIMIT..n {
+            let temp = v[i];
+            let mut j = i;
+            while temp.0 < v[j - 1].0 {
+                v[j] = v[j - 1];
+                j -= 1;
+            }
+            v[j] = temp;
+        }
+    } else {
+        insertion(v);
+    }
+}
+/// 82AC0140: docs/hails-additions/39-skatepark-layouts.md#fused-edge-bytes-and-vertex-bits
+fn fused_angle_code(score: f32) -> u8 {
+    let x = if score <= 1.0 { score } else { 2.0 - score };
+    let theta = x.clamp(-1.0, 1.0).acos().max(f32::from_bits(0x388A_697B)) * std::f32::consts::FRAC_1_PI;
+    let code = (-2.0 * theta.log2()) as i32;
+    code.clamp(0, 26) as u8
+}
+/// 82AC2390: docs/hails-additions/39-skatepark-layouts.md#fused-edge-bytes-and-vertex-bits
+fn fused_edge_byte(score: f32, paired: bool, concave_tolerance: f32) -> u8 {
+    let mut code = fused_angle_code(score);
+    if score < 1.0 {
+        code |= 0x20;
+    }
+    if score > 2.0 + concave_tolerance {
+        code |= 0x1A;
+    }
+    if !paired {
+        code |= 0x9A;
+    }
+    code
+}
+/// 82874DC8 / 82874CD0: docs/hails-additions/39-skatepark-layouts.md#fused-edge-bytes-and-vertex-bits
+fn fused_vertex_not_convex(
+    positions: &[Vec3],
+    vertices: &[[usize; 3]],
+    n_ref: Vec3,
+    v: usize,
+    first: usize,
+    rest: &[usize],
+    rules: &crate::park_layout::FuseRules,
+) -> bool {
+    let at = positions[v];
+    let others = |t: usize| {
+        let k = (0..3).find(|&k| vertices[t][k] == v).unwrap_or(0);
+        [vertices[t][(k + 1) % 3], vertices[t][(k + 2) % 3]]
+    };
+    let [a, b] = others(first);
+    let (mut u1, mut u2) = ((at - positions[a]).normalize_or_zero(), (at - positions[b]).normalize_or_zero());
+    for &t in rest {
+        for p in others(t) {
+            let w = (at - positions[p]).normalize_or_zero();
+            let s = w.dot(n_ref);
+            if s.abs() > rules.in_plane {
+                if s < rules.below_plane {
+                    return true;
+                }
+                continue;
+            }
+            let (c, q) = (u1.dot(u2), -w);
+            if (u1 + u2).dot(q) >= 0.0 && q.dot(u1) >= c - rules.wedge_slack && q.dot(u2) >= c - rules.wedge_slack {
+                return true;
+            }
+            let (w1, w2) = (u1.dot(w), u2.dot(w));
+            if w2 > w1 && c > w1 {
+                u2 = w;
+            } else if c > w2 {
+                u1 = w;
+            }
+        }
+    }
+    false
+}
 
 /// Portable triangle world: 1 mm vertex welding, reconstructed adjacency and
 /// contiguous-range broadphase metadata. Shared by the playable map and by
@@ -401,36 +981,118 @@ fn portable_parts(
     splits: Option<&[std::ops::Range<usize>]>,
     native_surfaces: bool,
 ) -> Result<(Vec<WorldTriangle>, Vec<u16>, Vec<QueryMesh>), String> {
+    portable_parts_fused(collision, materials, material, splits, native_surfaces, None)
+}
+/// [`portable_parts`] with an optional fuse (82872D70): docs/hails-additions/39-skatepark-layouts.md#code-reference-skate_worldrs
+fn portable_parts_fused(
+    collision: &[skate_data::skate_map::Collision],
+    materials: &[skate_data::skate_map::Material],
+    material: RetailContactMaterial,
+    splits: Option<&[std::ops::Range<usize>]>,
+    native_surfaces: bool,
+    fuse: Option<(&crate::park_layout::FuseRules, &[FuseTag])>,
+) -> Result<(Vec<WorldTriangle>, Vec<u16>, Vec<QueryMesh>), String> {
+    let (rows, fused_splits) = fuse_rows(collision, materials, splits, native_surfaces, fuse)?;
+    parts_from_rows(&rows, fused_splits.as_deref().or(splits), material)
+}
+
+/// The first half of [`portable_parts_fused`] (skate_vita: split out for the baked layouts): the kept triangles as
+/// rows, and with a fuse the split ranges over the kept ones.
+pub(crate) fn fuse_rows(
+    collision: &[skate_data::skate_map::Collision],
+    materials: &[skate_data::skate_map::Material],
+    splits: Option<&[std::ops::Range<usize>]>,
+    native_surfaces: bool,
+    fuse: Option<(&crate::park_layout::FuseRules, &[FuseTag])>,
+) -> Result<(Vec<FusedTriangle>, Option<Vec<std::ops::Range<usize>>>), String> {
     let points: Vec<_> = collision.iter().map(|t| t.points).collect();
-    let (positions, vertices, mut flags, mut cosines) =
-        welded_edge_features(&points, collision.iter().any(|t| t.native_edges.is_none()))?;
-    let mut triangles = Vec::with_capacity(vertices.len());
-    let mut packed_surfaces = Vec::with_capacity(vertices.len());
+    let (positions, vertices, mut flags, mut cosines, kept) = if let Some((rules, tags)) = fuse {
+        // The piece of each triangle: one split range per piece (append_pieces), else one piece.
+        let mut pieces = vec![0; points.len()];
+        for (piece, range) in splits.unwrap_or(&[]).iter().enumerate() {
+            pieces[range.clone()].fill(piece);
+        }
+        let (positions, vertices, flags, cosines, dropped) = fused_edge_features(&points, rules, &pieces, tags)?;
+        (positions, vertices, flags, cosines, dropped.into_iter().map(|d| !d).collect::<Vec<bool>>())
+    } else {
+        let reconstruct = collision.iter().any(|t| t.native_edges.is_none());
+        let (positions, vertices, flags, cosines) = welded_edge_features_within(&points, reconstruct, None)?;
+        let kept = vec![true; vertices.len()];
+        (positions, vertices, flags, cosines, kept)
+    };
+    let fused_splits: Option<Vec<std::ops::Range<usize>>> = (fuse.is_some()).then(|| {
+        let before: Vec<usize> = std::iter::once(0).chain(kept.iter().scan(0, |n, &k| { *n += usize::from(k); Some(*n) })).collect();
+        splits.map_or_else(|| vec![0..before[kept.len()]], |s| s.iter().map(|r| before[r.start]..before[r.end]).filter(|r| !r.is_empty()).collect())
+    });
+    let mut rows = Vec::with_capacity(vertices.len());
     for (i, source) in collision.iter().enumerate() {
-        if let Some(edges) = source.native_edges {
+        if !kept[i] {
+            continue;
+        }
+        if let (Some(edges), None) = (source.native_edges, fuse) {
             (flags[i], cosines[i]) = decode_native_edges(edges)?;
         }
-        if native_surfaces && source.native_edges.is_some() {
-            packed_surfaces.push(source.surface as u16);
+        let packed = if native_surfaces && source.native_edges.is_some() {
+            source.surface as u16
         } else {
             let m = &materials[source.material as usize - 1];
             // Exact EncodeRwSurfaceId mapping from the reference native adapter.
-            packed_surfaces.push((m.audio | (m.physics << 7) | (m.pattern << 12)) as u16);
-        }
-        let points = vertices[i].map(|id| {
-            let p = positions[id];
-            Vector3::new(p.x, p.y, p.z)
-        });
+            (m.audio | (m.physics << 7) | (m.pattern << 12)) as u16
+        };
+        let points = vertices[i].map(|id| positions[id].to_array());
+        rows.push(FusedTriangle { points, surface: source.surface, packed, flags: flags[i], cosines: cosines[i] });
+    }
+    Ok((rows, fused_splits))
+}
+
+/// skate_vita: a static triangle as [`portable_parts_fused`] decides it, before it becomes a `WorldTriangle`: what a
+/// baked skate.Park layout stores (crate::park_bake), so the Vita builds the fused pieces without running the fuser.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct FusedTriangle {
+    pub points: [[f32; 3]; 3],
+    pub surface: u32,
+    pub packed: u16,
+    pub flags: u32,
+    pub cosines: [f32; 3],
+}
+
+/// The second half of [`portable_parts_fused`] (skate_vita: split out for the baked layouts): the triangles, their
+/// packed surfaces and the query meshes over `splits` (64 triangles at most each).
+pub(crate) fn parts_from_rows(
+    rows: &[FusedTriangle],
+    splits: Option<&[std::ops::Range<usize>]>,
+    material: RetailContactMaterial,
+) -> Result<(Vec<WorldTriangle>, Vec<u16>, Vec<QueryMesh>), String> {
+    let (mut triangles, mut packed_surfaces) = (Vec::new(), Vec::new());
+    let meshes = append_rows(rows.iter().copied(), splits, material, &mut triangles, &mut packed_surfaces)?;
+    Ok((triangles, packed_surfaces, meshes))
+}
+
+/// [`parts_from_rows`] appending to a world's triangles and packed surfaces in place (skate_vita: a baked layout's
+/// 149,000 MegaPark triangles are 19.6 MB, built once instead of built and copied); the meshes' ranges are the
+/// appended triangles' places.
+pub(crate) fn append_rows(
+    rows: impl ExactSizeIterator<Item = FusedTriangle>,
+    splits: Option<&[std::ops::Range<usize>]>,
+    material: RetailContactMaterial,
+    triangles: &mut Vec<WorldTriangle>,
+    packed_surfaces: &mut Vec<u16>,
+) -> Result<Vec<QueryMesh>, String> {
+    let offset = triangles.len();
+    triangles.reserve_exact(rows.len());
+    packed_surfaces.reserve_exact(rows.len());
+    for row in rows {
+        packed_surfaces.push(row.packed);
         // Keep the supplied game's original static-world contact combine values.
         // The native map bridge supplies packed surfaces, not a guessed split of
         // the package's single friction scalar into static/dynamic coefficients.
         triangles.push(
             WorldTriangle::from_vertices(
-                points,
+                row.points.map(|p| Vector3::new(p[0], p[1], p[2])),
                 material,
-                source.surface,
-                flags[i],
-                cosines[i],
+                row.surface,
+                row.flags,
+                row.cosines,
                 0.,
             )
             .ok_or("Invalid SKATE collision volume")?,
@@ -441,8 +1103,9 @@ fn portable_parts(
     // triangle order and mesh identity/filter values: contact tie-breaking,
     // packed surfaces and adjacency must not change with this acceleration.
     let mut meshes = Vec::new();
-    let whole = [0..triangles.len()];
+    let whole = [0..triangles.len() - offset];
     for (start, end) in splits.unwrap_or(&whole).iter().flat_map(|r| (r.start..r.end).step_by(64).map(move |s| (s, (s + 64).min(r.end)))) {
+        let (start, end) = (start + offset, end + offset);
         let bounds = Bounds::from_points(triangles[start..end].iter().flat_map(|t| t.triangle.vertices))
             .ok_or("SKATE collision bounds empty")?;
         meshes.push(QueryMesh {
@@ -455,7 +1118,7 @@ fn portable_parts(
             pool: QueryPool::Ground,
         });
     }
-    Ok((triangles, packed_surfaces, meshes))
+    Ok(meshes)
 }
 
 /// One prop type's collision (skate_vita): the winding-fixed template-space triangles with
@@ -845,19 +1508,21 @@ impl PropCollisionLayer {
     }
 }
 
-/// Static collision for spawned DMO prop instances. No authored DMO collision
-/// mesh is recovered, so each instance reuses its template's render triangles,
-/// baked into world space with the instance transform at load. Reflections
-/// flip winding to keep outward normals; degenerate render triangles are
-/// skipped rather than rejecting the whole layer.
-/// One DMO template's retail physics collision (`native-props/<map>.json` `collision`, setup
-/// `dynamic_props.template_collision`): the template's ClusteredMesh triangles in model space, with their RW edge codes
-/// and surface ids (research dmo-physics-collision.md). Keyed by template id, so a mod can supply or replace one.
+/// One DMO template's retail collision: docs/hails-additions/39-skatepark-layouts.md#code-reference-skate_worldrs
 #[derive(Clone, Debug, Default)]
 pub(crate) struct PropShape {
     pub triangles: Vec<[[f32; 3]; 3]>,
     pub edges: Vec<Option<[u8; 3]>>,
     pub surfaces: Vec<u32>,
+    /// Empty when the sidecar predates them.
+    pub fuse: Vec<FuseTag>,
+}
+/// docs/hails-additions/39-skatepark-layouts.md#fused-vertex-order
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct FuseTag {
+    /// Raw vertex key per corner within the template: mesh << 32 | cluster << 8 | index.
+    pub keys: Option<[u64; 3]>,
+    pub second_half: bool,
 }
 
 /// The retail collision shapes per DMO template id; empty when setup exported none (older install).
@@ -888,7 +1553,24 @@ pub(crate) fn load_collision_shapes(path: &std::path::Path) -> std::collections:
             warn!("SKATE_PROP_COLLISION: {}: template {key}: triangle, edge and surface counts differ; render mesh kept", path.display());
             continue;
         }
-        out.insert(key.clone(), PropShape { triangles, edges, surfaces });
+        let tag = |unit: &serde_json::Value, keys: &serde_json::Value| -> Option<FuseTag> {
+            let corner = |k: &serde_json::Value| -> Option<u64> {
+                let k = k.as_array()?;
+                Some(k.first()?.as_u64()? << 32 | k.get(1)?.as_u64()? << 8 | k.get(2)?.as_u64()?)
+            };
+            let keys = keys.as_array()?;
+            Some(FuseTag {
+                keys: Some([corner(keys.first()?)?, corner(keys.get(1)?)?, corner(keys.get(2)?)?]),
+                second_half: unit.get(0)?.as_u64()? == 2 && unit.get(1)?.as_u64()? == 1,
+            })
+        };
+        let fuse: Vec<FuseTag> = match (v["units"].as_array(), v["vertex_keys"].as_array()) {
+            (Some(u), Some(k)) if u.len() == triangles.len() && k.len() == triangles.len() => {
+                u.iter().zip(k).map(|(u, k)| tag(u, k)).collect::<Option<_>>().unwrap_or_default()
+            }
+            _ => Vec::new(),
+        };
+        out.insert(key.clone(), PropShape { triangles, edges, surfaces, fuse });
     }
     out
 }
@@ -920,13 +1602,15 @@ pub(crate) fn build_prop_layer_with(
 
 /// Every placed object's collision in world space (its template's retail shape when it has one, else its render
 /// triangles) with one contiguous range per object: the props' layer and the skate.Park pieces' share of the static
-/// world (crate::park_layout). skate_vita: only the ranges (the props build their layer with [prop_layer_unbaked]);
-/// the local triangles are not kept.
+/// world (crate::park_layout), and each triangle's fuse tag (the template shape's, corners in the posed order).
+/// skate_vita: each range with its object's id, not upstream's `PropCollisionInstance` (the props build their layer
+/// with [prop_layer_unbaked]); the local triangles are not kept.
 pub(crate) fn posed_collision(
     map: &SkateMap,
     objects: &[skate_data::skate_map::StaticObject],
     shapes: &std::collections::BTreeMap<String, PropShape>,
-) -> (Vec<skate_data::skate_map::Collision>, Vec<std::ops::Range<usize>>) {
+) -> (Vec<skate_data::skate_map::Collision>, Vec<(u32, std::ops::Range<usize>)>, Vec<FuseTag>) {
+    let mut tags = Vec::new();
     let mut collision = Vec::new();
     let mut mismatched = std::collections::BTreeSet::new();
     let mut instances = Vec::new();
@@ -962,14 +1646,16 @@ pub(crate) fn posed_collision(
             gap <= 0.25
         });
         if let Some(shape) = shape {
-            for ((tri, edges), surface) in shape.triangles.iter().zip(&shape.edges).zip(&shape.surfaces) {
+            for (i, ((tri, edges), surface)) in shape.triangles.iter().zip(&shape.edges).zip(&shape.surfaces).enumerate() {
                 let mut points = *tri;
                 let mut edges = *edges;
+                let mut tag = shape.fuse.get(i).copied().unwrap_or_default();
                 if determinant < 0. {
                     points.swap(1, 2);
                     // Edge i runs from vertex i to i + 1: swapping b and c reverses the loop, so edge 0 (a-b) becomes
                     // a-c (old edge 2) and edge 2 becomes b-a (old edge 0).
                     edges = edges.map(|e| [e[2], e[1], e[0]]);
+                    tag.keys = tag.keys.map(|k| [k[0], k[2], k[1]]);
                 }
                 let [a, b, c] = points.map(Vec3::from_array);
                 if (b - a).cross(c - a).length_squared() <= 0. {
@@ -981,9 +1667,11 @@ pub(crate) fn posed_collision(
                     material: 1,
                     native_edges: edges,
                 });
+                tags.resize(collision.len() - 1, FuseTag::default());
+                tags.push(tag);
             }
             if collision.len() > start {
-                instances.push(start..collision.len());
+                instances.push((object.id, start..collision.len()));
             }
             continue;
         }
@@ -1011,10 +1699,11 @@ pub(crate) fn posed_collision(
             });
         }
         if collision.len() > start {
-            instances.push(start..collision.len());
+            instances.push((object.id, start..collision.len()));
         }
     }
-    (collision, instances)
+    tags.resize(collision.len(), FuseTag::default());
+    (collision, instances, tags)
 }
 
 /// skate_vita: [`build_prop_layer`] without triangles: the templates and instances, each
@@ -1701,5 +2390,320 @@ mod tests {
         let mesh = |entity: Entity| world.get::<Mesh3d>(entity).unwrap().0.id();
         assert_eq!(roots[0].2.len(), 1);
         assert_eq!(mesh(roots[0].2[0]), mesh(roots[1].2[0]));
+    }
+}
+
+/// skate_vita: upstream's skate.Park fuser tests (upstream 0947dea5), compiled on their own (the module above builds the
+/// PC renderer's world).
+#[cfg(test)]
+mod fuser_tests {
+    use super::*;
+
+    fn material() -> RetailContactMaterial {
+        RetailContactMaterial {
+            static_friction: 0.,
+            dynamic_friction: 0.,
+            restitution: 1.,
+        }
+    }
+
+    /// Two flat 1 m plates (two triangles each, normal up) meeting at x = 1 with piece B moved by `offset`.
+    fn plates(offset: [f32; 3]) -> Vec<[[f32; 3]; 3]> {
+        let a = |x: f32, z: f32| [x, 0.0, z];
+        let b = |x: f32, z: f32| [x + offset[0], offset[1], z + offset[2]];
+        vec![
+            [a(0., 0.), a(0., 1.), a(1., 0.)],
+            [a(1., 0.), a(0., 1.), a(1., 1.)],
+            [b(1., 0.), b(1., 1.), b(2., 0.)],
+            [b(2., 0.), b(1., 1.), b(2., 1.)],
+        ]
+    }
+
+    /// b477 / b478: flush park pieces (laptop session 2026-10-21: 1 to 2 mm apart) fuse, so the seam edges pair and
+    /// lose their convex bit; the 1 mm map path leaves them open; a real 5 cm gap stays open when fused.
+    #[test]
+    fn fused_park_pieces_pair_their_flush_seams() {
+        let seam = |features: &(Vec<Vec3>, Vec<[usize; 3]>, Vec<u32>, Vec<[f32; 3]>)| {
+            let (_, _, flags, cosines) = features;
+            // Triangle 1 edge 2 (x = 1, z 1 -> 0) and triangle 2 edge 0 (x = 1, z 0 -> 1).
+            [(1, 2), (2, 0)].map(|(t, e)| (flags[t] & (0x20 << e) != 0, cosines[t][e]))
+        };
+        let fuse = |points: &[[[f32; 3]; 3]]| {
+            let (p, v, f, c, _) = fused_edge_features(points, &crate::park_layout::FuseRules::default(), &[0, 0, 1, 1], &[]).unwrap();
+            (p, v, f, c)
+        };
+        let flush = plates([0.0015, 0.001, 0.0]);
+        let fused = fuse(&flush);
+        // Normals come from the merged corners (retail), so plate B's 1.5 mm pull tilts it by a hair.
+        assert!(seam(&fused).iter().all(|&(convex, cosine)| !convex && (cosine - 1.0).abs() < 1e-5), "paired: flat, not convex");
+        let mapped = welded_edge_features_within(&flush, true, None).unwrap();
+        assert!(seam(&mapped).iter().all(|&(convex, _)| convex), "the 1 mm grid keeps them open");
+        // A real gap stays unpaired: retail writes such an edge unmatched with cosine 1, not convex (82AC2390, b487).
+        let gap = fuse(&plates([0.05, 0.0, 0.0]));
+        assert!(seam(&gap).iter().all(|&(convex, cosine)| !convex && cosine == 1.0), "unpaired: not convex");
+        // Deterministic: the same input gives the same features.
+        assert_eq!(fused, fuse(&flush));
+    }
+
+    /// An IgnoreFuser piece (retail flag 2, b482 / b483) stays out of the fused set, and so out of the skater's world
+    /// (the skater's ground query reads only the fused GroundPool object, b484).
+    #[test]
+    fn ignore_fuser_pieces_stay_out_of_the_fused_set() {
+        let flush = plates([0.0015, 0.001, 0.0]);
+        let collision: Vec<_> = flush.iter().map(|&points| skate_data::skate_map::Collision {
+            // Template pieces carry native codes; 0x60 is a retail open border (convex, b477).
+            points, surface: 0, material: 1, native_edges: Some([0x60; 3]),
+        }).collect();
+        let pieces = |unfused: Vec<bool>| crate::park_layout::Pieces {
+            collision: collision.clone(), ranges: vec![0..2, 2..4], materials: vec![], rails: vec![],
+            fuse: crate::park_layout::FuseRules::default(), unfused, tags: vec![],
+        };
+        let flagged = pieces(vec![false, true]);
+        let ((fused, fused_ranges, _), (unfused, unfused_ranges, _)) = split_unfused(&flagged);
+        assert_eq!((fused.len(), fused_ranges, unfused.len(), unfused_ranges), (2, vec![0..2], 2, vec![0..2]));
+        assert_eq!(fused[..], collision[..2]);
+        assert_eq!(unfused[..], collision[2..]);
+        let none = pieces(vec![false, false]);
+        let ((all, ranges, _), (rest, _, _)) = split_unfused(&none);
+        assert_eq!((all.len(), ranges, rest.len()), (4, vec![0..2, 2..4], 0));
+        // Fewer flags than ranges (an older sidecar): the rest fuse.
+        let ((all, _, _), _) = split_unfused(&pieces(vec![]));
+        assert_eq!(all.len(), 4);
+        // Only the fused set reaches the skater's world, one query range per piece.
+        let build = |p: &crate::park_layout::Pieces| {
+            let (mut triangles, mut surfaces, mut meshes) = (vec![], vec![], vec![]);
+            append_pieces(&mut triangles, &mut surfaces, &mut meshes, p, material()).unwrap();
+            (triangles.len(), meshes.iter().map(|m| m.triangle_range.clone()).collect::<Vec<_>>())
+        };
+        assert_eq!(build(&flagged), (2, vec![0..2]));
+        assert_eq!(build(&none), (4, vec![0..2, 2..4]));
+        assert_eq!(build(&flagged), build(&flagged), "deterministic");
+        // The unfused pieces form the props-only world.
+        let props = props_only_world(&flagged, material()).unwrap().unwrap();
+        assert_eq!(props.triangles().len(), 2);
+        assert!(props_only_world(&none, material()).unwrap().is_none());
+    }
+
+    /// Two raised pads side by side (828755B8): docs/hails-additions/39-skatepark-layouts.md#code-reference-skate_worldrs
+    #[test]
+    fn fused_pads_drop_their_back_to_back_walls_and_pair_the_top_seam() {
+        let tri = |a: [f32; 3], b: [f32; 3], c: [f32; 3], out: Vec3| {
+            let n = (Vec3::from_array(b) - Vec3::from_array(a)).cross(Vec3::from_array(c) - Vec3::from_array(a));
+            if n.dot(out) < 0. { [a, c, b] } else { [a, b, c] }
+        };
+        // A closed box from x0 to x1 (y 0..0.75, z 0..1); `cross` splits the x = x1 face on the other diagonal.
+        let pad = |x0: f32, x1: f32, cross: bool| {
+            let (y, h) = (0.0, 0.75);
+            let centre = Vec3::new((x0 + x1) / 2., h / 2., 0.5);
+            let mut out = Vec::new();
+            let mut face = |q: [[f32; 3]; 4], other: bool| {
+                let n = q.iter().map(|p| Vec3::from_array(*p)).sum::<Vec3>() / 4. - centre;
+                if other {
+                    out.push(tri(q[1], q[2], q[3], n));
+                    out.push(tri(q[1], q[3], q[0], n));
+                } else {
+                    out.push(tri(q[0], q[1], q[2], n));
+                    out.push(tri(q[0], q[2], q[3], n));
+                }
+            };
+            face([[x0, h, 0.], [x1, h, 0.], [x1, h, 1.], [x0, h, 1.]], false);
+            face([[x0, y, 0.], [x1, y, 0.], [x1, y, 1.], [x0, y, 1.]], false);
+            face([[x0, y, 0.], [x1, y, 0.], [x1, h, 0.], [x0, h, 0.]], false);
+            face([[x0, y, 1.], [x1, y, 1.], [x1, h, 1.], [x0, h, 1.]], false);
+            face([[x0, y, 0.], [x0, h, 0.], [x0, h, 1.], [x0, y, 1.]], false);
+            face([[x1, y, 0.], [x1, h, 0.], [x1, h, 1.], [x1, y, 1.]], cross);
+            out
+        };
+        // Pad B is built mirrored (x0 = 2, x1 = 1) so its x = 1 face is the `cross` one.
+        for cross in [false, true] {
+            let mut points = pad(0., 1., false);
+            points.extend(pad(2., 1., cross));
+            let pieces: Vec<usize> = (0..points.len()).map(|i| i / 12).collect();
+            let (positions, vertices, flags, cosines, dropped) =
+                fused_edge_features(&points, &crate::park_layout::FuseRules::default(), &pieces, &[]).unwrap();
+            let walls: Vec<usize> = (0..points.len())
+                .filter(|&i| points[i].iter().all(|p| (p[0] - 1.).abs() < 1e-6))
+                .collect();
+            assert_eq!(walls.len(), 4);
+            assert_eq!((0..points.len()).filter(|&i| dropped[i]).collect::<Vec<_>>(), walls, "cross {cross}: the walls go");
+            // Every top edge on the seam (both ends at x = 1, y = 0.75) is paired flat: no convex bit, cosine 1.
+            let mut seam_edges = 0;
+            for t in (0..points.len()).filter(|&i| !dropped[i]) {
+                for e in 0..3 {
+                    let [a, b] = [vertices[t][e], vertices[t][(e + 1) % 3]].map(|v| positions[v]);
+                    if [a, b].iter().all(|p| (p.x - 1.).abs() < 1e-6 && (p.y - 0.75).abs() < 1e-6) {
+                        seam_edges += 1;
+                        assert_eq!((flags[t] & (0x20 << e), cosines[t][e]), (0, 1.0), "cross {cross}: triangle {t} edge {e}");
+                    }
+                }
+            }
+            assert!(seam_edges >= 2, "both tops have a seam edge");
+            // The same pads inside ONE piece keep their walls (retail culls only between different pieces).
+            let (_, _, _, _, one) = fused_edge_features(&points, &crate::park_layout::FuseRules::default(), &vec![0; points.len()], &[]).unwrap();
+            assert!(one.iter().all(|d| !d));
+        }
+    }
+
+    /// b478: the fused set ignores the pieces' own edge codes (keeps their surfaces), drops triangles the merge
+    /// collapses (retail 82AC2010) and keeps each piece's range over the kept triangles.
+    #[test]
+    fn fused_pieces_drop_collapsed_triangles_and_keep_their_ranges() {
+        let mut points = plates([0.0015, 0.0, 0.0]);
+        // A 4 mm sliver on piece A's far edge collapses under the 1 cm merge.
+        points.insert(2, [[0.0, 0.0, 0.0], [0.004, 0.0, 0.0], [0.0, 0.0, 0.004]]);
+        let collision: Vec<_> = points
+            .iter()
+            .map(|&points| skate_data::skate_map::Collision { points, surface: 7, material: 1, native_edges: Some([0x60; 3]) })
+            .collect();
+        let ranges = [0..3, 3..5];
+        let (triangles, surfaces, meshes) =
+            portable_parts_fused(&collision, &[], material(), Some(&ranges), true, Some((&crate::park_layout::FuseRules::default(), &[]))).unwrap();
+        assert_eq!(triangles.len(), 4, "the sliver is dropped");
+        assert_eq!(surfaces, [7; 4], "the pieces keep their surfaces");
+        assert_eq!(meshes.iter().map(|m| m.triangle_range.clone()).collect::<Vec<_>>(), [0..2, 2..4]);
+        // Without fusing, the same pieces keep every triangle and their native codes.
+        let (kept, _, _) = portable_parts(&collision[..2], &[], material(), None, true).unwrap();
+        assert_eq!(kept.len(), 2);
+    }
+
+    #[test]
+    fn fused_edge_bytes_follow_retail() {
+        let tol = crate::park_layout::FuseRules::default().concave_tolerance;
+        let decode = |byte: u8| decode_native_edges([byte, 0x1A, 0x1A]).unwrap();
+        assert_eq!(fused_edge_byte(1.0, false, tol), 0x9A);
+        let (flags, cosines) = decode(0x9A);
+        assert_eq!((flags & 0x20, cosines[0]), (0, 1.0));
+        assert_eq!(fused_edge_byte(0.0, true, tol), 0x22);
+        let (flags, cosines) = decode(0x22);
+        assert_eq!(flags & 0x20, 0x20);
+        assert!((cosines[0] - 0.6916).abs() < 1e-4, "{}", cosines[0]);
+        assert_eq!(fused_edge_byte(2.17, true, tol), 0x1B);
+        let (flags, cosines) = decode(0x1B);
+        assert_eq!((flags & 0x20, cosines[0]), (0, 1.0));
+        assert_eq!(fused_angle_code(0.97), 7);
+    }
+
+    #[test]
+    fn eastl_quick_sort_orders_by_key_and_keeps_every_entry() {
+        for n in [0usize, 1, 2, 28, 29, 64, 300] {
+            let mut v: Vec<(u32, u32)> = (0..n as u32).map(|i| ((i * 7919 + 13) % 17, i)).collect();
+            let mut want = v.clone();
+            eastl_quick_sort(&mut v);
+            assert!(v.windows(2).all(|w| w[0].0 <= w[1].0), "n={n}");
+            want.sort();
+            let mut got = v.clone();
+            got.sort();
+            assert_eq!(got, want, "n={n}");
+        }
+        let mut few = vec![(2, 0), (1, 1), (2, 2), (1, 3)];
+        eastl_quick_sort(&mut few);
+        assert_eq!(few, [(1, 1), (1, 3), (2, 0), (2, 2)], "short runs are an insertion sort (stable)");
+    }
+
+    /// b505 (Stadium - Full toe, recomp WHLC): a knife toe on the ground plane is not convex in retail.
+    #[test]
+    fn a_knife_toe_on_the_ground_plane_is_not_convex() {
+        let triangles = vec![
+            [[0.0, 0.0, 0.75], [0.0, 0.0, 0.0], [-0.505, 0.027, 0.75]],
+            [[0.0, 0.0, 0.75], [-0.75, 0.0, 0.75], [0.0, 0.0, 0.0]],
+        ];
+        let mut rules = crate::park_layout::FuseRules::default();
+        let (_, _, flags, cosines, _) = fused_edge_features(&triangles, &rules, &[0, 0], &[]).unwrap();
+        assert_eq!((cosines[0][0], flags[0] & 0x20), (0.99939764, 0), "toe edge: code 11, not convex");
+        assert_eq!((cosines[1][2], flags[1] & 0x80), (0.6915748, 0x80), "underside toe edge: code 2, convex");
+        rules.ground_planes = [None; 6];
+        let (_, _, flags, cosines, _) = fused_edge_features(&triangles, &rules, &[0, 0], &[]).unwrap();
+        assert_eq!((cosines[0][0], flags[0] & 0x20), (-0.23370063, 0x20), "without planes: the convex knife");
+    }
+
+    /// b507: a knife-toe ramp standing on another piece's deck above the ground takes its toe from the deck.
+    #[test]
+    fn a_knife_toe_on_a_raised_deck_is_not_convex() {
+        let deck = [[[-2.0, 1.0, -2.0], [-2.0, 1.0, 2.0], [2.0, 1.0, -2.0]], [[2.0, 1.0, -2.0], [-2.0, 1.0, 2.0], [2.0, 1.0, 2.0]]];
+        let ramp = |y: f32| [
+            [[0.0, y, 0.75], [0.0, y, 0.0], [-0.505, y + 0.027, 0.75]],
+            [[0.0, y, 0.75], [-0.75, y, 0.75], [0.0, y, 0.0]],
+        ];
+        let run = |y: f32, rules: &crate::park_layout::FuseRules, pieces: [usize; 4]| {
+            let triangles: Vec<_> = deck.iter().chain(ramp(y).iter()).copied().collect();
+            fused_edge_features(&triangles, rules, &pieces, &[]).unwrap()
+        };
+        let mut rules = crate::park_layout::FuseRules::default();
+        let (_, _, flags, cosines, _) = run(1.002, &rules, [0, 0, 1, 1]);
+        assert_eq!((cosines[2][0], flags[2] & 0x20), (0.99939764, 0), "toe edge on the deck: code 11, not convex");
+        let (_, _, flags, _, _) = run(1.01, &rules, [0, 0, 1, 1]);
+        assert_eq!(flags[2] & 0x20, 0x20, "more than 0.005 above the deck: the knife stays");
+        let (_, _, flags, _, _) = run(1.002, &rules, [0, 0, 0, 0]);
+        assert_eq!(flags[2] & 0x20, 0x20, "the same piece's deck does not count");
+        rules.mesh_floor_pass = false;
+        let (_, _, flags, _, _) = run(1.002, &rules, [0, 0, 1, 1]);
+        assert_eq!(flags[2] & 0x20, 0x20, "pass off: the knife stays");
+    }
+
+    #[test]
+    fn fused_vertex_ranks_follow_the_smallest_raw_key() {
+        let vertices = [[0, 1, 2], [2, 1, 3]];
+        let tag = |k: [u64; 3]| FuseTag { keys: Some(k), second_half: false };
+        let rank = fused_vertex_ranks(&vertices, 4, &[0, 1], &[tag([5, 4, 9]), tag([1, 3, 0])]).unwrap();
+        assert_eq!(rank, [1, 0, 2, 3], "keys 5, 4, 9 (piece 0 beats piece 1), 1 << 40");
+        assert!(fused_vertex_ranks(&vertices, 4, &[0, 1], &[tag([5, 4, 9]), FuseTag::default()]).is_none());
+    }
+
+    #[test]
+    fn fused_set_leaves_out_a_quads_second_half() {
+        let triangles = vec![
+            [[0.0, 0.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]],
+            [[1.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+        ];
+        let tags = [
+            FuseTag { keys: Some([0, 1, 2]), second_half: false },
+            FuseTag { keys: Some([3, 2, 1]), second_half: true },
+        ];
+        let mut rules = crate::park_layout::FuseRules::default();
+        let (_, _, _, _, dropped) = fused_edge_features(&triangles, &rules, &[0, 0], &tags).unwrap();
+        assert_eq!(dropped, [false, true]);
+        rules.quad_first_half_only = false;
+        let (_, _, _, _, dropped) = fused_edge_features(&triangles, &rules, &[0, 0], &tags).unwrap();
+        assert_eq!(dropped, [false, false], "a mod can keep both halves");
+    }
+
+    #[test]
+    fn fused_set_drops_a_zero_area_triangle() {
+        let triangles = vec![
+            [[0.0, 0.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]],
+            [[0.0, 0.0, 0.0], [0.5, 0.0, 0.0], [1.0, 0.0, 0.0]],
+        ];
+        let rules = crate::park_layout::FuseRules::default();
+        let (_, _, _, _, dropped) = fused_edge_features(&triangles, &rules, &[0, 1], &[]).unwrap();
+        assert_eq!(dropped, [false, true]);
+    }
+
+    #[test]
+    fn fused_vertex_bits_follow_retail() {
+        let grid = |height: fn(f32, f32) -> f32| {
+            let p = |x: f32, z: f32| [x, height(x, z), z];
+            let mut triangles = Vec::new();
+            for x in [-1.0, 0.0] {
+                for z in [-1.0, 0.0] {
+                    triangles.push([p(x, z), p(x, z + 1.), p(x + 1., z)]);
+                    triangles.push([p(x + 1., z), p(x, z + 1.), p(x + 1., z + 1.)]);
+                }
+            }
+            triangles
+        };
+        let centre_disabled = |triangles: Vec<[[f32; 3]; 3]>| {
+            let rules = crate::park_layout::FuseRules::default();
+            let (positions, vertices, flags, _, dropped) = fused_edge_features(&triangles, &rules, &vec![0; triangles.len()], &[]).unwrap();
+            let centre = positions.iter().position(|p| p.x == 0.0 && p.z == 0.0).unwrap();
+            let at: Vec<bool> = (0..vertices.len())
+                .filter(|&t| !dropped[t])
+                .filter_map(|t| (0..3).find(|&k| vertices[t][k] == centre).map(|k| flags[t] & (0x200 << k) != 0))
+                .collect();
+            assert!(!at.is_empty() && at.iter().all(|&d| d == at[0]));
+            at[0]
+        };
+        assert!(centre_disabled(grid(|_, _| 0.0)), "flat");
+        assert!(centre_disabled(grid(|x, _| x.abs())), "valley");
+        assert!(!centre_disabled(grid(|x, z| 1.0 - x.abs().max(z.abs()))), "pyramid apex");
     }
 }

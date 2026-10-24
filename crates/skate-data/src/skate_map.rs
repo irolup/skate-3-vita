@@ -22,7 +22,7 @@ pub struct SkateMap {
     pub routes: Vec<Route>,
     pub extensions: Vec<Extension>,
 }
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Material {
     pub name: String,
     pub flags: u32,
@@ -61,7 +61,7 @@ pub struct Vertex {
     pub decal_uv: Option<[f32; 2]>,
     pub tangent_frame: Option<[u8; 4]>,
 }
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Collision {
     pub points: [[f32; 3]; 3],
     pub surface: u32,

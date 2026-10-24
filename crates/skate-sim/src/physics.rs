@@ -806,8 +806,14 @@ impl GamePhysics {
             BoardMotion::Active,
         );
         // The skate.Park layout the map was loaded with (park_layout.rs): fixed pieces in the static world and rails.
-        // skate_vita: NOT YET with a collision window (a streamed district); no Vita path attaches a layout yet.
+        // skate_vita: NOT YET with a collision window (a streamed district). A park pack carries its layout baked
+        // (park_bake.rs): the fused rows and the rails, no fuse at load.
         let pieces = map.and_then(|map| crate::park_layout::load_pieces(asset_root, map));
+        let baked = match (&pieces, map) {
+            (None, Some(map)) => crate::park_bake::decode(map).transpose()?,
+            _ => None,
+        };
+        let layout = pieces.as_ref().map(crate::skate_world::LayoutPieces::Loaded).or(baked.as_ref().map(crate::skate_world::LayoutPieces::Baked));
         let mut window = None;
         let world = match map {
             Some(map) => match (crate::collision_window::configured(), map.extensions.iter().find(|e| &e.tag == b"RWCM")) {
@@ -826,10 +832,10 @@ impl GamePhysics {
                             window = Some(w);
                             world
                         }
-                        None => crate::skate_world::collision_world_with(map, settings.floor_material, pieces.as_ref())?,
+                        None => crate::skate_world::collision_world_with(map, settings.floor_material, layout)?,
                     }
                 }
-                _ => crate::skate_world::collision_world_with(map, settings.floor_material, pieces.as_ref())?,
+                _ => crate::skate_world::collision_world_with(map, settings.floor_material, layout)?,
             },
             None => terrain.world(settings.floor_material),
         };
@@ -871,7 +877,11 @@ impl GamePhysics {
             crate::grind_world::StaticProvider::authored(&crate::grind_world::test_rails())?
         } else {
             let provider = crate::grind_world::StaticProvider::new(map)?;
-            match &pieces { Some(pieces) => provider.with_pieces(&pieces.rails)?, None => provider }
+            match (&pieces, &baked) {
+                (Some(pieces), _) => provider.with_pieces(&pieces.rails)?,
+                (None, Some(baked)) => provider.with_pieces(&baked.rails)?,
+                (None, None) => provider,
+            }
         });
         if let Some(map) = map {
             eprintln!(

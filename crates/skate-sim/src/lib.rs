@@ -36,6 +36,7 @@ mod presentation;
 mod scoring_runtime;
 mod session_marker;
 mod park_layout;
+pub mod park_bake;
 mod skate_world;
 mod skater_animation;
 mod transform;

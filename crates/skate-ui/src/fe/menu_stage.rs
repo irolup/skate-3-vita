@@ -1934,7 +1934,9 @@ impl MenuStage {
             .data()
             .map_nodes
             .iter()
-            .filter(|n| n.entry.kind == skate_core::menus::EntryKind::FeLocation)
+            // Locations, and the skate.Park folder's park worlds (keyed by the world row's id: the bake gives each the
+            // first destination that names it).
+            .filter(|n| matches!(n.entry.kind, skate_core::menus::EntryKind::FeLocation | skate_core::menus::EntryKind::World))
             .filter(|n| self.teleports.get(&n.entry.id).is_some_and(|(map, _)| can_travel(map)))
             .map(|n| n.entry.clone())
             .collect();

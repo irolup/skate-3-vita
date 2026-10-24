@@ -739,3 +739,34 @@ Not taken: the minimap's groups in add order and its hide messages (one group on
 | vita-bake `ui.rs` | `private/tips-loader.json` from the collections | — |
 
 Data: the menu set re-exported at `0947dea5` (tiploader, still version 14; the `36018e19` set kept as `menu-movies.v14-36018`); ui.pak rebaked. Checks: skate-ui `the_loading_screen_runs_around_a_load` (FE 52 opens, the black drops, 74 draws, a panel cycle, closes and fades back in); skate-data `the_retail_tips` (20 lines, 31 hints); `FE_HASH 3bc34026d85cc590` (unchanged). Vita: DownTown -> University through FE 52 (black, push, up, black, close, fade in), University loaded in 15.2 s (13.1 to 14.5 s in earlier runs); the menu stage +1,143 KiB (21,845 KiB), its textures 8,484 KiB (were 7,819), the run's peak heap 164.8 MB; checked by the user.
+
+## Phase 2, step 2: the skate.Park fuser (2026-10-24)
+
+| Part | What | Edits |
+|---|---|---|
+| skate-sim `skate_world.rs` | upstream at `0947dea5`: retail's fuser for the pieces (`append_pieces`, `split_unfused`, `props_only_world`, the welded and fused edge features, the plane and mesh-floor passes, `fused_vertex_ranks` with `eastl_quick_sort`, the edge bytes and vertex bits, `portable_parts_fused`), `FuseTag`, `PropShape::fuse`, `load_collision_shapes` reading the fuse tags | taken whole where ours still equalled `b110bab`; `load_collision_shapes` reads through `skate_data::vfs`; `posed_collision` returns each range with its object's id (not upstream's `PropCollisionInstance`) and the fuse tags; upstream's 12 data-free fuser tests in `fuser_tests` (the old tests module stays off) |
+| skate-sim `park_layout.rs` | `Pieces::{fuse, unfused, tags}`, `FuseRules` / `FusePlane` and the sidecar's fuse rules, the `IgnoreFuser` cap | `git merge-file` ours / `b110bab` / `0947dea5`; sidecars read through `skate_data::vfs` |
+| skate-data `skate_map.rs` | `Collision` is `Clone` (as upstream) | — |
+
+Not taken yet: the props-only world in prop dynamics (`set_props_only_world`; the Fullparks' only IgnoreFuser pieces are 8 bushes in Downtown). Checks: the fuser tests (12); parity 20/20 + 20/20; DownTown `PERF_HASH 77fc1129ae1e3070` (unchanged), 0.78 ms a tick; the survey test fuses the Fullparks to 44,346 / 83,765 / 148,739 / 58,184 triangles in 89 / 209 / 345 / 151 ms on the desktop (so the Vita reads them fused from the bake).
+
+## Phase 2, steps 3 and 4: the Fullpark layouts baked into the park packs (2026-10-24)
+
+| Part | What | Edits |
+|---|---|---|
+| skate-sim `park_bake.rs` (new) | — | ours: a layout baked as the park map's `PKFU` extension: the fused rows (`skate_world::FusedTriangle`) with one range per piece, and each railed piece's id, template and placement with the templates' splines; decoded at load into the same triangles and posed rails (test `a_baked_layout_builds_the_fused_world`: bit-identical triangles, the same rails) |
+| skate-sim `skate_world.rs` | — | ours: `portable_parts_fused` split into `fuse_rows` and `parts_from_rows`, `fused_piece_rows` (what `append_pieces` appends), `LayoutPieces` (loaded or baked) in `collision_world_with` / `retail_collision_world`, `PKFU` accepted by `validate_runtime` |
+| skate-sim `physics.rs` | — | ours: a map with a baked layout gets its fused rows in the static world and its rails in the grind world |
+| vita-bake `park_layout.rs` (new), `map.rs` | upstream draws each piece with its tint and the layout's projected lightmap (`retail_world.wgsl`, b439 / b440 / b444) | ours: every park places its Fullpark layout (owner); the pieces posed into the park's render (vertices shared within a piece), each tint folded into its material colour, the projected lightmap's coordinates (sun from the park's sky) in the lightmap channel with the layout's lightmap texture; the pieces' draws split on a 32 m grid; the sim map takes the `PKFU` extension before the spawn check |
+| skate-data `skate_map.rs` | `Material` is `Clone` | — |
+
+Packs (`vita-bake maps`): MegaPark 13.4 MB (279 draws, 59k triangles, 74k vertices, 149k fused triangles), StartPark 6.5 MB, IndustrialSkatePark 10.9 MB, DownTownSkatePark 11.9 MB; the old packs kept as `map_<park>.pak.pre-phase2`. Checks: parity 20/20 + 20/20 (the Course has no layout); skate-sim as before; every park's spawn holds with its pieces. Heap: MegaPark from University ran out of memory building its world (a 21 MB block: 161k triangles of 132 bytes); the baked rows are read in place from the extension and appended straight into the world (`skate_world::append_rows`, no 19.6 MB copy, no 9 MB row copy). Not yet: the pieces drawn with upstream's dynamic-object lighting (ours: the park shader, lightmap squared), the props-only world (Downtown's 8 bushes), the teleporter exits into skate.Park worlds (step 5).
+
+## Phase 2, step 5: the skate.Park folder's parks on the Challenge Map (2026-10-24)
+
+| Part | What | Edits |
+|---|---|---|
+| skate-data `challenge_map.rs` `bake` | upstream `retail_menus::challenge_map` (b447): each park world row enters its world through the first destination that names it (`teleports.json` `world`) | ours: those teleports baked under the world row's id |
+| skate-ui `fe/menu_stage.rs` `register_teleports` | upstream `register_teleports` over (kind, id) pairs | ours: World rows as well as locations |
+
+The skate.Park tab's five rows (Stadium, PCU Training Full and Basic, Team HQ, Downtown Full) were greyed since `74c124a` (left out with no layouts on the Vita). Every park loads its Fullpark layout (owner), so PCU Training - Basic loads the Fullpark too. ui.pak rebaked (74 teleports). Vita (all four parks through the Challenge Map, the Stadium also from University's teleporter): loads 4.3 to 10.2 s; 60 fps median everywhere; draws median 238 in the Stadium (the bowl stays in view, CPU 11 ms), 46 to 97 elsewhere; heap peak 160.5 MB; checked by the user. Owner (2026-10-24): retail does not offer these parks from the start; they stay open on the Vita until the career (Phase 5) brings their unlocks.

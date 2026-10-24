@@ -66,6 +66,10 @@ impl<'a> Reader<'a> {
     pub fn u64(&mut self) -> Result<u64, String> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
     }
+    /// The next `n` bytes as they are (borrowed).
+    pub fn bytes(&mut self, n: usize) -> Result<&'a [u8], String> {
+        self.take(n)
+    }
     pub fn str(&mut self) -> Result<String, String> {
         let n = self.u32()? as usize;
         String::from_utf8(self.take(n)?.to_vec()).map_err(|e| e.to_string())

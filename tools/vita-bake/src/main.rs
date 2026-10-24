@@ -16,6 +16,7 @@ mod audio;
 mod district;
 mod living;
 mod map;
+mod park_layout;
 mod sim;
 mod textures;
 mod tiles;

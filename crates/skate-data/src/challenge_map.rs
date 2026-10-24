@@ -632,6 +632,7 @@ pub struct Baked {
 /// `teleports.json` carries per destination (`label_key`, `name`), as upstream's `retail_menus::challenge_map`.
 pub fn bake(collections: &crate::collections::Collections, world_maps: &BTreeMap<String, String>, teleports: &serde_json::Value,
     unlocks: &LocationUnlocks) -> Baked {
+    let teleports_json = teleports;
     let texts: BTreeMap<String, String> = teleports["destinations"]
         .as_array()
         .into_iter()
@@ -639,7 +640,7 @@ pub fn bake(collections: &crate::collections::Collections, world_maps: &BTreeMap
         .filter_map(|d| Some((d["label_key"].as_str()?.to_owned(), d["name"].as_str()?.to_owned())))
         .collect();
     let label_text = |label: &str| texts.get(label).cloned();
-    let teleports: BTreeMap<String, (String, [[f32; 4]; 4])> = teleports["destinations"]
+    let mut teleports: BTreeMap<String, (String, [[f32; 4]; 4])> = teleports["destinations"]
         .as_array()
         .into_iter()
         .flatten()
@@ -648,6 +649,14 @@ pub fn bake(collections: &crate::collections::Collections, world_maps: &BTreeMap
             Some((d["id"].as_str()?.to_owned(), (d["map"].as_str()?.to_owned(), matrix)))
         })
         .collect();
+    // The skate.Park folder's park worlds (upstream retail_menus `challenge_map`, b447): each enters its world through
+    // the first destination that names it (`world`), under the world row's id.
+    for d in teleports_json["destinations"].as_array().into_iter().flatten() {
+        let (Some(world), Some(id)) = (d["world"].as_str(), d["id"].as_str()) else { continue };
+        if let Some(found) = teleports.get(id).cloned() {
+            teleports.entry(world.to_owned()).or_insert(found);
+        }
+    }
     let markers = location_markers(collections)
         .into_iter()
         .filter_map(|(key, m)| {
@@ -728,5 +737,7 @@ mod baked_tests {
         );
         assert_eq!(Baked::from_json(&json).unwrap(), baked);
         assert!(!baked.nodes.is_empty() && !baked.teleports.is_empty());
+        // The skate.Park folder's park worlds enter their worlds (b447).
+        assert_eq!(baked.teleports.get("dist_megapark_full").map(|(m, _)| m.as_str()), Some("MegaPark"));
     }
 }

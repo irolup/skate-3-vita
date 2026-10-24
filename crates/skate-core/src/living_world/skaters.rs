@@ -1,18 +1,5 @@
-//! Ambient NPC skaters: the rules of the retail manager `sub_8245BA28` [code].
-//!
-//! - Kill switch `sub_8245C4A8`: zombie cheat, a scripted (kind 3) AI skater, or the manager
-//!   disabled → every ambient NPC despawns and the tick ends.
-//! - Desired count: 3 offline, 0 online (mgr+608); a challenge can override it.
-//! - Phases of `tick mod 60`: 0 cull (`sub_8245D520`), 15 character pool (`sub_8245B400`), 30
-//!   spawn (`sub_8245C548`), 3-12 / 18-27 / 33-57 per-skater checks (`sub_8245A9B8`).
-//! - Cull: 3-D distance to the reference > 120 m, or height difference > 1000 m, or while the
-//!   ambient count exceeds the desired count.
-//! - Spawn: at most one per call; AI cap 5; ambient count below desired; candidate characters =
-//!   ready, unused pool entries; candidate lines = unused valid lines whose start node lies 60 to
-//!   90 m (3-D) from the reference, first 32; score per (character, line) (`sub_8245C018`, lowest
-//!   wins); first free skater slot 1..6.
-//! - Free Play "A.I. Skaters" off (mode 3, `+340`): no spawns, and the per-skater checks
-//!   despawn every ambient NPC.
+//! Ambient NPC skaters: the rules of the retail manager 8245BA28.
+//! Kill switch, phases, cull and spawn: docs/hails-additions/26b-living-world-population.md#ambient-skater-manager
 
 use super::config::{retail, SkaterConfig};
 use super::population::{pick_highest, pick_lowest, KindState, Scorer};
@@ -139,10 +126,19 @@ fn line_of(choice: &SpawnChoice) -> Option<([u8; 16], &str, u8)> {
     }
 }
 
+/// A called skater (FE 62 Call Skater; retail companion entries, research b544 / b563): requested until it spawns,
+/// requested again when culled, freed only by a dismiss (the skater then rides on as an ambient one).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Companion {
+    pub key: String,
+    /// The live skater serving it.
+    pub serial: Option<u32>,
+}
+
 /// Candidate lines for a reference point: valid, unused, start node within [inner, outer], first N.
-fn candidate_lines(cfg: &SkaterConfig, world: &dyn SkaterWorld, st: &KindState, reference: Vec3) -> Vec<usize> {
+fn candidate_lines(cfg: &SkaterConfig, world: &dyn SkaterWorld, st: &KindState, reference: Vec3, inner: f32) -> Vec<usize> {
     let used: Vec<[u8; 16]> = st.live.values().filter_map(|l| line_of(&l.choice).map(|x| x.0)).collect();
-    let (i2, o2) = (cfg.spawn_inner * cfg.spawn_inner, cfg.spawn_outer * cfg.spawn_outer);
+    let (i2, o2) = (inner * inner, cfg.spawn_outer * cfg.spawn_outer);
     world
         .lines()
         .iter()
@@ -157,10 +153,26 @@ fn candidate_lines(cfg: &SkaterConfig, world: &dyn SkaterWorld, st: &KindState, 
         .collect()
 }
 
-pub(crate) fn tick(cfg: &SkaterConfig, st: &mut KindState, pool: &mut Vec<String>, inputs: &TickInputs, tick: u64, seed: u64, out: &mut Vec<Decision>) {
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn tick(cfg: &SkaterConfig, st: &mut KindState, pool: &mut Vec<String>, companions: &mut [Companion], inputs: &TickInputs, tick: u64, seed: u64, out: &mut Vec<Decision>) {
+    // A despawned companion is requested again (8245DCE0 -> 827C6180).
+    // A waiting one whose character already rides takes that skater (NOT RETAIL YET: inferred, the retail case is not
+    // read; the character never rides twice).
+    let requeue = |st: &KindState, companions: &mut [Companion]| {
+        for c in companions.iter_mut() {
+            if c.serial.is_some_and(|s| !st.live.contains_key(&s)) {
+                c.serial = None;
+            }
+            if c.serial.is_none() {
+                c.serial = st.live.values().find(|l| line_of(&l.choice).is_some_and(|x| x.1 == c.key)).map(|l| l.id.serial);
+            }
+        }
+    };
+    requeue(st, companions);
     // Kill switch.
     if !cfg.enabled || inputs.zombie || inputs.scripted_skaters > 0 {
         st.despawn_all(tick, DespawnReason::Disabled, out);
+        requeue(st, companions);
         return;
     }
     let desired = if inputs.online { 0 } else { inputs.ambient_skater_override.unwrap_or(cfg.desired) };
@@ -176,9 +188,12 @@ pub(crate) fn tick(cfg: &SkaterConfig, st: &mut KindState, pool: &mut Vec<String
         for s in serials {
             let p = st.live[&s].position;
             let far = observers.iter().all(|o| dist2(p, *o) > cfg.cull * cfg.cull || (p[1] - o[1]).abs() > cfg.cull_height);
+            // NOT RETAIL YET (inferred, b563 open): the excess cull leaves called skaters alone, else a call above the
+            // desired count is culled and called again every cycle.
+            let called = companions.iter().any(|c| c.serial == Some(s));
             let reason = if far {
                 DespawnReason::Distance
-            } else if excess > 0 {
+            } else if excess > 0 && !called {
                 DespawnReason::Excess
             } else {
                 continue;
@@ -193,26 +208,34 @@ pub(crate) fn tick(cfg: &SkaterConfig, st: &mut KindState, pool: &mut Vec<String
     if cfg.is_check_phase(phase) && !option_on {
         st.despawn_all(tick, DespawnReason::FreePlayOff, out);
     }
+    requeue(st, companions);
 
     let Some(world) = inputs.skater_world else { return };
 
     if phase == cfg.phase_pool {
-        pool_update(cfg, st, pool, world, inputs.online, reference);
+        pool_update(cfg, st, pool, companions, world, inputs.online, reference);
     }
 
     if phase == cfg.phase_spawn && option_on {
-        spawn(cfg, st, pool, world, inputs, reference, tick, seed, desired, out);
+        spawn(cfg, st, pool, companions, world, inputs, reference, tick, seed, desired, out);
     }
 }
 
-/// Character pool (`sub_8245B400` with the scorer `sub_8245B068`): load one character per call
-/// into a free entry; when full, release the oldest unused entry that fits no nearby line.
-/// Retail streams the character assets (entry state 4 = loaded); our characters are ready at
-/// once, so an entry is usable the cycle it is chosen.
-fn pool_update(cfg: &SkaterConfig, st: &mut KindState, pool: &mut Vec<String>, world: &dyn SkaterWorld, online: bool, reference: Vec3) {
-    let lines = candidate_lines(cfg, world, st, reference);
+/// Character pool (8245B400, scorer 8245B068): one load per call; characters are ready at once here. A waiting
+/// companion's character loads first (8245B7A0 takes a requested entry ahead of the random pick).
+fn pool_update(cfg: &SkaterConfig, st: &mut KindState, pool: &mut Vec<String>, companions: &[Companion], world: &dyn SkaterWorld, online: bool, reference: Vec3) {
+    let lines = candidate_lines(cfg, world, st, reference, cfg.spawn_inner);
     let in_use: Vec<String> = st.live.values().filter_map(|l| line_of(&l.choice).map(|x| x.1.to_string())).collect();
     pool.retain(|k| world.characters().iter().any(|c| &c.key == k));
+    let requested = companions.iter().find(|c| c.serial.is_none() && !pool.contains(&c.key) && world.characters().iter().any(|w| w.key == c.key));
+    if let Some(c) = requested {
+        if pool.len() >= cfg.pool_size as usize {
+            let Some(i) = pool.iter().position(|k| !in_use.contains(k) && !companions.iter().any(|c| &c.key == k)) else { return };
+            pool.remove(i);
+        }
+        pool.push(c.key.clone());
+        return;
+    }
     if pool.len() >= cfg.pool_size as usize {
         let stale = pool.iter().position(|k| {
             !in_use.contains(k)
@@ -240,29 +263,50 @@ fn pool_update(cfg: &SkaterConfig, st: &mut KindState, pool: &mut Vec<String>, w
 }
 
 #[allow(clippy::too_many_arguments)]
-fn spawn(cfg: &SkaterConfig, st: &mut KindState, pool: &[String], world: &dyn SkaterWorld, inputs: &TickInputs, reference: Vec3, tick: u64, seed: u64, desired: u32, out: &mut Vec<Decision>) {
+fn spawn(cfg: &SkaterConfig, st: &mut KindState, pool: &[String], companions: &mut [Companion], world: &dyn SkaterWorld, inputs: &TickInputs, reference: Vec3, tick: u64, seed: u64, desired: u32, out: &mut Vec<Decision>) {
     let ambient = st.len() as u32;
-    if ambient + inputs.scripted_skaters >= cfg.ai_cap || ambient >= desired {
+    if ambient + inputs.scripted_skaters >= cfg.ai_cap {
         return;
     }
     let used: Vec<(&str, u8)> = st.live.values().filter_map(|l| line_of(&l.choice).map(|x| (x.1, x.2))).collect();
+    // Free slot: slots [0, players) are players (retail slot 0 = local, online players after); the search starts at 1.
+    let players = inputs.player_slots.max(1);
+    let Some(slot) = (players.max(1)..cfg.slots).find(|s| !used.iter().any(|(_, u)| *u as u32 == *s)) else { return };
+    // A loaded companion first (sub_8245C548): a fitting free line from the companion inner radius out, the nearest to
+    // the player wins. NOT RETAIL YET (open in b563): whether the desired-count gate also holds a called skater back.
+    let waiting = companions.iter().position(|c| c.serial.is_none() && pool.contains(&c.key) && !used.iter().any(|(k, _)| *k == c.key));
+    if let Some(i) = waiting {
+        let Some(character) = world.characters().iter().find(|c| c.key == companions[i].key) else { return };
+        let skaters: Vec<Vec3> = inputs.observers.iter().map(|o| o.position).chain(st.live.values().map(|l| l.position)).collect();
+        let best = candidate_lines(cfg, world, st, reference, cfg.companion_inner)
+            .into_iter()
+            .map(|l| &world.lines()[l])
+            .filter(|line| world.fits(line, character) && skaters.iter().all(|p| dist2(*p, line.start) >= cfg.reject_radius2))
+            .min_by(|a, b| dist2(a.start, reference).total_cmp(&dist2(b.start, reference)));
+        if let Some(line) = best {
+            let choice = SpawnChoice::Skater { line: line.id, character: character.key.clone(), slot: slot as u8 };
+            let record = st.spawn(seed, tick, line.start, line.heading, false, choice);
+            companions[i].serial = Some(record.id.serial);
+            out.push(Decision::Spawn(record));
+        }
+        return;
+    }
+    if ambient >= desired {
+        return;
+    }
     let characters: Vec<usize> = pool
         .iter()
-        .filter(|k| !used.iter().any(|(c, _)| c == k))
+        .filter(|k| !used.iter().any(|(c, _)| c == k) && !companions.iter().any(|c| &c.key == *k))
         .filter_map(|k| world.characters().iter().position(|c| &c.key == k))
         .take(cfg.pool_size as usize)
         .collect();
     if characters.is_empty() {
         return;
     }
-    let lines = candidate_lines(cfg, world, st, reference);
+    let lines = candidate_lines(cfg, world, st, reference, cfg.spawn_inner);
     if lines.is_empty() {
         return;
     }
-    // Free slot: slots [0, players) are players (retail slot 0 = local, online players after);
-    // the search starts at 1.
-    let players = inputs.player_slots.max(1);
-    let Some(slot) = (players.max(1)..cfg.slots).find(|s| !used.iter().any(|(_, u)| *u as u32 == *s)) else { return };
     let mut skaters: Vec<Vec3> = inputs.observers.iter().map(|o| o.position).collect();
     skaters.extend(st.live.values().map(|l| l.position));
     let pairs: Vec<(usize, usize)> = characters.iter().flat_map(|&c| lines.iter().map(move |&l| (c, l))).collect();

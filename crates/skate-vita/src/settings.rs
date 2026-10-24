@@ -3,7 +3,9 @@
 use vita_platform::controls::{self, StickGain};
 
 pub const PATH: &str = "ux0:data/SKATEVITA/settings.bin";
-const MAGIC: &[u8; 8] = b"SKVSET09";
+const MAGIC: &[u8; 8] = b"SKVSET10";
+/// Version 9 (before the minimap setting): the same record without its byte.
+const MAGIC_V9: &[u8; 8] = b"SKVSET09";
 /// Version 8: the same record; its pedestrians byte read as the new default (Off), since version 8
 /// defaulted to Low, which DownTown's memory cannot hold beside traffic and NPC skaters.
 const MAGIC_V8: &[u8; 8] = b"SKVSET08";
@@ -92,6 +94,8 @@ pub struct Settings {
     pub ai_skaters: bool,
     /// The pedestrian density, an index into `PEDESTRIANS` (Off, Low, Medium, Retail).
     pub pedestrians: u8,
+    /// The HUD minimap (Game Settings > Minimap; retail's default on, owner 2026-10-24).
+    pub minimap: bool,
     /// The zombie cheat (Extras > Enter Cheat Code `zombie`): for the session only, never saved (retail keeps it on
     /// the simulation, not in the profile, b304).
     pub zombie: bool,
@@ -106,6 +110,9 @@ const PEDESTRIANS_DEFAULT: u8 = 0;
 /// The peds at most under the zombie cheat (retail's pool is 31). NOT RETAIL: the Vita's frame time with angry peds
 /// (device-tuned).
 const ZOMBIE_PEDS: u32 = 8;
+/// The called skaters (Call Skater) at most at once: retail allows 3, each one more NPC skater at about 1.4 ms a tick
+/// in DownTown (owner, 2026-10-24).
+pub const CALLED_SKATERS: u32 = 1;
 
 /// The Traffic setting's choices: (label, density). The density scales each census area's
 /// car cap as retail's Free Play traffic scale does (DownTown's is 30; at most 15 cars live).
@@ -119,6 +126,25 @@ impl Settings {
         if self.fast_physics { 25 } else { 50 }
     }
 
+    /// The Free Play options (FE 34) shown for these settings: the levels' densities.
+    pub fn free_play(&self) -> skate_core::living_world::FreePlay {
+        let level = |levels: &[(&str, f32)], i: u8| levels[usize::from(i).min(levels.len() - 1)].1;
+        skate_core::living_world::FreePlay { traffic: level(&TRAFFIC, self.traffic), pedestrians: level(&PEDESTRIANS, self.pedestrians), ai_skaters: self.ai_skaters }
+    }
+
+    /// FE 34's values back: each density to the nearest of the Vita's levels (a tie to the lower: the levels are its
+    /// budget). True when something changed.
+    pub fn set_free_play(&mut self, values: skate_core::living_world::FreePlay) -> bool {
+        let nearest = |levels: &[(&str, f32)], v: f32| {
+            (0..levels.len()).fold(0, |best, i| if (levels[i].1 - v).abs() < (levels[best].1 - v).abs() - 1e-4 { i } else { best }) as u8
+        };
+        let before = (self.traffic, self.pedestrians, self.ai_skaters);
+        self.traffic = nearest(&TRAFFIC, values.traffic);
+        self.pedestrians = nearest(&PEDESTRIANS, values.pedestrians);
+        self.ai_skaters = values.ai_skaters;
+        before != (self.traffic, self.pedestrians, self.ai_skaters)
+    }
+
     /// The living world's settings from the menu (traffic on with its density; peds and NPC
     /// skaters are not ported yet).
     pub fn living(&self) -> skate_sim::LivingWorldSettings {
@@ -128,6 +154,7 @@ impl Settings {
         living.skaters.enabled = self.ai_skaters;
         let (_, peds) = PEDESTRIANS[usize::from(self.pedestrians).min(PEDESTRIANS.len() - 1)];
         living.pedestrians = skate_sim::KindSetting { enabled: peds > 0.0, density: peds };
+        living.companion_slots = Some(CALLED_SKATERS);
         // The zombie cheat: peds whatever the setting (retail ignores the density then), bounded by the Vita's pool;
         // the sim drops the traffic and the NPC skaters itself.
         if self.zombie {
@@ -163,6 +190,7 @@ impl Default for Settings {
             traffic: TRAFFIC_DEFAULT,
             ai_skaters: true,
             pedestrians: PEDESTRIANS_DEFAULT,
+            minimap: true,
             zombie: false,
         }
     }
@@ -188,6 +216,7 @@ impl Settings {
             self.traffic,
             u8::from(self.ai_skaters),
             self.pedestrians,
+            u8::from(self.minimap),
         ]);
         for g in [c.left_gain.x, c.left_gain.y, c.right_gain.x, c.right_gain.y] {
             b.extend_from_slice(&g.to_le_bytes());
@@ -198,8 +227,8 @@ impl Settings {
     pub fn decode(b: &[u8]) -> Option<Self> {
         // Version 2 has one more byte (the menu style) after the seven of version 1, version 3
         // two more (the manual meter, the trick analyzer), version 4 another (fast physics),
-        // version 5 another (retail audio), version 6 another (traffic); the gains follow. Older
-        // files read as the defaults.
+        // version 5 another (retail audio), version 6 another (traffic), version 7 (AI skaters), 8 / 9
+        // (pedestrians) and 10 (minimap) another each; the gains follow. Older files read as the defaults.
         let v1 = b.len() == 8 + 7 + 16 && &b[..8] == MAGIC_V1;
         let v2 = b.len() == 8 + 8 + 16 && &b[..8] == MAGIC_V2;
         let v3 = b.len() == 8 + 10 + 16 && &b[..8] == MAGIC_V3;
@@ -208,10 +237,11 @@ impl Settings {
         let v6 = b.len() == 8 + 13 + 16 && &b[..8] == MAGIC_V6;
         let v7 = b.len() == 8 + 14 + 16 && &b[..8] == MAGIC_V7;
         let v8 = b.len() == 8 + 15 + 16 && &b[..8] == MAGIC_V8;
-        if !v1 && !v2 && !v3 && !v4 && !v5 && !v6 && !v7 && !v8 && (b.len() != 8 + 15 + 16 || &b[..8] != MAGIC) {
+        let v9 = b.len() == 8 + 15 + 16 && &b[..8] == MAGIC_V9;
+        if !v1 && !v2 && !v3 && !v4 && !v5 && !v6 && !v7 && !v8 && !v9 && (b.len() != 8 + 16 + 16 || &b[..8] != MAGIC) {
             return None;
         }
-        let shift = if v1 { 0 } else if v2 { 1 } else if v3 { 3 } else if v4 { 4 } else if v5 { 5 } else if v6 { 6 } else if v7 { 7 } else { 8 };
+        let shift = if v1 { 0 } else if v2 { 1 } else if v3 { 3 } else if v4 { 4 } else if v5 { 5 } else if v6 { 6 } else if v7 { 7 } else if v8 || v9 { 8 } else { 9 };
         let f = |at: usize| f32::from_le_bytes(b[at..at + 4].try_into().unwrap());
         let gain = |v: f32| if v.is_finite() && (0.5..=2.0).contains(&v) { v } else { 1.0 };
         Some(Self {
@@ -236,6 +266,7 @@ impl Settings {
             traffic: if v1 || v2 || v3 || v4 || v5 { TRAFFIC_DEFAULT } else { b[20].min(TRAFFIC.len() as u8 - 1) },
             ai_skaters: v1 || v2 || v3 || v4 || v5 || v6 || b[21] != 0,
             pedestrians: if v1 || v2 || v3 || v4 || v5 || v6 || v7 || v8 { PEDESTRIANS_DEFAULT } else { b[22].min(PEDESTRIANS.len() as u8 - 1) },
+            minimap: v1 || v2 || v3 || v4 || v5 || v6 || v7 || v8 || v9 || b[23] != 0,
             zombie: false,
         })
     }
@@ -269,14 +300,14 @@ mod tests {
         // A version 1 file (no menu-style byte) still loads, with the default for it.
         let mut v1 = b"SKVSET01".to_vec();
         v1.extend_from_slice(&s.encode()[8..8 + 7]);
-        v1.extend_from_slice(&s.encode()[8 + 15..]);
+        v1.extend_from_slice(&s.encode()[8 + 16..]);
         let loaded = Settings::decode(&v1).unwrap();
         assert!(loaded.retail_menus && !loaded.manual_meter);
         assert_eq!((loaded.volume, loaded.world, loaded.controls.left_gain.y), (3, 6, 1.1));
         // A version 2 file (no meter byte) loads with the meter off.
         let mut v2 = b"SKVSET02".to_vec();
         v2.extend_from_slice(&s.encode()[8..8 + 8]);
-        v2.extend_from_slice(&s.encode()[8 + 15..]);
+        v2.extend_from_slice(&s.encode()[8 + 16..]);
         let loaded = Settings::decode(&v2).unwrap();
         assert!(!loaded.retail_menus && !loaded.manual_meter);
         assert_eq!(loaded.controls.left_gain.y, 1.1);
@@ -285,7 +316,7 @@ mod tests {
         // A version 3 file (no physics byte) loads with fast physics.
         let mut v3 = b"SKVSET03".to_vec();
         v3.extend_from_slice(&s.encode()[8..8 + 10]);
-        v3.extend_from_slice(&s.encode()[8 + 15..]);
+        v3.extend_from_slice(&s.encode()[8 + 16..]);
         let loaded = Settings::decode(&v3).unwrap();
         assert!(loaded.fast_physics && loaded.manual_meter);
         assert_eq!(loaded.controls.left_gain.y, 1.1);
@@ -295,7 +326,7 @@ mod tests {
         s.retail_audio = false;
         let mut v4 = b"SKVSET04".to_vec();
         v4.extend_from_slice(&s.encode()[8..8 + 11]);
-        v4.extend_from_slice(&s.encode()[8 + 15..]);
+        v4.extend_from_slice(&s.encode()[8 + 16..]);
         let loaded = Settings::decode(&v4).unwrap();
         assert!(loaded.retail_audio && !loaded.fast_physics);
         assert_eq!(loaded.controls.left_gain.y, 1.1);
@@ -306,7 +337,7 @@ mod tests {
         s.traffic = 3;
         let mut v5 = b"SKVSET05".to_vec();
         v5.extend_from_slice(&s.encode()[8..8 + 12]);
-        v5.extend_from_slice(&s.encode()[8 + 15..]);
+        v5.extend_from_slice(&s.encode()[8 + 16..]);
         let loaded = Settings::decode(&v5).unwrap();
         assert_eq!((loaded.traffic, loaded.controls.left_gain.y), (TRAFFIC_DEFAULT, 1.1));
         assert_eq!(Settings::decode(&s.encode()), Some(s));
@@ -314,7 +345,7 @@ mod tests {
         s.ai_skaters = false;
         let mut v6 = b"SKVSET06".to_vec();
         v6.extend_from_slice(&s.encode()[8..8 + 13]);
-        v6.extend_from_slice(&s.encode()[8 + 15..]);
+        v6.extend_from_slice(&s.encode()[8 + 16..]);
         let loaded = Settings::decode(&v6).unwrap();
         assert!(loaded.ai_skaters && loaded.traffic == 3);
         assert_eq!(Settings::decode(&s.encode()), Some(s));
@@ -322,13 +353,38 @@ mod tests {
         s.pedestrians = 3;
         let mut v7 = b"SKVSET07".to_vec();
         v7.extend_from_slice(&s.encode()[8..8 + 14]);
-        v7.extend_from_slice(&s.encode()[8 + 15..]);
+        v7.extend_from_slice(&s.encode()[8 + 16..]);
         let loaded = Settings::decode(&v7).unwrap();
         assert_eq!(loaded.pedestrians, PEDESTRIANS_DEFAULT);
         assert_eq!(Settings::decode(&s.encode()), Some(s));
+        // A version 9 file (no minimap byte) loads with the minimap on.
+        s.minimap = false;
+        let mut v9 = b"SKVSET09".to_vec();
+        v9.extend_from_slice(&s.encode()[8..8 + 15]);
+        v9.extend_from_slice(&s.encode()[8 + 16..]);
+        let loaded = Settings::decode(&v9).unwrap();
+        assert!(loaded.minimap && loaded.pedestrians == 3);
+        assert_eq!(Settings::decode(&s.encode()), Some(s));
         assert_eq!(Settings::decode(b"garbage"), None);
         let mut bad = s.encode();
-        bad[23..27].copy_from_slice(&f32::NAN.to_le_bytes());
+        bad[24..28].copy_from_slice(&f32::NAN.to_le_bytes());
         assert_eq!(Settings::decode(&bad).unwrap().controls.left_gain.x, 1.0);
+    }
+
+    /// FE 34 opens on the levels' densities; its tenths go back to the nearest level, a tie to the lower.
+    #[test]
+    fn free_play_values_map_to_the_nearest_level() {
+        let mut s = Settings::default();
+        s.traffic = 1;
+        let v = s.free_play();
+        assert_eq!((v.traffic, v.pedestrians), (TRAFFIC[1].1, PEDESTRIANS[usize::from(s.pedestrians)].1));
+        let fp = |traffic, pedestrians| skate_core::living_world::FreePlay { traffic, pedestrians, ai_skaters: false };
+        assert!(s.set_free_play(fp(0.3, 0.6)));
+        assert_eq!((s.traffic, s.pedestrians, s.ai_skaters), (1, 2, false));
+        s.set_free_play(fp(0.7, 0.75));
+        assert_eq!((s.traffic, s.pedestrians), (2, 2), "ties go to the lower level");
+        s.set_free_play(fp(0.8, 1.0));
+        assert_eq!((s.traffic, s.pedestrians), (3, 3));
+        assert!(!s.set_free_play(fp(0.9, 1.0)));
     }
 }

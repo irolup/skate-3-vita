@@ -267,6 +267,22 @@ impl Session {
         self.living.as_ref().map(|l| l.ped_rig())
     }
     /// The population counts (skaters, peds, cars) for diagnostics.
+    /// Call a skater by character key (FE 62 Call Skater): the living world places it next (None: no living world).
+    pub fn call_skater(&mut self, key: &str) -> Option<skate_core::living_world::CallOutcome> {
+        self.living.as_mut().map(|l| l.population.world.call_skater(key))
+    }
+    /// Dismiss a called skater: its slot frees, a spawned one rides on as an ambient skater. True when it was called.
+    pub fn dismiss_skater(&mut self, key: &str) -> bool {
+        self.living.as_mut().is_some_and(|l| l.population.world.dismiss_skater(key))
+    }
+    /// The called skaters' NPC serials (the ones riding now), oldest first.
+    pub fn called_serials(&self) -> Vec<u32> {
+        self.living.as_ref().map_or_else(Vec::new, |l| l.population.world.companions().iter().filter_map(|c| c.serial).collect())
+    }
+    /// The called skaters' character keys, oldest first.
+    pub fn called_skaters(&self) -> Vec<String> {
+        self.living.as_ref().map_or_else(Vec::new, |l| l.population.world.companions().iter().map(|c| c.key.clone()).collect())
+    }
     pub fn living_counts(&self) -> Option<[usize; 3]> {
         use skate_core::living_world::Kind;
         self.living.as_ref().map(|l| [Kind::Skater, Kind::Pedestrian, Kind::Vehicle].map(|k| l.population.world.count(k)))

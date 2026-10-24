@@ -39,3 +39,8 @@ pub mod extras;
 pub mod offline_profile;
 pub mod text_entry;
 pub mod text_viewer;
+pub mod spawn_skater;
+pub mod free_skate_options;
+pub mod indicator_trail;
+pub mod minimap;
+pub mod tips_loader;

@@ -73,8 +73,9 @@ fn trim_language(json: &mut serde_json::Value) {
     json["language"] = serde_json::Value::Object(kept);
 }
 
-/// The linked screens the game still loads (`skate_ui::menu_runtime`: the manual meter and the trick analyzer).
-const LINKED_SCREENS: [&str; 2] = ["manualmeter.linked.json", "trickanalyser.linked.json"];
+/// The linked screens the game still loads (`skate_ui::menu_runtime`: the manual meter, the trick analyzer and the HUD
+/// minimap's frame).
+const LINKED_SCREENS: [&str; 3] = ["manualmeter.linked.json", "trickanalyser.linked.json", "hudminimap.linked.json"];
 
 /// The linked front-end screens (`tools/link_ui_screen.py`, in `SCREENS/runtime/`) and
 /// the textures they name, under `private/ui/` in the pack (the movie JSON keeps its
@@ -89,7 +90,7 @@ fn screens(dir: &Path, list: &mut Vec<File>) -> Result<(), String> {
     linked.sort();
     for path in linked {
         let name = path.file_name().unwrap().to_string_lossy().to_string();
-        // Only the HUD meters still run as linked screens; the crossbar (R2), the replay editor, its help and the popup
+        // Only the HUD meters and the minimap still run as linked screens; the crossbar (R2), the replay editor, its help and the popup
         // (resync b110bab) run on the menu stage from the menu movie set.
         if !LINKED_SCREENS.contains(&name.as_str()) {
             println!("  screen {name}: skipped (the menu stage runs it from the menu movie set)");
@@ -180,8 +181,12 @@ fn teleporters(assets: &Path) -> Result<Option<Vec<u8>>, String> {
 
 /// The teleporters' floating icons (upstream setup `visual_indicators.py` at `74c124a`, research b532 to b539): the
 /// `visual-indicators.json` rows the teleporters name (their `ribbon_indicator` rows, splines and styles, the
-/// `default` colour retail's teleporter requests resolve to) and those colours' textures, as PNGs.
+/// `default` colour retail's teleporter requests resolve to) and those colours' textures, as PNGs; and the called
+/// skater's trail row (`trail_follow`, which setup exports under its vault hash; b566, upstream `36018e19`).
 const INDICATORS: &str = "private/visual-indicators.json";
+/// The loading screen's lines (`skate_data::tips_loader::TipsLines`, read by `skate_ui::fe::menu_stage`).
+const TIPS_LOADER: &str = "private/tips-loader.json";
+const TRAIL_STYLES: [&str; 2] = ["trail_follow", "Hash_8330C6CBB7402726"];
 
 fn indicators(assets: &Path, teleporters: &[u8]) -> Result<Option<Vec<File>>, String> {
     let Ok(bytes) = std::fs::read(assets.join(INDICATORS)) else { return Ok(None) };
@@ -202,7 +207,8 @@ fn indicators(assets: &Path, teleporters: &[u8]) -> Result<Option<Vec<File>>, St
     let mut slim = full.clone();
     slim["indicators"] = rows.clone().into();
     slim["splines"] = pick("splines", &field("spline")).into();
-    slim["styles"] = pick("styles", &field("style").into_iter().chain(["default".to_owned()]).collect()).into();
+    let styles = field("style").into_iter().chain(["default".to_owned()]).chain(TRAIL_STYLES.map(str::to_owned));
+    slim["styles"] = pick("styles", &styles.collect()).into();
     slim["colours"] = colours.clone().into();
     let folder = full["textures"].as_str().unwrap_or("visual-indicators").to_owned();
     let mut files = vec![File { path: INDICATORS.to_owned(), bytes: serde_json::to_vec(&slim).map_err(|e| e.to_string())? }];
@@ -273,6 +279,10 @@ pub fn bake(assets: &Path, out: &Path, screens_dir: Option<&Path>) -> Result<(),
                     let json = serde_json::to_vec(&map.to_json()).map_err(|e| e.to_string())?;
                     println!("  challenge map: {} nodes, {} markers, {} teleports, {} KiB", map.nodes.len(), map.markers.len(), map.teleports.len(), json.len() / 1024);
                     list.push(File { path: CHALLENGE_MAP.to_owned(), bytes: json });
+                    // The loading screen's lines (FE 52, upstream `0947dea5`): Coach Frank's and the hints' string ids.
+                    let tips = skate_data::tips_loader::read(&collections);
+                    println!("  loading screen tips: {} Coach Frank lines, {} hints", tips.coach.len(), tips.hints.len());
+                    list.push(File { path: TIPS_LOADER.to_owned(), bytes: serde_json::to_vec(&tips).map_err(|e| e.to_string())? });
                 }
                 (Err(e), _) | (_, Err(e)) => println!("  (no trick guide: {e})"),
                 _ => println!("  (no trick guide: the menu tables have no categories)"),

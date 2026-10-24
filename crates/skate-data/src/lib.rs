@@ -38,3 +38,4 @@ pub mod ped_anim;
 pub mod ped_nav;
 pub mod roads;
 pub mod trigger_volumes;
+pub mod tips_loader;

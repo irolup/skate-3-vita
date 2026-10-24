@@ -56,6 +56,8 @@ const SKATE_WITH: &str = "SkateWith";
 
 const DIFFICULTY: &str = "ID_GAMESETTINGS_DIFFICULTY_OPTIONS";
 const SFX_VOLUME: &str = "ID_GAMESETTINGS_SFXVOLUME";
+/// Retail's Minimap row (settings +158, default on): the HUD minimap (retail_hud.rs).
+const MINIMAP: &str = "ID_GAMESETTINGS_MINIMAP_TOGGLE";
 const REAR_TOUCH: &str = "VITA_REAR_TOUCH";
 const DPAD_BUMPERS: &str = "VITA_DPAD_BUMPERS";
 const FRONT_TOUCH: &str = "VITA_FRONT_TOUCH";
@@ -241,9 +243,10 @@ pub fn register(registry: &mut MenuRegistry, settings: &Settings) {
     let traffic: Vec<&str> = TRAFFIC.iter().map(|t| t.0).collect();
     let pedestrians: Vec<&str> = PEDESTRIANS.iter().map(|t| t.0).collect();
     let difficulty: Vec<String> = ["EASY", "NORMAL", "HARDCORE"].iter().map(|l| format!("ID_GAMESETTINGS_DIFFICULTY_{l}")).collect();
-    let rules: [(&str, ValueRule); 12] = [
+    let rules: [(&str, ValueRule); 13] = [
         (DIFFICULTY, cycle(&difficulty.iter().map(String::as_str).collect::<Vec<_>>())),
         (SFX_VOLUME, ValueRule::retail_slider()),
+        (MINIMAP, toggle()),
         (REAR_TOUCH, toggle()),
         (DPAD_BUMPERS, toggle()),
         (FRONT_TOUCH, toggle()),
@@ -277,6 +280,7 @@ pub fn write_settings(registry: &mut MenuRegistry, s: &Settings) {
     let values = [
         (DIFFICULTY, int(difficulty)),
         (SFX_VOLUME, SettingValue::Float(f64::from(s.volume.min(10)) / 10.0)),
+        (MINIMAP, flag(s.minimap)),
         (REAR_TOUCH, flag(c.rear_touch_bumpers)),
         (DPAD_BUMPERS, flag(c.dpad_bumpers)),
         (FRONT_TOUCH, flag(c.front_touch_thumbs)),
@@ -305,6 +309,7 @@ pub fn read_setting(registry: &MenuRegistry, id: &str, s: &mut Settings) -> bool
     match id {
         DIFFICULTY => s.difficulty = [Difficulty::Easy, Difficulty::Normal, Difficulty::Hardcore][index(3) as usize],
         SFX_VOLUME => s.volume = (v * 10.0).round().clamp(0.0, 10.0) as u8,
+        MINIMAP => s.minimap = on,
         REAR_TOUCH => s.controls.rear_touch_bumpers = on,
         DPAD_BUMPERS => s.controls.dpad_bumpers = on,
         FRONT_TOUCH => s.controls.front_touch_thumbs = on,

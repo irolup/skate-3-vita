@@ -27,6 +27,8 @@ mod world_replay;
 mod teleporters;
 mod teleporter_icons;
 #[cfg(target_os = "vita")]
+mod called_trails;
+#[cfg(target_os = "vita")]
 mod colour_grade;
 mod settings;
 mod vita_menus;

@@ -485,6 +485,102 @@ fn skaters_three_ambient_spawn_on_phase_30_at_60_to_90_m() {
     assert_eq!(world.skater_pool().len(), 5);
 }
 
+/// Call Skater (b544 / b563): a called character loads into the pool first and spawns on the nearest fitting free
+/// line from 4 m out (the 40 m ring here, inside the ambient 60 m inner radius); three slots, then Full.
+#[test]
+fn called_skater_spawns_on_the_nearest_line_and_slots_are_limited() {
+    let data = skater_data();
+    let obs = [still(0.0, 0.0)];
+    let mut inputs = TickInputs::offline(&obs);
+    inputs.skater_world = Some(&data);
+    let mut world = LivingWorld::new(config(), 21);
+    assert_eq!(world.call_skater("pro_7"), CallOutcome::Called);
+    assert_eq!(world.call_skater("pro_7"), CallOutcome::AlreadyCalled);
+    let mut at = None;
+    for _ in 0..(60 * 10) {
+        let d = world.step(&inputs);
+        if let Some(s) = spawns(&d, Kind::Skater).into_iter().find(|s| matches!(&s.choice, SpawnChoice::Skater { character, .. } if character == "pro_7")) {
+            at = Some(h(s.position, obs[0].position));
+            assert_eq!(world.companions()[0].serial, Some(s.id.serial));
+            break;
+        }
+    }
+    let r = at.expect("the called skater spawned");
+    assert!((r - 40.0).abs() < 1e-3, "{r}");
+    // Above the desired count, the excess cull takes ambient skaters, not the called one.
+    let serial = world.companions()[0].serial;
+    for _ in 0..(60 * 10) {
+        world.step(&inputs);
+    }
+    assert_eq!(world.companions()[0].serial, serial);
+    assert_eq!(world.call_skater("pro_1"), CallOutcome::Called);
+    assert_eq!(world.call_skater("pro_2"), CallOutcome::Called);
+    assert_eq!(world.call_skater("pro_3"), CallOutcome::Full);
+}
+
+/// A culled companion is requested again and comes back near the player; a dismiss frees the slot and leaves the
+/// skater riding.
+#[test]
+fn called_skater_returns_after_a_cull_and_dismiss_keeps_it_riding() {
+    let data = skater_data();
+    let near = [still(0.0, 0.0)];
+    let mut inputs = TickInputs::offline(&near);
+    inputs.skater_world = Some(&data);
+    let mut world = LivingWorld::new(config(), 5);
+    world.call_skater("pro_4");
+    let mut first = None;
+    for _ in 0..(60 * 10) {
+        world.step(&inputs);
+        if let Some(s) = world.companions()[0].serial {
+            first = Some(s);
+            break;
+        }
+    }
+    let first = first.expect("spawned");
+    // The player leaves: everything is culled beyond 120 m, the companion waits again.
+    let far = [still(500.0, 0.0)];
+    let mut away = TickInputs::offline(&far);
+    away.skater_world = Some(&data);
+    for _ in 0..60 {
+        world.step(&away);
+    }
+    assert!(world.live(Kind::Skater).all(|l| l.id.serial != first));
+    // Back home it spawns again.
+    let mut again = None;
+    for _ in 0..(60 * 10) {
+        world.step(&inputs);
+        if let Some(s) = world.companions()[0].serial {
+            again = Some(s);
+            break;
+        }
+    }
+    let again = again.expect("respawned");
+    assert_ne!(again, first);
+    assert!(world.dismiss_skater("pro_4"));
+    assert!(world.companions().is_empty());
+    world.step(&inputs);
+    assert!(world.live(Kind::Skater).any(|l| l.id.serial == again));
+}
+
+/// Calling a character that already rides as an ambient skater makes that skater the companion.
+#[test]
+fn calling_a_riding_character_takes_that_skater() {
+    let data = skater_data();
+    let obs = [still(0.0, 0.0)];
+    let mut inputs = TickInputs::offline(&obs);
+    inputs.skater_world = Some(&data);
+    let mut world = LivingWorld::new(config(), 21);
+    while world.count(Kind::Skater) == 0 {
+        world.step(&inputs);
+    }
+    let live = world.live(Kind::Skater).next().unwrap();
+    let (serial, SpawnChoice::Skater { character, .. }) = (live.id.serial, live.choice.clone()) else { panic!() };
+    world.call_skater(&character);
+    world.step(&inputs);
+    assert_eq!(world.companions()[0].serial, Some(serial));
+    assert_eq!(world.live(Kind::Skater).filter(|l| matches!(&l.choice, SpawnChoice::Skater { character: c, .. } if *c == character)).count(), 1);
+}
+
 #[test]
 fn skaters_never_spawn_within_5_m_of_another_skater() {
     // Two lines only: one 3 m from a standing player 75 m out, one free.

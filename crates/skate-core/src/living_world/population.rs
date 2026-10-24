@@ -185,8 +185,19 @@ pub struct LivingWorld {
     clock: ConsoleClock,
     pub(crate) skaters: KindState,
     pub(crate) skater_pool: Vec<String>,
+    pub(crate) companions: Vec<super::skaters::Companion>,
     pub(crate) peds: KindState,
     pub(crate) vehicles: KindState,
+}
+
+/// What a call to a skater did (827C5C50).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallOutcome {
+    Called,
+    /// Already called: nothing changes.
+    AlreadyCalled,
+    /// Every slot in use (FE 62 shows the limit popup before it gets here).
+    Full,
 }
 
 impl LivingWorld {
@@ -198,6 +209,7 @@ impl LivingWorld {
             clock: ConsoleClock::default(),
             skaters: KindState::new(Kind::Skater, seed),
             skater_pool: Vec::new(),
+            companions: Vec::new(),
             peds: KindState::new(Kind::Pedestrian, seed),
             vehicles: KindState::new(Kind::Vehicle, seed),
         }
@@ -252,6 +264,30 @@ impl LivingWorld {
         &self.skater_pool
     }
 
+    /// Called skaters (FE 62 Call Skater), oldest first.
+    pub fn companions(&self) -> &[super::skaters::Companion] {
+        &self.companions
+    }
+
+    /// Call a skater by character key (827C5C50): the ambient manager loads and places it next.
+    pub fn call_skater(&mut self, key: &str) -> CallOutcome {
+        if self.companions.iter().any(|c| c.key == key) {
+            return CallOutcome::AlreadyCalled;
+        }
+        if self.companions.len() >= self.config.skaters.companion_slots as usize {
+            return CallOutcome::Full;
+        }
+        self.companions.push(super::skaters::Companion { key: key.into(), serial: None });
+        CallOutcome::Called
+    }
+
+    /// Dismiss a called skater (827C6270): its slot frees; a spawned one rides on as an ambient skater.
+    pub fn dismiss_skater(&mut self, key: &str) -> bool {
+        let before = self.companions.len();
+        self.companions.retain(|c| c.key != key);
+        self.companions.len() != before
+    }
+
     /// Engine-side movement of an entity (NPC riding its line, ped walking): culls and the
     /// 5 m rule use the latest position.
     pub fn update_position(&mut self, id: LivingWorldId, position: Vec3) {
@@ -299,6 +335,8 @@ impl LivingWorld {
             self.state_mut(k).initial_pending = true;
         }
         self.skater_pool.clear();
+        // 8245D398 clears the companion entries with the AI manager.
+        self.companions.clear();
         out
     }
 
@@ -347,7 +385,7 @@ impl LivingWorld {
                 let density = density(&config.vehicles, inputs.free_play.map(|f| f.traffic));
                 census_pass(&config.vehicles, &mut self.vehicles, inputs, tick, seed, density, &mut out);
             }
-            skaters::tick(&config.skaters, &mut self.skaters, &mut self.skater_pool, inputs, tick, seed, &mut out);
+            skaters::tick(&config.skaters, &mut self.skaters, &mut self.skater_pool, &mut self.companions, inputs, tick, seed, &mut out);
         }
         self.tick += 1;
         out

@@ -17,6 +17,8 @@ use crate::vita_menus::{Choice, Worlds};
 
 /// The movie set in ui.pak (vita-bake `MENU_MOVIES`).
 const SET: &str = "private/menu-movies";
+/// The living world's skater profiles (living.pak): the pros Call Skater lists.
+const PROFILES: &str = "private/living_world/skater_profiles.json";
 /// Textures uploaded per frame while the set settles.
 const UPLOADS_PER_FRAME: usize = 4;
 /// Seconds the stage keeps running and drawing after the stack empties: the closed screen's outro plays out
@@ -42,6 +44,8 @@ pub struct Update {
     pub settings_changed: bool,
     /// Challenge Map locations picked: their map (`packs::WORLDS` name) and locator matrix.
     pub teleports: Vec<(String, [[f32; 4]; 4])>,
+    /// Call Skater (FE 62): a character key to call (true) or dismiss (false), in order.
+    pub skater_calls: Vec<(String, bool)>,
 }
 
 pub enum FeMenus {
@@ -67,6 +71,9 @@ pub struct Ready {
     worlds: Worlds,
     /// Seconds left of the closing outro.
     closing: f32,
+    /// The retail loading screen (FE 52) runs for this load (`set_loading`), and whether the game still loads.
+    loading_screen: bool,
+    load_wanted: bool,
     /// The retail replay screen is open (`FeMenus::replay`), and the choices made in its popups since last taken.
     replay: bool,
     replay_choices: Vec<(String, i32)>,
@@ -114,6 +121,10 @@ fn load(settings: Settings, worlds: Worlds) -> Result<Loaded, String> {
     // Challenge Map locations in the worlds the Vita has can be travelled to; the others stay greyed.
     let travel = stage.register_teleports(&|map| crate::packs::WORLDS.contains(&map));
     println!("FE_MENUS challenge map: {travel} locations to travel to");
+    // Call Skater lists the pros of the living world's skater profiles (living.pak); none without it.
+    let callable = read(PROFILES).map(|b| skate_ui::fe::spawn_skater_host::callable(&b)).unwrap_or_default();
+    println!("FE_MENUS call skater: {} pros", callable.len());
+    stage.set_callable(callable, crate::settings::CALLED_SKATERS as usize);
     let boot_ms = booted.elapsed().as_secs_f32() * 1000.0;
     let heap_stage = heap();
     let mut textures = Vec::with_capacity(wanted.len());
@@ -210,6 +221,8 @@ impl FeMenus {
                         replay: false,
                         replay_choices: Vec::new(),
                         hud: false,
+                        loading_screen: false,
+                        load_wanted: false,
                         #[cfg(target_os = "vita")]
                         keyboard: Default::default(),
                         stats: Stats::default(),
@@ -228,13 +241,31 @@ impl FeMenus {
                     println!("FE_MENUS textures uploaded; heap {} KiB", heap() / 1024);
                 }
             }
-            if !r.shown && r.closing > 0.0 {
-                r.closing -= seconds;
+            // The closing outro and the loading screen share the one update a frame.
+            let closing = !r.shown && r.closing > 0.0;
+            if closing || r.loading_screen {
+                if closing {
+                    r.closing -= seconds;
+                }
+                let started = Instant::now();
                 let frame = r.stage.update_keys(Vec::new(), seconds);
+                if r.loading_screen {
+                    let ms = started.elapsed().as_secs_f32() * 1000.0;
+                    r.stats.worst_ms = r.stats.worst_ms.max(ms);
+                }
                 for line in &frame.log {
                     println!("FE_MENUS {line}");
                 }
-                if r.closing <= 0.0 {
+                if r.stage.failed {
+                    let error = frame.log.last().cloned().unwrap_or_default();
+                    self.fail(error);
+                    return;
+                }
+                if r.loading_screen && !r.load_wanted && !r.stage.load_active() {
+                    r.loading_screen = false;
+                    println!("FE_MENUS loading screen done; heap {} KiB", heap() / 1024);
+                }
+                if closing && r.closing <= 0.0 {
                     for key in r.named.drain(..) {
                         apt.remove_texture(&key);
                     }
@@ -242,6 +273,34 @@ impl FeMenus {
                 }
             }
         }
+    }
+
+    /// The retail loading screen (FE 52) around a world load: `loading` from the load's start until the world is
+    /// ready, `began` on the frame it starts. A load that began before the stage could show it keeps the plain
+    /// loading screen (the first world's: the menus load after it).
+    pub fn set_loading(&mut self, loading: bool, began: bool) {
+        let FeMenus::Ready(r) = self else { return };
+        if !r.stage.has_loading_screen() || r.stage.failed || !r.pending.is_empty() {
+            return;
+        }
+        if loading && began && !r.loading_screen {
+            r.loading_screen = true;
+            println!("FE_MENUS loading screen; heap {} KiB", heap() / 1024);
+        }
+        r.load_wanted = loading;
+        if r.loading_screen {
+            r.stage.set_loading(loading);
+        }
+    }
+
+    /// The loading screen runs (the menus draw it over everything).
+    pub fn loading_screen(&self) -> bool {
+        matches!(self, FeMenus::Ready(r) if r.loading_screen)
+    }
+
+    /// The loading screen covers the world (the fader black or FE 52 up): black under the menus, not the world.
+    pub fn loading_covered(&self) -> bool {
+        matches!(self, FeMenus::Ready(r) if r.loading_screen && r.stage.load_covered())
     }
 
     /// Opens the pause menu (retail Start), or the main menu, with the game's current settings and saved replays.
@@ -434,13 +493,15 @@ impl FeMenus {
 
     /// One frame while shown, with the pad's 24 native values: choices and settings changes for the game (the
     /// settings rows the player changed are written to `settings`).
-    pub fn update(&mut self, pad: &[f32; 24], seconds: f32, settings: &mut Settings) -> Update {
+    pub fn update(&mut self, pad: &[f32; 24], seconds: f32, settings: &mut Settings, called: &[String]) -> Update {
         let FeMenus::Ready(r) = self else { return Update::default() };
         if !r.shown {
             return Update::default();
         }
         let mut out = Update { open: true, ..Update::default() };
         r.stage.set_cheats(if settings.zombie { &["zombie"] } else { &[] });
+        r.stage.set_called(called);
+        r.stage.set_free_play(settings.free_play());
         // The system keyboard takes the pad while it is up; its answer goes to the text entry.
         #[cfg(target_os = "vita")]
         let typing = r.keyboard.running();
@@ -484,6 +545,23 @@ impl FeMenus {
                 out.settings_changed = true;
             }
         }
+        // Call Skater: calls and dismisses go to the sim's living world; Free Play's You (the only skater listed: no
+        // player character swap on the Vita) changes nothing.
+        for action in &frame.spawn_skater {
+            use skate_core::spawn_skater::{Action, Skater};
+            match action {
+                Action::Call(Skater::Character(key)) => out.skater_calls.push((key.clone(), true)),
+                Action::Dismiss(Skater::Character(key)) => out.skater_calls.push((key.clone(), false)),
+                _ => {}
+            }
+        }
+        // The Free Play options (FE 34): its values to the Vita's Traffic / Pedestrians levels and AI skaters.
+        if let Some(values) = frame.free_play {
+            if settings.set_free_play(values) {
+                crate::vita_menus::write_settings(&mut r.stage.menus.registry, settings);
+                out.settings_changed = true;
+            }
+        }
         for (row, _) in &frame.settings {
             out.settings_changed |= crate::vita_menus::read_setting(&r.stage.menus.registry, row, settings);
         }
@@ -505,7 +583,7 @@ impl FeMenus {
     /// glyphs, `app::draw_glyphs`: retail name with `_hud`, rectangle in stage space).
     pub fn draw(&mut self, apt: &mut Apt) -> Vec<(String, [f32; 4])> {
         let FeMenus::Ready(r) = self else { return Vec::new() };
-        if !r.shown && !r.replay && !r.hud && (r.closing <= 0.0 || r.hidden) {
+        if !r.shown && !r.replay && !r.hud && !r.loading_screen && (r.closing <= 0.0 || r.hidden) {
             return Vec::new();
         }
         let started = Instant::now();

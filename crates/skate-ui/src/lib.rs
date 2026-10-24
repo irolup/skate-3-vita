@@ -7,6 +7,7 @@ pub mod fe;
 pub mod hud_runtime;
 pub mod menu_runtime;
 pub mod meter;
+pub mod minimap;
 
 #[cfg(test)]
 mod tests;

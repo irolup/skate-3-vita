@@ -177,6 +177,11 @@ pub(crate) struct Shared {
     pub camera_world: Option<skate_sim::live::CameraWorld>,
     /// Request: teleport the skater to the world's spawn.
     pub respawn: bool,
+    /// Requests from Call Skater (FE 62): a character key to call (true) or dismiss (false), in order.
+    pub skater_calls: Vec<(String, bool)>,
+    /// The called skaters (character keys, oldest first) and the NPC serials of those riding, as of the last tick.
+    pub called_skaters: Vec<String>,
+    pub called_serials: Vec<u32>,
     /// Request: teleport the skater to a locator (a Challenge Map location); it waits while a world loads, then
     /// applies to the new session.
     pub teleport: Option<[[f32; 4]; 4]>,
@@ -451,6 +456,15 @@ fn run_session(shared: &Mutex<Shared>, input: &Input, session: &mut Session, mut
                 session.set_living_settings(s.living.clone());
                 println!("living world: {:?} (live)", s.living);
             }
+            for (key, call) in std::mem::take(&mut s.skater_calls) {
+                if call {
+                    println!("LIVING call skater {key}: {:?}", session.call_skater(&key));
+                } else {
+                    println!("LIVING dismiss skater {key}: {}", if session.dismiss_skater(&key) { "freed" } else { "not called" });
+                }
+            }
+            s.called_skaters = session.called_skaters();
+            s.called_serials = session.called_serials();
             s.living_counts = session.living_counts();
             if let (Some([skaters, peds, cars]), 0) = (s.living_counts, session.ticks() % 600) {
                 println!("LIVING skaters={skaters} peds={peds} cars={cars} tick={} {}", session.ticks(), session.ped_brain_summary());

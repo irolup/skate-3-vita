@@ -1,21 +1,5 @@
-//! Living world population core (doc `docs/hails-additions/26b-living-world-population.md`, milestone 2).
-//!
-//! One census engine for every ambient kind: NPC skaters, pedestrians and vehicles (props and
-//! dynamic objects later). Pure and engine-independent: no ECS, no I/O, no rendering. The game
-//! feeds observer positions, the census map and the session state once per console tick and gets
-//! spawn / despawn decisions back.
-//!
-//! Retail reference (TU3, addresses are evidence only; values are re-implemented, not copied):
-//! - census tick `sub_826B71F0`: one living-world type per tick in rotation (peds, vehicles, DMOs,
-//!   props), each a cull pass then a spawn pass (`sub_826B7530` peds, `sub_826B7760` vehicles);
-//! - ambient skater manager `sub_8245BA28`: a 60-tick phase cycle (cull, pool, spawn, checks).
-//!
-//! Multiplayer seams (no networking here): a decision is a pure function of
-//! (config, seed, tick, observers, slot budget). It runs in one place (standalone or a future
-//! host); everything downstream consumes [`Decision`] records, never the RNG, so a client can
-//! replay the host's records. Every entity has a stable [`LivingWorldId`]; records carry what is
-//! needed to recreate the entity on another machine, including the seed of its own sub-RNG.
-//! Decisions never depend on hash-map iteration order or frame time.
+//! Living world population core: one census engine for NPC skaters, peds and vehicles. Pure.
+//! Retail reference (826B71F0, 8245BA28) and multiplayer seams: docs/hails-additions/26b-living-world-population.md#population-core
 
 pub mod ai_record;
 pub mod ai_controller;
@@ -45,9 +29,9 @@ pub use census::{CensusCircle, CensusGrid, CensusMap, CensusRange, CensusRecord,
 pub use clock::ConsoleClock;
 pub use config::{CensusKindConfig, FreePlay, PopulationConfig, SkaterConfig};
 pub use draw_distance::DrawDistance;
-pub use population::{LaneState, LivingWorld, TickInputs};
+pub use population::{CallOutcome, LaneState, LivingWorld, TickInputs};
 pub use rng::Rng;
-pub use skaters::{SkaterCharacter, SkaterLine, SkaterWorld};
+pub use skaters::{Companion, SkaterCharacter, SkaterLine, SkaterWorld};
 
 /// World position, metres (engine axes: y up; census grids use x / z).
 pub type Vec3 = [f32; 3];
@@ -116,10 +100,7 @@ pub enum SpawnChoice {
     /// point and the `livingworld_entitycategories` category the weight roll picked. The
     /// concrete entity / model inside the category is picked from `seed` by the body milestone.
     Census { record: String, category: String },
-    /// Census vehicles (milestone V2): the census record and category, the entity the category
-    /// roll picked and its `livingworld_models` record, the palette indices (`vehicles.json`
-    /// `palette_ids`: `<model>/chassis/<i>`, `<model>/secondary/<i>`), and the lane the factory
-    /// placed it on: retail segment id, lane, distance along the segment (m). Speed at spawn 0.
+    /// Census vehicle record: category, entity, model record, palette indices and the placed lane.
     Vehicle {
         record: String,
         category: String,

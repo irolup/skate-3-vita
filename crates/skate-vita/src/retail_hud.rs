@@ -426,6 +426,71 @@ impl Meter {
     }
 }
 
+const MINIMAP: &str = "private/ui/hudminimap.linked.json";
+/// The menu set (ui.pak) whose minimap icon images the minimap draws.
+const MENU_SET: &str = "private/menu-movies";
+
+/// The HUD minimap (`hud2/hudminimap`, skate_ui::minimap; upstream `36018e19`): the frame, the called skaters' icons and
+/// the north pointer, top right; on by default (Game Settings > Minimap, retail's default).
+pub struct Minimap {
+    map: skate_ui::minimap::MiniMap,
+    tracker: skate_ui::minimap::Tracker,
+    icons: Vec<skate_core::minimap::Icon>,
+}
+
+impl Minimap {
+    pub const FILE: &'static str = MINIMAP;
+
+    pub fn load(apt: &mut Apt) -> Result<Self, String> {
+        let map = skate_ui::minimap::MiniMap::load(&read_screen(MINIMAP)?)?;
+        upload_textures(&map.shapes, apt)?;
+        // The icon and pointer textures: the menu set's `texture/<name>` images.
+        let manifest = read_screen(&format!("{MENU_SET}/manifest.json"))?;
+        for name in skate_ui::minimap::TEXTURES {
+            let e = &manifest["images"][format!("texture/{name}")];
+            let (Some(rgba), Some(w), Some(h)) = (e["rgba"].as_str(), e["width"].as_u64(), e["height"].as_u64()) else {
+                return Err(format!("no texture/{name} in the menu set"));
+            };
+            let bytes = skate_data::vfs::read(&Path::new(ROOT).join(MENU_SET).join(rgba)).map_err(|e| format!("{rgba}: {e}"))?;
+            if bytes.len() != (w * h * 4) as usize {
+                return Err(format!("texture {rgba}: wrong size"));
+            }
+            apt.add_texture(&format!("{}{name}", skate_ui::minimap::TEXTURE_PREFIX), w as u32, h as u32, &bytes);
+        }
+        Ok(Self { map, tracker: Default::default(), icons: Vec::new() })
+    }
+
+    /// One displayed frame while playing: `dt` seconds, the setting, the player's position, the camera's forward and the
+    /// called skaters' positions (`mini_skater` each, retail's AI slots with +0x7A, b565). False on a script error.
+    pub fn frame(&mut self, dt: f32, setting: bool, player: glam::Vec3, forward: glam::Vec3, called: &[glam::Vec3]) -> bool {
+        self.tracker.step(dt, player.to_array(), forward.to_array());
+        self.icons.clear();
+        self.icons.extend(called.iter().enumerate().map(|(i, p)| skate_core::minimap::Icon {
+            id: format!("called_skaters:{i}"),
+            texture: "mini_skater".into(),
+            position: [p.x, p.z],
+            angle: 0.0,
+            scale: 1.0,
+            fade: true,
+            max_distance: 0.0,
+            colour: [1.0; 4],
+        }));
+        // Our HUD draws in play only, so the HUD is on there; Free Play (mode 3) follows the row.
+        self.map.update(skate_core::minimap::visible(true, 3, setting), &self.tracker).is_ok()
+    }
+
+    /// A teleport or a new world: the heading takes no velocity from the jump.
+    pub fn reset(&mut self) {
+        self.tracker.reset();
+    }
+
+    pub fn draw(&self, apt: &mut Apt) {
+        if let Ok(draws) = self.map.draw(&self.tracker, &self.icons) {
+            apt.draw(&draws);
+        }
+    }
+}
+
 /// Frames the gesture of the last trick stays on screen once the trick display is idle.
 const ANALYZER_HOLD: u32 = 180;
 

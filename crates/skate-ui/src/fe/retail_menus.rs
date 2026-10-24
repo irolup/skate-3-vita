@@ -23,6 +23,12 @@ pub const TEXT_ENTRY_SCREEN: &str = "47ddadb752e051b6";
 pub const TEXT_VIEWER_SCREEN: &str = "bd688a2a5602e595";
 /// The Skate Profile screen (TU3 FE 61, template 106 OfflineProfile, b308).
 pub const OFFLINE_PROFILE_SCREEN: &str = "f17ccf55ee91b4f7";
+/// The SpawnSkater screen (TU3 FE 62, template 107 `cas/spawnskater.swf`, b543) and the Free Play options (TU3 FE
+/// 34, template 13 `main/freeskate_options.swf`, b548 / b564).
+pub const SPAWN_SKATER_SCREEN: &str = "6abd6ed78ce7e627";
+pub const FREE_SKATE_SCREEN: &str = "898675eacd78bf05";
+/// The loading screen (TU3 FE 52, template 131 `main/tiploader.swf`, key hash64("tiploader"), b581).
+pub const LOADING_SCREEN: &str = "e1fa207da2bdf61a";
 
 /// Retail pause items whose retail FE screen is ported: the crossbar pushes it (GameSettings -> FE 45, the Game
 /// Settings screen; screen id = its info record key).

@@ -233,10 +233,23 @@ struct IconsGpu {
     index_count: GLsizei,
     front: GLuint,
     background: GLuint,
+    /// The called skaters' trails (`set_trail`): world-space ribbons (vbo, ibo, index count) by slot.
+    trails: [Option<(GLuint, GLuint, GLsizei)>; TRAIL_SLOTS],
 }
 
 impl IconsGpu {
     const STRIDE: usize = 20;
+}
+
+/// Trails at most (retail keeps 4 trail objects, `827ADA30`).
+pub const TRAIL_SLOTS: usize = 4;
+
+/// One called skater's trail to draw: its slot (`Scene::set_trail`) and the pass factors as [`IconInstance`]'s.
+#[derive(Clone, Copy, Debug)]
+pub struct TrailInstance {
+    pub slot: usize,
+    pub front: f32,
+    pub background: [f32; 2],
 }
 
 /// One teleporter icon to draw: its model matrix and the pass factors (retail's `i_intensity` x the fade).
@@ -373,6 +386,8 @@ pub struct Frame<'a> {
     pub hand_props: &'a [PedInstance<'a>],
     /// The teleporter icons in view (drawn last, blended).
     pub icons: &'a [IconInstance],
+    /// The called skaters' trails in view (drawn with the icons).
+    pub trails: &'a [TrailInstance],
 }
 
 impl Scene {
@@ -807,13 +822,36 @@ impl Scene {
                 index_count: indices.len() as GLsizei,
                 front: upload_texture(front),
                 background: upload_texture(background),
+                trails: Default::default(),
             });
         }
+    }
+
+    /// A called skater's trail mesh (world space, the icons' vertex layout) in `slot`, replacing the last one; an empty
+    /// mesh frees the slot. Needs the icons loaded (their program and textures).
+    pub fn set_trail(&mut self, slot: usize, vertices: &[[f32; 5]], indices: &[u16]) {
+        let Some(gpu) = self.icons.as_mut().filter(|_| slot < TRAIL_SLOTS) else { return };
+        if let Some((vbo, ibo, _)) = gpu.trails[slot].take() {
+            unsafe {
+                glDeleteBuffers(1, &vbo);
+                glDeleteBuffers(1, &ibo);
+            }
+        }
+        if indices.is_empty() {
+            return;
+        }
+        let bytes: Vec<u8> = vertices.iter().flatten().flat_map(|f| f.to_le_bytes()).collect();
+        let index_bytes: Vec<u8> = indices.iter().flat_map(|i| i.to_le_bytes()).collect();
+        gpu.trails[slot] = Some(unsafe { (buffer(GL_ARRAY_BUFFER, &bytes), buffer(GL_ELEMENT_ARRAY_BUFFER, &index_bytes), indices.len() as GLsizei) });
     }
 
     pub fn unload_icons(&mut self) {
         if let Some(i) = self.icons.take() {
             unsafe {
+                for (vbo, ibo, _) in i.trails.iter().flatten() {
+                    glDeleteBuffers(1, vbo);
+                    glDeleteBuffers(1, ibo);
+                }
                 glDeleteBuffers(1, &i.vbo);
                 glDeleteBuffers(1, &i.ibo);
                 glDeleteTextures(1, &i.front);
@@ -824,30 +862,43 @@ impl Scene {
 
     /// Retail's two passes per icon (b535 `827AFC80`, b536 `82CE9080`): the background alpha blended, then the front
     /// added; depth tested, no depth write, both faces.
-    fn draw_icons(&self, icons: &[IconInstance], vp: &[f32; 16]) {
-        let Some(gpu) = self.icons.as_ref().filter(|_| !icons.is_empty()) else { return };
+    fn draw_icons(&self, icons: &[IconInstance], trails: &[TrailInstance], vp: &[f32; 16]) {
+        let Some(gpu) = self.icons.as_ref().filter(|_| !icons.is_empty() || !trails.is_empty()) else { return };
         unsafe {
+            // Background alpha blended, then front added, with the bound mesh.
+            let passes = |model: &[f32; 16], front: f32, [b, a]: [f32; 2], count: GLsizei| {
+                glUniformMatrix4fv(gpu.model, 1, GL_FALSE, model.as_ptr());
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                glBindTexture(GL_TEXTURE_2D, gpu.background);
+                glUniform4f(gpu.scale, b, b, b, a);
+                glDrawElements(GL_TRIANGLES, count, GL_UNSIGNED_SHORT, std::ptr::null());
+                glBlendFunc(GL_ONE, GL_ONE);
+                glBindTexture(GL_TEXTURE_2D, gpu.front);
+                glUniform4f(gpu.scale, front, front, front, 1.0);
+                glDrawElements(GL_TRIANGLES, count, GL_UNSIGNED_SHORT, std::ptr::null());
+            };
             glUseProgram(gpu.program.id);
             glUniformMatrix4fv(gpu.viewproj, 1, GL_FALSE, vp.as_ptr());
-            glBindBuffer(GL_ARRAY_BUFFER, gpu.vbo);
-            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, gpu.ibo);
-            attributes(&[(3, GL_FLOAT, GL_FALSE, 0), (2, GL_FLOAT, GL_FALSE, 12)], IconsGpu::STRIDE);
             glDisable(GL_CULL_FACE);
             glDepthMask(GL_FALSE);
             glEnable(GL_BLEND);
             glActiveTexture(GL_TEXTURE0);
-            for icon in icons {
-                let model = icon.model.to_cols_array();
-                glUniformMatrix4fv(gpu.model, 1, GL_FALSE, model.as_ptr());
-                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-                glBindTexture(GL_TEXTURE_2D, gpu.background);
-                let [b, a] = icon.background;
-                glUniform4f(gpu.scale, b, b, b, a);
-                glDrawElements(GL_TRIANGLES, gpu.index_count, GL_UNSIGNED_SHORT, std::ptr::null());
-                glBlendFunc(GL_ONE, GL_ONE);
-                glBindTexture(GL_TEXTURE_2D, gpu.front);
-                glUniform4f(gpu.scale, icon.front, icon.front, icon.front, 1.0);
-                glDrawElements(GL_TRIANGLES, gpu.index_count, GL_UNSIGNED_SHORT, std::ptr::null());
+            if !icons.is_empty() {
+                glBindBuffer(GL_ARRAY_BUFFER, gpu.vbo);
+                glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, gpu.ibo);
+                attributes(&[(3, GL_FLOAT, GL_FALSE, 0), (2, GL_FLOAT, GL_FALSE, 12)], IconsGpu::STRIDE);
+                for icon in icons {
+                    passes(&icon.model.to_cols_array(), icon.front, icon.background, gpu.index_count);
+                }
+            }
+            // The trails are in world space.
+            let identity = Mat4::IDENTITY.to_cols_array();
+            for trail in trails {
+                let Some(Some((vbo, ibo, count))) = gpu.trails.get(trail.slot) else { continue };
+                glBindBuffer(GL_ARRAY_BUFFER, *vbo);
+                glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, *ibo);
+                attributes(&[(3, GL_FLOAT, GL_FALSE, 0), (2, GL_FLOAT, GL_FALSE, 12)], IconsGpu::STRIDE);
+                passes(&identity, trail.front, trail.background, *count);
             }
             glDisable(GL_BLEND);
             glDepthMask(GL_TRUE);
@@ -980,7 +1031,7 @@ impl Scene {
             }
             self.draw_cars(frame, &vp, true);
             // The teleporter icons, blended over everything.
-            self.draw_icons(frame.icons, &vp);
+            self.draw_icons(frame.icons, frame.trails, &vp);
         }
     }
 

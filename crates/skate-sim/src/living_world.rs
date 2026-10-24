@@ -306,6 +306,9 @@ pub struct LivingWorldSettings {
     /// skate_vita: the ped pool in place of retail's 31 (`retail::PED_POOL`), the only bound left on the peds under the
     /// zombie cheat; None = retail's.
     pub ped_pool: Option<u32>,
+    /// skate_vita: the called skaters (FE 62 Call Skater) at most in place of retail's 3 (`retail::SKATER_COMPANION_SLOTS`);
+    /// each is one more NPC skater on the tick. None = retail's.
+    pub companion_slots: Option<u32>,
     /// Session seed (0 = derive from the map name).
     pub seed: u64,
     /// Log a population summary every 5 s.
@@ -362,6 +365,7 @@ impl Default for LivingWorldSettings {
             free_play: None,
             zombie: false,
             ped_pool: None,
+            companion_slots: None,
             seed: 0,
             debug: false,
         }
@@ -392,6 +396,9 @@ impl LivingWorldSettings {
         config.pedestrians.density = self.pedestrians.density;
         if let Some(pool) = self.ped_pool {
             config.pedestrians.pool = Some(pool);
+        }
+        if let Some(slots) = self.companion_slots {
+            config.skaters.companion_slots = slots;
         }
         config.vehicles.enabled = on && self.vehicles.enabled;
         config.vehicles.density = self.vehicles.density;

@@ -221,6 +221,12 @@ pub struct FrontEnd<'a> {
     pub tos: crate::fe::extras_host::TosHost,
     /// The Skate Profile screen FE 61 (offline_profile_host).
     pub offline_profile: crate::fe::offline_profile_host::OfflineProfileHost,
+    /// FE 62 SpawnSkater's `SkaterSpawner` object (spawn_skater_host).
+    pub spawn_skater: crate::fe::spawn_skater_host::SpawnSkaterHost,
+    /// FE 34 FreeSkateOption's object (free_skate_options_host).
+    pub free_skate: crate::fe::free_skate_options_host::FreeSkateOptionsHost,
+    /// FE 52 loading screen's `TipsLoader` object (tips_loader_host).
+    pub tips_loader: crate::fe::tips_loader_host::TipsLoaderHost,
 }
 
 impl<'a> FrontEnd<'a> {
@@ -251,13 +257,16 @@ impl<'a> FrontEnd<'a> {
             extras: Default::default(),
             tos: Default::default(),
             offline_profile: Default::default(),
+            spawn_skater: Default::default(),
+            free_skate: Default::default(),
+            tips_loader: Default::default(),
         }
     }
 }
 
 impl crate::fe::apt_stage::StageNatives for FrontEnd<'_> {
     fn objects(&self) -> Vec<String> {
-        ["Game", "CoreMenu", "Audio", "FELanguage", "FETrickTutorial", "FEChallengeMap", "FEReplayMenu", "HUDComponents", "Popup", "Progression", "Stats", "SignUpPoster", "tos"]
+        ["Game", "CoreMenu", "Audio", "FELanguage", "FETrickTutorial", "FEChallengeMap", "FEReplayMenu", "HUDComponents", "Popup", "Progression", "Stats", "SignUpPoster", "tos", "SkaterSpawner", "FreeSkateOption", "TipsLoader"]
             .map(String::from)
             .to_vec()
     }
@@ -295,6 +304,15 @@ impl crate::fe::apt_stage::StageNatives for FrontEnd<'_> {
             if let Some(value) = self.tos.call(vm, method, &args)? {
                 return Ok(value);
             }
+        }
+        if let Some(value) = self.free_skate.call(object, method) {
+            return Ok(value);
+        }
+        if let Some(value) = self.spawn_skater.call(vm, object, method, &args)? {
+            return Ok(value);
+        }
+        if let Some(value) = self.tips_loader.call(vm, object, method, &args)? {
+            return Ok(value);
         }
         // The Extras rows and its picker callbacks (only while FE 18 is on top).
         if let Some(value) = (object == "Game").then(|| self.extras.call(method, &args)).flatten() {
@@ -386,7 +404,7 @@ mod tests {
             help: format!("ID_{id}_HELP"),
             sub_option_kind: kind,
         };
-        MenuRegistry::new(MenuData { map_nodes: Vec::new(), map_pictures: Default::default(), map_markers: Default::default(),
+        MenuRegistry::new(MenuData { map_nodes: Vec::new(), map_pictures: Default::default(), map_markers: Default::default(), map_debug: Default::default(),
             categories: vec![
                 Category { id: "SinglePlayer".into(), label: "ID_CROSSBAR_SINGLE_PLAYER".into(), icon: Icon::Retail("singleplayer".into()) },
                 Category { id: "Options".into(), label: "ID_CROSSBAR_OPTIONS".into(), icon: Icon::Retail("options".into()) },

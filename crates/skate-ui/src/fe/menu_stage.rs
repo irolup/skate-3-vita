@@ -14,7 +14,7 @@ use crate::fe::crossbar_host::{FrontEnd, SubOptionRow};
 use crate::fe::retail_menu_movies::{MenuImage, RetailMenuMovies};
 use crate::fe::retail_menus::{
     RetailMenus, CHALLENGE_MAP_SCREEN, EXTRAS_SCREEN, OFFLINE_PROFILE_SCREEN, PAUSE_SCREEN, SCREEN, SETTINGS_SCREEN, TABLES, TEXT_ENTRY_SCREEN, TEXT_VIEWER_SCREEN,
-    TRICK_GUIDE_SCREEN, VIDEO_CALIBRATION_SCREEN,
+    TRICK_GUIDE_SCREEN, VIDEO_CALIBRATION_SCREEN, FREE_SKATE_SCREEN, SPAWN_SKATER_SCREEN, LOADING_SCREEN,
 };
 use skate_core::crossbar::{CrossbarAction, CrossbarRules, CrossbarState, NavEvent};
 use skate_core::fe_fade::{FeFade, FeFadeParams};
@@ -108,6 +108,28 @@ const OFFLINE_PROFILE_ITEM: &str = "SkateProfileOffline";
 const PROFILE_NEXT_TAB: u32 = 7;
 const PROFILE_PREVIOUS_TAB: u32 = 10;
 const PROFILE_SCROLL: [u32; 4] = [12, 13, 24, 25];
+/// The SpawnSkater template (record 107) and its path; FE screen 62's init opens it (0x8264D958, b543). The Free Play
+/// and Call Skater pause items open it.
+const SPAWN_SKATER: &str = "SpawnSkater";
+const SPAWN_SKATER_PATH: &str = "cas/spawnskater.swf";
+/// Its limit popup's callback (the choice changes nothing).
+const SPAWN_SKATER_POPUP: &str = "spawn_skater.limit";
+/// The Free Play options template (record 13) and its path; FE 34 (X in FE 62 Free Play, flow 0x8A; b548 / b564).
+const FREE_SKATE: &str = "FreeSkateOption";
+const FREE_SKATE_PATH: &str = "main/freeskate_options.swf";
+/// The loading screen (template 131 TipsLoader, FE 52; research b581; upstream `0947dea5`), optional in the set, and
+/// its lines (`vita-bake ui`).
+const TIPS_LOADER: &str = "TipsLoader";
+const TIPS_LOADER_PATH: &str = "main/tiploader.swf";
+pub const TIPS_LOADER_DATA: &str = "private/tips-loader.json";
+/// The fader bit the game state's loading holds (sub_826E08A8 bit 2).
+const FADE_LOAD: u32 = 2;
+/// AptMisc (X) and the direction keys (pad, left stick, d-pad repeats) FE 34 reads.
+const APT_MISC: u32 = 5;
+const KEYS_UP: [u32; 3] = [12, 16, 24];
+const KEYS_DOWN: [u32; 3] = [13, 17, 25];
+const KEYS_LEFT: [u32; 3] = [14, 18, 26];
+const KEYS_RIGHT: [u32; 3] = [15, 19, 27];
 /// skate_vita: the Licenses row (upstream greys it as WIP; ours shows this project's licenses, user 2026-10-23).
 const LICENSES_ROW: &str = "extras.licenses";
 const CROSSBAR_ENUMS: [&str; 6] =
@@ -117,9 +139,9 @@ const POPUP_KINDS: [PopupKind; 3] = [PopupKind::Standard, PopupKind::Small, Popu
 /// skate_vita (memory): the movies the pause front end runs on, for `RetailMenuMovies::read_lean` (their imports
 /// come along): the boot root and what it loads (the screen manager, the chyron, the dimmer, ...), the pause menu,
 /// Game Settings, Video Calibration, the Trick Guide, the Challenge Map, the instant replay screen and its help, the
-/// action overlay (the teleporter prompt), Extras, the text viewer, the Skate Profile and the popups. Not the free skate options or the
-/// HUD movies.
-pub const PAUSE_ROOTS: [&str; 23] = [
+/// action overlay (the teleporter prompt), Extras, the text viewer, the Skate Profile, SpawnSkater, the Free Play
+/// options, the loading screen and the popups. Not the HUD movies.
+pub const PAUSE_ROOTS: [&str; 26] = [
     "source/screens/main",
     "source/screens/main/FE_root",
     "source/screens/main/chyron",
@@ -141,6 +163,9 @@ pub const PAUSE_ROOTS: [&str; 23] = [
     "source/screens/main/extras",
     "source/screens/nucleus/nucleus_tos",
     "source/screens/profile/offline_skateProfile",
+    "source/screens/cas/spawnskater",
+    "source/screens/main/freeskate_options",
+    "source/screens/main/tiploader",
     "source/screens/popup/sk8popup",
     "source/screens/popup/small_popup",
 ];
@@ -197,6 +222,10 @@ pub struct Frame {
     pub text_entry: Option<(String, skate_core::text_entry::TextEntryRequest)>,
     /// Cheats turned on or off (`skate_core::cheats` ids), for the game to apply.
     pub cheats: Vec<(String, bool)>,
+    /// What FE 62 asked of the game: skaters called or dismissed, the player's skater picked.
+    pub spawn_skater: Vec<skate_core::spawn_skater::Action>,
+    /// FE 34 closed with these Free Play values (flow 0x8B): the game applies them.
+    pub free_play: Option<skate_core::living_world::FreePlay>,
 }
 
 pub struct MenuStage {
@@ -252,6 +281,25 @@ pub struct MenuStage {
     offline_profile: crate::fe::offline_profile_host::OfflineProfileHost,
     extras: crate::fe::extras_host::ExtrasHost,
     tos: crate::fe::extras_host::TosHost,
+    /// FE 62's AS id, its host, the mode the next push opens it in (the pause item picks it), the pros Call Skater
+    /// lists and the skaters the game has called ([`Self::set_called_skaters`]).
+    spawn_skater_id: i32,
+    spawn_skater: crate::fe::spawn_skater_host::SpawnSkaterHost,
+    spawn_skater_mode: skate_core::spawn_skater::Mode,
+    callable: Vec<crate::fe::spawn_skater_host::Callable>,
+    called: Vec<String>,
+    /// FE 34's AS id, its host and the game's Free Play values it opens with ([`Self::set_free_play`]).
+    free_skate_id: i32,
+    free_skate: crate::fe::free_skate_options_host::FreeSkateOptionsHost,
+    free_play: skate_core::living_world::FreePlay,
+    /// FE 52's AS id (None: no movie or template in the set), its `TipsLoader` host, the load sequence, whether the
+    /// screen's intro is done / it closed, and whether the game is loading ([`Self::set_loading`]).
+    tips_loader_id: Option<i32>,
+    tips_loader: crate::fe::tips_loader_host::TipsLoaderHost,
+    load: skate_core::tips_loader::LoadScreen,
+    load_up: bool,
+    load_gone: bool,
+    loading: bool,
     cheats: skate_core::cheats::CheatRules,
     /// The cheats in effect (the game's flags, [`Self::set_cheats`]): entering a code toggles them.
     cheats_on: skate_core::cheats::CheatState,
@@ -514,11 +562,25 @@ impl MenuStage {
             let owner = Owner::Engine(format!("{SCREEN}{OFFLINE_PROFILE_SCREEN}"));
             menus.registry.register_handler(EntryRef::item(OFFLINE_PROFILE_ITEM), Handler { owner, select: true, highlight: false, callback: None });
         }
+        // SpawnSkater (FE 62): Free Play (SoloFreeskateOptions) and Call Skater (SkateWith) push it (b307); greyed
+        // without the movie (sets before version 14).
+        if has(SPAWN_SKATER, SPAWN_SKATER_PATH) {
+            for (item, _) in skate_core::spawn_skater::SpawnSkaterRules::default().items {
+                if menus.registry.data().item(&item).is_some() {
+                    let owner = Owner::Engine(format!("{SCREEN}{SPAWN_SKATER_SCREEN}"));
+                    menus.registry.register_handler(EntryRef::item(&item), Handler { owner, select: true, highlight: false, callback: None });
+                }
+            }
+        }
         let mut extras = crate::fe::extras_host::ExtrasHost::default();
         if let Some(row) = extras.rules.rows.iter_mut().find(|r| r.id == LICENSES_ROW) {
             row.greyed = !has(TEXT_VIEWER, TEXT_VIEWER_PATH);
         }
         let replay_id = has(REPLAY, REPLAY_PATH).then(|| as_id(REPLAY));
+        // The loading screen's lines; without them its panels have nothing to say (Coach Frank and the hint).
+        let tips_lines: skate_data::tips_loader::TipsLines =
+            read(TIPS_LOADER_DATA).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        let tips_loader_id = (has(TIPS_LOADER, TIPS_LOADER_PATH) && !tips_lines.coach.is_empty()).then(|| as_id(TIPS_LOADER));
         let replay_help_id = has(REPLAY_HELP, REPLAY_HELP_PATH).then(|| as_id(REPLAY_HELP));
         let signup_id = has_signup.then(|| as_id(SIGNUP));
 
@@ -558,6 +620,25 @@ impl MenuStage {
             offline_profile: Default::default(),
             extras,
             tos: Default::default(),
+            spawn_skater_id: as_id(SPAWN_SKATER),
+            spawn_skater: Default::default(),
+            spawn_skater_mode: Default::default(),
+            callable: Vec::new(),
+            called: Vec::new(),
+            free_skate_id: as_id(FREE_SKATE),
+            free_skate: Default::default(),
+            free_play: Default::default(),
+            tips_loader_id,
+            // The tips RNG's seed (retail's is open): the boot's time, as upstream.
+            tips_loader: crate::fe::tips_loader_host::TipsLoaderHost {
+                lines: tips_lines,
+                seed: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.subsec_nanos() | 1),
+                ..Default::default()
+            },
+            load: Default::default(),
+            load_up: false,
+            load_gone: false,
+            loading: false,
             cheats: Default::default(),
             cheats_on: Default::default(),
             pending_entry: None,
@@ -689,6 +770,11 @@ impl MenuStage {
         let entry = self.index(TEXT_ENTRY_SCREEN);
         let viewer = self.index(TEXT_VIEWER_SCREEN);
         let profile = self.index(OFFLINE_PROFILE_SCREEN);
+        let spawn = self.index(SPAWN_SKATER_SCREEN);
+        let free = self.index(FREE_SKATE_SCREEN);
+        let (spawn_id, free_id) = (self.spawn_skater_id, self.free_skate_id);
+        let loader = self.index(LOADING_SCREEN).filter(|_| self.tips_loader_id.is_some());
+        let loader_id = self.tips_loader_id.unwrap_or(0);
         let (crossbar_id, options_id, cal_id, trick_id) = (self.crossbar_id, self.options_id, self.video_cal_id, self.trick_guide_id);
         let map_id = self.challenge_map_id;
         let (extras_id, viewer_id, profile_id) = (self.extras_id, self.viewer_id, self.profile_id);
@@ -710,6 +796,13 @@ impl MenuStage {
         fe.extras.open = extras.is_some() && self.stack.top(Layer::Main) == extras;
         fe.tos = std::mem::take(&mut self.tos);
         fe.offline_profile = std::mem::take(&mut self.offline_profile);
+        fe.spawn_skater = std::mem::take(&mut self.spawn_skater);
+        fe.spawn_skater.open = spawn.is_some() && self.stack.top(Layer::Main) == spawn;
+        fe.free_skate = std::mem::take(&mut self.free_skate);
+        fe.free_skate.open = free.is_some() && self.stack.top(Layer::Main) == free;
+        fe.tips_loader = std::mem::take(&mut self.tips_loader);
+        // No keys while a load runs (upstream: none while the sequence is active).
+        let keys = if self.load.active() { Vec::new() } else { keys };
         let (replay_id, replay_help_id) = (self.replay_id, self.replay_help_id);
         let replay_feed = self.replay_feed.clone();
         let replay_shown = &mut self.replay_shown;
@@ -722,6 +815,8 @@ impl MenuStage {
         let popup_choices = &mut out.popup_choices;
         let cheats_out = &mut out.cheats;
         let text_entry = &mut out.text_entry;
+        let spawn_out = &mut out.spawn_skater;
+        let free_play_out = &mut out.free_play;
         let stage = &mut self.stage;
         let stack = &mut self.stack;
         let screens = &self.screens;
@@ -755,7 +850,7 @@ impl MenuStage {
                     continue;
                 }
                 let target = stack.input_target();
-                let Some(screen) = target.filter(|t| [pause, options, cal, trick, map, extras, viewer, profile].contains(&Some(*t))) else { continue };
+                let Some(screen) = target.filter(|t| [pause, options, cal, trick, map, extras, viewer, profile, spawn, free].contains(&Some(*t))) else { continue };
                 // sub_825EC0E8: the screen's C++ handler first, then the movie's UpdateInput when the handler did
                 // not consume the key and the screen's record says so (+12).
                 let mut consumed = false;
@@ -773,6 +868,10 @@ impl MenuStage {
                     viewer_id
                 } else if Some(screen) == profile {
                     profile_id
+                } else if Some(screen) == spawn {
+                    spawn_id
+                } else if Some(screen) == free {
+                    free_id
                 } else {
                     trick_id
                 };
@@ -785,7 +884,44 @@ impl MenuStage {
                     // while the close fades out (S+52).
                     continue;
                 }
-                if Some(screen) == profile {
+                if Some(screen) == free {
+                    // Screen 34 input 8260A4E8 (b564): Up / Down pick the row (sound, SetState 999), Left / Right step
+                    // it (SetState row; the movie plays the slider sound), B writes back and closes; the movie takes no
+                    // keys.
+                    use skate_core::free_skate_options::Key;
+                    let k = match key {
+                        APT_PREVIOUS => Some(Key::Back),
+                        k if KEYS_UP.contains(&k) => Some(Key::Up),
+                        k if KEYS_DOWN.contains(&k) => Some(Key::Down),
+                        k if KEYS_LEFT.contains(&k) => Some(Key::Left),
+                        k if KEYS_RIGHT.contains(&k) => Some(Key::Right),
+                        _ => None,
+                    };
+                    consumed = true;
+                    if let Some(k) = k {
+                        let f = &mut fe.free_skate;
+                        let out = f.screen.key(k, &f.rules);
+                        sounds.extend(out.sound);
+                        f.states.extend(out.states);
+                        if let Some(values) = out.close {
+                            // Flow 0x8B: the values go to the session, then the screen closes.
+                            log.push(format!("free play options {values:?}"));
+                            *free_play_out = Some(values);
+                            stack.request(Layer::Main, Request::Close { screen });
+                        }
+                    }
+                } else if Some(screen) == spawn {
+                    // Screen 62 input 0x8264DF18 (b543): B closes (not in the demo mode), X dismisses a called skater or
+                    // opens the Free Play options; never consumed (NOT RETAIL YET: the return value is not read), so the
+                    // movie's picker also gets every key. Y (gamercard) is console platform UI.
+                    let s = &mut fe.spawn_skater;
+                    let out = match key {
+                        APT_PREVIOUS => s.screen.back(&s.rules),
+                        APT_MISC => s.screen.x(&s.rules),
+                        _ => Default::default(),
+                    };
+                    s.take(out);
+                } else if Some(screen) == profile {
                     // Screen 61 input 0x8264C608 (b308): Back closes, the tab keys step the tab, Up / Down scroll in
                     // the movie; Y (gamercard) and X (achievements) are console platform UI with no equivalent.
                     use skate_core::offline_profile::ProfileKey;
@@ -1005,6 +1141,50 @@ impl MenuStage {
                         fe.offline_profile.states.clear();
                         close(stage, profile_id, &mut fe)?;
                     }
+                    Effect::Open(i) if Some(i) == spawn => {
+                        let groups = crate::fe::spawn_skater_host::groups(&self.callable);
+                        let called = self.called.iter().map(|k| skate_core::spawn_skater::Skater::Character(k.clone())).collect();
+                        let s = &mut fe.spawn_skater;
+                        s.screen = skate_core::spawn_skater::SpawnSkater::open(self.spawn_skater_mode, &groups, called);
+                        log.push(format!("open SpawnSkater (FE {i}) mode {} rows {}", s.screen.mode.code(), s.screen.rows().len()));
+                        s.states.clear();
+                        s.actions.clear();
+                        s.open = true;
+                        open_screen(stage, SPAWN_SKATER_PATH, SPAWN_SKATER, &mut fe)?;
+                    }
+                    Effect::Close(i) if Some(i) == spawn => {
+                        log.push(format!("close SpawnSkater (FE {i})"));
+                        fe.spawn_skater.open = false;
+                        close(stage, spawn_id, &mut fe)?;
+                    }
+                    Effect::Open(i) if Some(i) == free => {
+                        // Init copies the session's values into the screen (b564).
+                        log.push(format!("open Free Play options (FE {i}) {:?}", self.free_play));
+                        fe.free_skate.screen = skate_core::free_skate_options::FreeSkateOptions::open(self.free_play);
+                        fe.free_skate.states.clear();
+                        fe.free_skate.open = true;
+                        open_screen(stage, FREE_SKATE_PATH, FREE_SKATE, &mut fe)?;
+                    }
+                    Effect::Open(i) if Some(i) == loader => {
+                        log.push(format!("open loading screen (FE {i})"));
+                        fe.tips_loader.open = true;
+                        fe.tips_loader.tips.open();
+                        self.load_up = false;
+                        self.load_gone = false;
+                        open_screen(stage, TIPS_LOADER_PATH, TIPS_LOADER, &mut fe)?;
+                    }
+                    Effect::Close(i) if Some(i) == loader => {
+                        log.push(format!("close loading screen (FE {i})"));
+                        fe.tips_loader.open = false;
+                        self.load_up = false;
+                        self.load_gone = true;
+                        close(stage, loader_id, &mut fe)?;
+                    }
+                    Effect::Close(i) if Some(i) == free => {
+                        log.push(format!("close Free Play options (FE {i})"));
+                        fe.free_skate.open = false;
+                        close(stage, free_id, &mut fe)?;
+                    }
                     Effect::Open(i) if Some(i) == extras => {
                         log.push(format!("open Extras (FE {i})"));
                         fe.extras.screen = skate_core::extras::Extras::open();
@@ -1051,8 +1231,8 @@ impl MenuStage {
                         close(stage, cal_id, &mut fe)?;
                     }
                     // Screen vt+28 -> facade ShowScreen (0x825DA410): the AS id as "%d" and "true" / "false".
-                    Effect::Show(i, visible) if [pause, options, cal, trick, map, extras, profile].contains(&Some(i)) => {
-                        let id = [(pause, crossbar_id), (options, options_id), (cal, cal_id), (trick, trick_id), (map, map_id), (extras, extras_id), (profile, profile_id)]
+                    Effect::Show(i, visible) if [pause, options, cal, trick, map, extras, profile, spawn, free].contains(&Some(i)) => {
+                        let id = [(pause, crossbar_id), (options, options_id), (cal, cal_id), (trick, trick_id), (map, map_id), (extras, extras_id), (profile, profile_id), (spawn, spawn_id), (free, free_id)]
                             .into_iter()
                             .find(|(s, _)| *s == Some(i))
                             .map_or(0, |(_, id)| id);
@@ -1145,6 +1325,28 @@ impl MenuStage {
                 }
                 for action in self.fade.tick() {
                     run_fade_action(stack, action);
+                }
+            }
+            // The loading screen around a world load (game state 0x82707508; doc 31 "Loading screen"): fade to black,
+            // push FE 52, drop the black when it is up; when the load is done, black, close, a few black updates, fade in.
+            if let Some(l) = loader {
+                use skate_core::tips_loader::LoadStep;
+                let step = self.load.update(self.loading, self.fade.alpha >= 1.0, self.load_up, self.load_gone);
+                match step {
+                    Some(LoadStep::HoldBlack) => {
+                        self.fade.hold(FADE_LOAD, None, false, &params);
+                    }
+                    Some(LoadStep::Push) => stack.request(Layer::Main, Request::push(l)),
+                    Some(LoadStep::ReleaseInstant) => self.fade.release(FADE_LOAD, true, &params),
+                    Some(LoadStep::Close) => stack.request(Layer::Main, Request::Close { screen: l }),
+                    Some(LoadStep::Release) => {
+                        self.load_gone = false;
+                        self.fade.release(FADE_LOAD, false, &params);
+                    }
+                    None => {}
+                }
+                if let Some(step) = step {
+                    log.push(format!("loading screen {step:?}"));
                 }
             }
             stage.update(seconds * 1000.0, &movies.movies, &mut fe)?;
@@ -1297,6 +1499,83 @@ impl MenuStage {
             for state in std::mem::take(&mut fe.extras.states) {
                 set_state(stage, extras_id, state, &mut fe)?;
             }
+            // The loading screen: intro complete = up (the black goes at once); then a panel every 9.0 s (sub_82605CC0).
+            if let Some(l) = loader.filter(|l| stack.top(Layer::Main) == Some(*l)) {
+                if take_call(&mut fe, &format!("Game.OnScreenIntroComplete({loader_id})")) {
+                    stack.ready(l);
+                    self.load_up = true;
+                }
+                if self.load_up {
+                    let t = &mut fe.tips_loader;
+                    let available = t.available();
+                    let mut seed = t.seed;
+                    let state = t.tips.update(seconds, available, &mut || crate::fe::tips_loader_host::lcg(&mut seed));
+                    t.seed = seed;
+                    if let Some(state) = state {
+                        set_state(stage, loader_id, state.code() as i32, &mut fe)?;
+                    }
+                }
+            }
+            // SpawnSkater: loaded -> SetState(State_UpdateList) builds the list (NOT RETAIL YET: who posts retail's first
+            // one is not read); intro complete = ready; then the picks and keys (b543 / b545).
+            if let Some(s) = spawn.filter(|s| stack.top(Layer::Main) == Some(*s)) {
+                if take_call(&mut fe, &format!("Game.OnScreenLoaded({spawn_id})")) {
+                    fe.spawn_skater.states.push(fe.spawn_skater.rules.state_list);
+                }
+                if take_call(&mut fe, &format!("Game.OnScreenIntroComplete({spawn_id})")) {
+                    stack.ready(s);
+                }
+            }
+            // Free Play options: loaded -> every row refreshes and the selection shows (NOT RETAIL YET: the poster of
+            // the first states is not read); intro complete = ready; then the key states.
+            if let Some(f) = free.filter(|f| stack.top(Layer::Main) == Some(*f)) {
+                if take_call(&mut fe, &format!("Game.OnScreenLoaded({free_id})")) {
+                    let first = [0, 1, 2, fe.free_skate.rules.state_selection];
+                    fe.free_skate.states.extend(first);
+                }
+                if take_call(&mut fe, &format!("Game.OnScreenIntroComplete({free_id})")) {
+                    stack.ready(f);
+                }
+            }
+            for state in std::mem::take(&mut fe.free_skate.states) {
+                set_state(stage, free_id, state, &mut fe)?;
+            }
+            sounds.append(&mut fe.spawn_skater.sounds);
+            for state in std::mem::take(&mut fe.spawn_skater.states) {
+                set_state(stage, spawn_id, state, &mut fe)?;
+            }
+            for action in std::mem::take(&mut fe.spawn_skater.actions) {
+                use skate_core::spawn_skater::Action;
+                log.push(format!("spawn skater {action:?}"));
+                match action {
+                    Action::Close => {
+                        if let Some(s) = spawn {
+                            stack.request(Layer::Main, Request::Close { screen: s });
+                        }
+                    }
+                    // A standard popup with its Continue option (the small popup shows no option, see CHEAT_POPUP).
+                    Action::LimitReached => {
+                        let [description, title, button] = fe.spawn_skater.rules.limit_popup.clone();
+                        self.popups.push(PopupRequest { title, description, options: vec![button], callback: SPAWN_SKATER_POPUP.into(), ..Default::default() });
+                        self.popup_dirty = true;
+                    }
+                    // FlowMessage 0x89 (82705E88, b562): fade, reload the player record, close FE 62. NOT RETAIL YET: no
+                    // fade, the pause menu closes with it (inferred: Free Play resumes). skate_vita: only You is listed.
+                    Action::SetPlayer(_) => {
+                        spawn_out.push(action);
+                        for s in [spawn, pause].into_iter().flatten() {
+                            stack.request(Layer::Main, Request::Close { screen: s });
+                        }
+                    }
+                    // Flow 0x8A: the Free Play options FE 34 over FE 62.
+                    Action::Options => match free {
+                        Some(f) => stack.request(Layer::Main, Request::push(f)),
+                        None => log.push("no Free Play options screen (FE 34) in the tables".into()),
+                    },
+                    // Called / dismissed skaters go to the game's living world; the preview is not ported.
+                    other => spawn_out.push(other),
+                }
+            }
             for action in std::mem::take(&mut fe.extras.selected) {
                 use skate_core::extras::ExtrasAction;
                 log.push(format!("extras select {action:?}"));
@@ -1431,6 +1710,9 @@ impl MenuStage {
         self.extras = std::mem::take(&mut fe.extras);
         self.tos = std::mem::take(&mut fe.tos);
         self.offline_profile = std::mem::take(&mut fe.offline_profile);
+        self.spawn_skater = std::mem::take(&mut fe.spawn_skater);
+        self.free_skate = std::mem::take(&mut fe.free_skate);
+        self.tips_loader = std::mem::take(&mut fe.tips_loader);
         fe.challenge_map.markers = if fe.challenge_map.open { fe.challenge_map.state.markers(fe.registry, fe.context) } else { Vec::new() };
         self.challenge_map = std::mem::take(&mut fe.challenge_map);
         let settings_selected = std::mem::take(&mut self.settings.selected);
@@ -1469,7 +1751,15 @@ impl MenuStage {
                                 run_fade_action(&mut self.stack, action);
                             }
                         }
-                        Some(screen) => self.stack.request(Layer::Main, Request::push(screen)),
+                        Some(screen) => {
+                            // The row sets FE 62 +0x40 before the push (b307: 200 Free Play, 100 Call Skater).
+                            if Some(screen) == self.index(SPAWN_SKATER_SCREEN) {
+                                if let Some((_, mode)) = self.spawn_skater.rules.items.iter().find(|(i, _)| *i == item) {
+                                    self.spawn_skater_mode = *mode;
+                                }
+                            }
+                            self.stack.request(Layer::Main, Request::push(screen))
+                        }
                         None => out.log.push(format!("no FE screen {}", &name[SCREEN.len()..])),
                     },
                     _ => out.items.push((item, outcome)),
@@ -1680,6 +1970,51 @@ impl MenuStage {
     /// The cheats in effect (the game's flags), so a code toggles what is on.
     pub fn set_cheats(&mut self, on: &[&str]) {
         self.cheats_on.on = on.iter().map(|s| (*s).to_owned()).collect();
+    }
+
+    /// The pros Call Skater lists ([`crate::fe::spawn_skater_host::callable`]) and how many may be called at once
+    /// (retail 3; the Vita's own cap).
+    pub fn set_callable(&mut self, callable: Vec<crate::fe::spawn_skater_host::Callable>, limit: usize) {
+        self.callable = callable;
+        let rules = &mut self.spawn_skater.rules;
+        rules.companion_limit = limit;
+        if let Some(text) = crate::fe::spawn_skater_host::limit_text(limit) {
+            rules.limit_popup[0] = text;
+        }
+    }
+
+    /// The skaters called now (the living world's companions, oldest first); FE 62 reads them when it opens.
+    pub fn set_called(&mut self, called: &[String]) {
+        if self.called != called {
+            self.called = called.to_vec();
+        }
+    }
+
+    /// The retail loading screen can show (its movie, template and lines are in this install).
+    pub fn has_loading_screen(&self) -> bool {
+        self.tips_loader_id.is_some()
+    }
+
+    /// The game loads a world (true from the start of the load until the world is ready): the loading screen's
+    /// sequence runs on the next updates.
+    pub fn set_loading(&mut self, loading: bool) {
+        self.loading = loading;
+    }
+
+    /// Any part of the loading screen's sequence runs (the stage must be updated and drawn).
+    pub fn load_active(&self) -> bool {
+        self.load.active()
+    }
+
+    /// The loading screen covers the world (the fader black or FE 52 up): draw black under it, not the world.
+    pub fn load_covered(&self) -> bool {
+        use skate_core::tips_loader::LoadPhase;
+        matches!(self.load.phase, LoadPhase::Opening | LoadPhase::Up | LoadPhase::Closing | LoadPhase::Closed)
+    }
+
+    /// The session's Free Play values FE 34 opens with (Traffic, Pedestrians, A.I. Skaters).
+    pub fn set_free_play(&mut self, values: skate_core::living_world::FreePlay) {
+        self.free_play = values;
     }
 
     /// The game's answer to [`Frame::text_entry`]: the text typed, or None (cancelled). Taken on the next update.
@@ -1988,6 +2323,139 @@ mod tests {
     /// (FE 46), `zombie` turns the cheat on with its dialog, again turns it off; an invalid character warns and asks
     /// again; Licenses opens the text viewer with this project's licenses; B closes the viewer, then Extras.
     /// Data-gated like the pause test.
+    /// SpawnSkater on the lean set: Call Skater opens FE 62 with the pros, A calls one, A on another shows the limit
+    /// popup (the Vita's 1), X on the called row dismisses it; Free Play opens it with You, X opens the Free Play options
+    /// (FE 34), Right steps Traffic and B writes the values back.
+    #[test]
+    fn spawn_skater_calls_and_dismisses_and_opens_the_free_play_options() {
+        use skate_core::spawn_skater::{Action, Skater};
+        let Some(root) = crate::fe::apt_imports::test_menu_set() else { return };
+        let assets = crate::fe::apt_imports::main_checkout().join("assets");
+        let read_set = |p: &str| std::fs::read(root.join(p)).map_err(|e| format!("{p}: {e}"));
+        let read = |p: &str| std::fs::read(assets.join(p)).map_err(|e| format!("{p}: {e}"));
+        if read(TABLES).is_err() {
+            eprintln!("skipped: no menu tables");
+            return;
+        }
+        let movies = RetailMenuMovies::read_lean(&read_set, Some(&PAUSE_ROOTS)).unwrap();
+        if !movies.movies.contains_key(&movie_key(SPAWN_SKATER_PATH)) || !movies.movies.contains_key(&movie_key(FREE_SKATE_PATH)) {
+            eprintln!("skipped: no SpawnSkater / Free Play options movie in this set");
+            return;
+        }
+        let mut ms = MenuStage::boot(movies, &read).unwrap();
+        ms.menus.context.mode = "FreePlay".into();
+        let pro = |k: &str| crate::fe::spawn_skater_host::Callable { key: k.into(), name_id: format!("ID_COMMON_{}", k.to_uppercase()) };
+        ms.set_callable(vec![pro("chris_cole"), pro("danny_way")], 1);
+        ms.set_free_play(skate_core::living_world::FreePlay { traffic: 0.2, pedestrians: 0.0, ai_skaters: true });
+        let run = |ms: &mut MenuStage, keys: Vec<(u32, usize)>, frames: usize| {
+            let mut frame = ms.update_keys(keys, 1.0 / 60.0);
+            for _ in 1..frames {
+                let mut next = ms.update_keys(Vec::new(), 1.0 / 60.0);
+                frame.log.append(&mut next.log);
+                frame.spawn_skater.append(&mut next.spawn_skater);
+                frame.free_play = frame.free_play.or(next.free_play);
+            }
+            assert!(!ms.failed, "{:?}", frame.log);
+            frame
+        };
+        let open_item = |ms: &mut MenuStage, item: &str| {
+            let view = front_end(&ms.menus, &ms.language, &ms.sub_options, ms.crossbar.clone()).view;
+            let (tab, row) = (0..8)
+                .flat_map(|t| (0..16).map(move |r| (t, r)))
+                .find(|&(t, r)| view.item(t, r) == Some(item))
+                .unwrap_or_else(|| panic!("{item} in the pause menu"));
+            for _ in 0..8 {
+                if ms.crossbar.menu == tab as i32 {
+                    break;
+                }
+                run(ms, vec![(APT_RIGHT, 0)], 20);
+            }
+            for _ in 0..16 {
+                if ms.crossbar.option == row as i32 {
+                    break;
+                }
+                run(ms, vec![(13, 0)], 10);
+            }
+            run(ms, vec![(APT_NEXT, 0)], 90)
+        };
+        run(&mut ms, vec![(APT_START, 0)], 90);
+        let frame = open_item(&mut ms, "SkateWith");
+        assert!(frame.log.iter().any(|l| l.starts_with("open SpawnSkater") && l.ends_with("mode 100 rows 3")), "{:?}", frame.log);
+        eprintln!("spawn skater natives {:?}", ms.stage.unhandled());
+        // The picker starts on the first pickable row (the header is greyed): A calls Chris Cole.
+        let frame = run(&mut ms, vec![(APT_NEXT, 0)], 30);
+        assert_eq!(frame.spawn_skater, [Action::Call(Skater::Character("chris_cole".into()))], "{:?}", frame.log);
+        // Down, A: the limit popup; A closes it.
+        run(&mut ms, vec![(13, 0)], 10);
+        let frame = run(&mut ms, vec![(APT_NEXT, 0)], 30);
+        assert!(frame.spawn_skater.is_empty() && ms.popup_shown(), "{:?}", frame.log);
+        assert!(ms.popups.shown().is_some_and(|(_, r)| r.description.starts_with("#There is already a skater called.")), "the Vita's cap of 1");
+        run(&mut ms, vec![(APT_NEXT, 0)], 30);
+        assert!(!ms.popup_shown());
+        // Up, X: Chris Cole dismissed. B closes FE 62.
+        run(&mut ms, vec![(12, 0)], 10);
+        let frame = run(&mut ms, vec![(APT_MISC, 0)], 30);
+        assert_eq!(frame.spawn_skater, [Action::Dismiss(Skater::Character("chris_cole".into()))], "{:?}", frame.log);
+        let frame = run(&mut ms, vec![(APT_PREVIOUS, 0)], 60);
+        assert!(frame.log.iter().any(|l| l.starts_with("close SpawnSkater")), "{:?}", frame.log);
+        // Free Play: FE 62 with You; X opens FE 34; Right steps Traffic 0.2 -> 0.3; B writes it back.
+        let frame = open_item(&mut ms, "SoloFreeskateOptions");
+        assert!(frame.log.iter().any(|l| l.starts_with("open SpawnSkater") && l.ends_with("mode 200 rows 2")), "{:?}", frame.log);
+        let frame = run(&mut ms, vec![(APT_MISC, 0)], 90);
+        assert!(frame.log.iter().any(|l| l.starts_with("open Free Play options")), "{:?}", frame.log);
+        eprintln!("free play natives {:?}", ms.stage.unhandled());
+        run(&mut ms, vec![(APT_RIGHT, 0)], 10);
+        let frame = run(&mut ms, vec![(APT_PREVIOUS, 0)], 60);
+        let values = frame.free_play.expect("B writes the values back");
+        assert!((values.traffic - 0.3).abs() < 1e-6 && values.ai_skaters, "{values:?}");
+        assert!(frame.log.iter().any(|l| l.starts_with("close Free Play options")), "{:?}", frame.log);
+    }
+
+    /// The loading screen on the lean set: a load fades to black, pushes FE 52, drops the black when it is up and
+    /// shows a panel (Coach Frank or a hint); the load's end fades to black, closes it and fades back in.
+    #[test]
+    fn the_loading_screen_runs_around_a_load() {
+        let Some(root) = crate::fe::apt_imports::test_menu_set() else { return };
+        let assets = crate::fe::apt_imports::main_checkout().join("assets");
+        let read_set = |p: &str| std::fs::read(root.join(p)).map_err(|e| format!("{p}: {e}"));
+        // The lines as vita-bake writes them (from the collections).
+        let tips = skate_data::collections::Collections::load(&assets).map(|c| skate_data::tips_loader::read(&c)).unwrap_or_default();
+        let tips = serde_json::to_vec(&tips).unwrap();
+        let read = |p: &str| if p == TIPS_LOADER_DATA { Ok(tips.clone()) } else { std::fs::read(assets.join(p)).map_err(|e| format!("{p}: {e}")) };
+        if read(TABLES).is_err() {
+            eprintln!("skipped: no menu tables");
+            return;
+        }
+        let movies = RetailMenuMovies::read_lean(&read_set, Some(&PAUSE_ROOTS)).unwrap();
+        if !movies.movies.contains_key(&movie_key(TIPS_LOADER_PATH)) {
+            eprintln!("skipped: no loading screen movie in this set");
+            return;
+        }
+        let mut ms = MenuStage::boot(movies, &read).unwrap();
+        assert!(ms.has_loading_screen(), "movie, template and lines");
+        let mut log = Vec::new();
+        let run = |ms: &mut MenuStage, log: &mut Vec<String>, frames: usize| {
+            for _ in 0..frames {
+                let mut f = ms.update_keys(Vec::new(), 1.0 / 60.0);
+                log.append(&mut f.log);
+                assert!(!ms.failed, "{log:?}");
+            }
+        };
+        ms.set_loading(true);
+        run(&mut ms, &mut log, 120);
+        assert!(ms.load_covered() && ms.fade.alpha == 0.0, "up, the black dropped: {log:?}");
+        assert!(log.iter().any(|l| l.starts_with("open loading screen")), "{log:?}");
+        let draws = ms.draw();
+        eprintln!("loading screen draws {}; natives {:?}", draws.len(), ms.stage.unhandled());
+        assert!(!draws.is_empty());
+        // Ten seconds: the panel goes out and the next comes in.
+        run(&mut ms, &mut log, 600);
+        ms.set_loading(false);
+        run(&mut ms, &mut log, 120);
+        assert!(log.iter().any(|l| l.starts_with("close loading screen")), "{log:?}");
+        assert!(!ms.load_active() && ms.fade.alpha == 0.0, "faded back in: {log:?}");
+    }
+
     #[test]
     fn extras_enters_a_cheat_and_shows_the_licenses() {
         let Some(root) = crate::fe::apt_imports::test_menu_set() else { return };

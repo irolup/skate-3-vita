@@ -1,8 +1,5 @@
-//! Population configuration. Code constants of the retail build are the defaults here (labelled
-//! [code] with their address); data values (census caps, category weights, ranges) are not
-//! duplicated: they come from the user's exported tables (`skate-data::living_world`) and a world
-//! without that export stays empty. Every field is public so settings and mods can override it;
-//! restoring `PopulationConfig::retail()` (plus the data) undoes a mod.
+//! Population configuration: retail code constants as defaults ([code] + address), data from the export; all public.
+//! Details: docs/hails-additions/26b-living-world-population.md#population-config
 
 use super::census::CensusRange;
 use super::traffic::PlacementRules;
@@ -20,17 +17,11 @@ pub mod retail {
     pub const INITIAL_RING: (f32, f32) = (8.0, 80.0);
     /// km/h per m/s for the range lerp key (`0x822F8628` = 3.6) [code].
     pub const KMH_PER_MS: f32 = 3.6;
-    /// Census type rotation: the census tick runs one type per tick, peds 0, vehicles 1,
-    /// DMOs 2, props 3 (`sub_826B71F0`, census `+164`, `(+164 + 1) % 4` at `0x826B7420`) [code].
-    /// At the 60 Hz world tick each type gets a cull + spawn pass 15 times per second. The
-    /// initial populate runs every type in the same tick (`0x826B7444` path) [code].
+    /// Census type rotation: one type per tick (826B71F0, +164 mod 4); initial populate runs all (0x826B7444).
     pub const CENSUS_ROTATION: u32 = 4;
     pub const ROTATION_PEDS: u32 = 0;
     pub const ROTATION_VEHICLES: u32 = 1;
-    /// Vehicle limit: the census vehicle spawn (`sub_826B83C8`, census vtable `0x8230C638` slot
-    /// +8) refuses while the live vehicle count is not below census `+148` = 15 (constructor
-    /// `sub_826B6D58`); the initial populate compares with a literal 15 [code]. The recomp never
-    /// showed more than 15 cars at once in DownTown (cap 30) [trace proof1 / proof2, VEHSTATE].
+    /// Vehicle limit 15 (826B83C8 refuses at census +148; ctor 826B6D58); never more than 15 cars in the recomp.
     pub const VEHICLE_LIMIT: u32 = 15;
     pub const VEHICLE_INITIAL_LIMIT: u32 = 15;
     /// Entity inside the picked category: `trunc(u32 x 2^-32 x 100) mod n` from the world RNG
@@ -56,6 +47,8 @@ pub mod retail {
     pub const SKATER_SLOTS: u32 = 7; // *(0x83067060+8), 168-byte slots, slot 0 = local player
     pub const SKATER_POOL: u32 = 5; // character pool entries at mgr+64
     pub const SKATER_SPAWN_INNER: f32 = 60.0; // 0x821FF080
+pub const SKATER_COMPANION_SLOTS: u32 = 3; // companion entries at [[0x830CFD94]+0xE0]+0x5C (b544)
+pub const SKATER_COMPANION_INNER: f32 = 4.0; // spawn inner radius while a called skater waits (sub_8245C548, b544)
     pub const SKATER_SPAWN_OUTER: f32 = 90.0; // sub_82459480
     pub const SKATER_MAX_CANDIDATE_LINES: usize = 32; // sub_82459480
     pub const SKATER_CULL: f32 = 120.0; // 0x82256FE0
@@ -123,7 +116,8 @@ pub struct CensusKindConfig {
     /// vehicles: no (`sub_826B7760`) [code].
     pub spawn_in_zombie: bool,
     /// Culled whatever the distance while the zombie cheat is on: vehicles yes (the cull `sub_826BAAB8` despawns a
-    /// car beyond the cull radius OR when the zombie query is true) [code]; peds no.
+    /// car beyond the cull radius OR when the zombie query is true) [code]; peds no. Also whether the Free Play mass
+    /// cull at density 0 runs in zombie mode (`sub_826B7010` guards only the ped clear, b551).
     pub cull_in_zombie: bool,
 }
 
@@ -191,6 +185,9 @@ pub struct SkaterConfig {
     /// removed below opacity 0.2 (`sub_8246EA90`, `sub_8245A9B8`), only at a dead end of the
     /// replay tier (fix 9: retail chains lines, see `line_chain`).
     pub leave_fade: super::leave_fade::LeaveFadeConfig,
+    /// Called skaters (FE 62 Call Skater): slots and the spawn inner radius while one waits (research b544 / b563).
+    pub companion_slots: u32,
+    pub companion_inner: f32,
     /// What a skater does at the end of its line: continue on a line starting within 4 m
     /// (`sub_8246C7F8`, [data] `ai_skater` tunable), so it leaves only by the 120 m cull.
     pub line_chain: super::replay::ChainConfig,
@@ -218,6 +215,8 @@ impl SkaterConfig {
             near_radius2: SKATER_NEAR_RADIUS2,
             score_rand: SKATER_SCORE_RAND,
             allow_community_offline: true,
+            companion_slots: SKATER_COMPANION_SLOTS,
+            companion_inner: SKATER_COMPANION_INNER,
             leave_fade: super::leave_fade::LeaveFadeConfig::retail(),
             line_chain: super::replay::ChainConfig::retail(),
         }

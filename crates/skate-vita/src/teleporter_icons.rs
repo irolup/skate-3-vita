@@ -10,6 +10,9 @@
 //!
 //! Ours: one ribbon (every disc teleporter names the same `teleport` row; another row's icons are skipped), the bake's
 //! slim `visual-indicators.json` and its two textures in ui.pak (`vita-bake ui`).
+//!
+//! The called skater's trail (upstream `36018e19`, research b566 / b567) shares the textures and the strips: its
+//! `trail_follow` style row ([`Icons::trail_mesh`], [`Icons::trail_factors`]).
 use glam::{Mat3, Mat4, Vec3};
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -116,6 +119,9 @@ pub struct Icons {
     style: Style,
     park_maps: Vec<String>,
     park_fade_scale: f32,
+    /// The called skater's trail style (`trail_follow`, exported under its vault hash 0x8330C6CBB7402726); None: no
+    /// trail.
+    trail: Option<Style>,
 }
 
 fn png(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
@@ -148,6 +154,11 @@ fn ribbon(spline: &Spline, style: &Style) -> (Vec<[f32; 5]>, Vec<u16>) {
             }
         }
     }
+    strips(&points, style)
+}
+
+/// The strips over sampled points (each with its texture u), shared by the icons and the trails (upstream `strips`).
+fn strips(points: &[(Vec3, f32)], style: &Style) -> (Vec<[f32; 5]>, Vec<u16>) {
     let h = 0.25 * (style.width[0] + style.width[1]);
     let edges: Vec<(Vec3, Vec3)> = if style.three_strips {
         vec![(Vec3::new(0.0, 0.0, -h), Vec3::new(0.0, 0.0, h)), (Vec3::new(0.0, -h, 0.0), Vec3::new(0.0, h, 0.0)), (Vec3::new(-h, 0.0, 0.0), Vec3::new(h, 0.0, 0.0))]
@@ -210,7 +221,29 @@ impl Icons {
             style,
             park_maps: file.park_maps,
             park_fade_scale: file.park_fade_scale,
+            trail: ["trail_follow", "Hash_8330C6CBB7402726"].iter().find_map(|k| file.styles.get(*k)).cloned(),
         })
+    }
+
+    /// The called skater's trail can be drawn (its style row is in ui.pak).
+    pub fn has_trail(&self) -> bool {
+        self.trail.is_some()
+    }
+
+    /// A trail's ribbon in world space: retail's B-spline over its points at the style's samples, three strips.
+    pub fn trail_mesh(&self, trail: &skate_core::indicator_trail::Trail) -> (Vec<[f32; 5]>, Vec<u16>) {
+        let Some(style) = &self.trail else { return Default::default() };
+        let points: Vec<(Vec3, f32)> = trail.curve(style.samples.clamp(1, MAX_SAMPLES)).into_iter().map(|(p, u)| (Vec3::from_array(p), u)).collect();
+        strips(&points, style)
+    }
+
+    /// The trail's pass factors (front, background rgb, background alpha) at the view depth of its skater; None when
+    /// hidden (behind the camera, past the fade, fewer than 4 points).
+    pub fn trail_factors(&self, trail: &skate_core::indicator_trail::Trail, depth: f32) -> Option<(f32, [f32; 2])> {
+        let style = self.trail.as_ref()?;
+        let alpha = if depth <= 0.0 || trail.points.len() < 4 { 0.0 } else { style.alpha(depth) };
+        let [front, back] = style.intensity;
+        (alpha > 0.0).then(|| (front * alpha, [back, (back * alpha).sqrt()]))
     }
 
     /// This frame's icons for the anchors (locator matrices, rows right, up, forward, translation) on `map`, with the
@@ -286,5 +319,32 @@ mod tests {
         assert_eq!(v.len(), 3 * 11 * 2);
         assert_eq!(i.len(), 3 * 10 * 6);
         assert_eq!(v[1][4], 1.0, "v across the strip");
+    }
+
+    /// The trail: nothing below 4 points; 5 points are 2 B-spline segments of 10 samples, three strips; hidden behind
+    /// the camera and inside the fade-in.
+    #[test]
+    fn a_trail_is_a_b_spline_ribbon_with_its_fade() {
+        let icons = Icons {
+            key: String::new(),
+            vertices: Vec::new(),
+            indices: Vec::new(),
+            front: (0, 0, Vec::new()),
+            background: (0, 0, Vec::new()),
+            offset: [0.0; 3],
+            billboard: false,
+            style: style(),
+            park_maps: Vec::new(),
+            park_fade_scale: 10.0,
+            trail: Some(Style { width: [0.3, 0.15], samples: 10, three_strips: true, fade: [3.58, 14.5, 100.0, 100.0], intensity: [1.0, 0.5] }),
+        };
+        let mut trail = skate_core::indicator_trail::Trail::default();
+        trail.points = vec![[0.0; 3], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]];
+        assert!(icons.trail_mesh(&trail).1.is_empty() && icons.trail_factors(&trail, 20.0).is_none());
+        trail.points.extend([[3.0, 0.0, 0.0], [4.0, 0.0, 0.0]]);
+        let (v, i) = icons.trail_mesh(&trail);
+        assert_eq!((v.len(), i.len()), (3 * 20 * 2, 3 * 19 * 6));
+        assert_eq!(icons.trail_factors(&trail, 20.0), Some((1.0, [0.5, 0.5f32.sqrt()])));
+        assert!(icons.trail_factors(&trail, 2.0).is_none() && icons.trail_factors(&trail, -5.0).is_none());
     }
 }

@@ -152,6 +152,40 @@ const ICON_NAME: &str = "Hash_FCFE787CCF2F775E";
 const WORLD_OFFSET: &str = "Hash_B88A4034D63E905E";
 const WORLD_MAP_INFO: &str = "Hash_20BBC594CD2FAEF8";
 
+const ICON_MAX_DISTANCE: &str = "Hash_2CF25B33B439DDCD";
+
+/// A fe_map_icons record (minimap and Challenge Map icons, b565 / b571).
+#[derive(Clone, Debug, PartialEq)]
+pub struct MapIcon {
+    /// Its texture in the icon pack (`race_gate` -> `mini_gate`).
+    pub texture: String,
+    /// Beyond this the minimap does not draw it; 0 = the minimap's default (1000).
+    pub max_distance: f32,
+}
+
+/// Every fe_map_icons record by name.
+pub fn map_icons(collections: &crate::collections::Collections) -> BTreeMap<String, MapIcon> {
+    collections
+        .entries()
+        .iter()
+        .filter(|e| class_is(e, ICON_CLASS))
+        .filter_map(|e| {
+            let texture = collections.field(ICON_CLASS, &e.key, ICON_NAME).ok()?.data.clone();
+            let max_distance = collections
+                .field(ICON_CLASS, &e.key, ICON_MAX_DISTANCE)
+                .ok()
+                .and_then(|f| u32::from_str_radix(f.data.get(0..8)?, 16).ok())
+                .map_or(0.0, f32::from_bits);
+            Some((e.key.clone(), MapIcon { texture: texture.to_string(), max_distance }))
+        })
+        .collect()
+}
+
+/// A record by name: most keys are stored hashed, so `name` also matches its hash (retail's script lookup, b571).
+pub fn map_icon<'a>(icons: &'a BTreeMap<String, MapIcon>, name: &str) -> Option<&'a MapIcon> {
+    icons.get(name).or_else(|| icons.get(&format!("Hash_{:016X}", hash(name))))
+}
+
 /// What a location's Challenge Map marker needs besides its locator (research b264 / b265).
 #[derive(Clone, Debug, PartialEq)]
 pub struct MarkerSource {
@@ -563,6 +597,20 @@ mod tests {
         assert_eq!(aletown.offset, [225.0, -175.0]);
         assert_eq!(aletown.bounds, [2050, -850, 1050, -1250, 512, 512]);
         assert!(downtown.iter().all(|n| markers.get(&n.entry.id).is_some_and(|m| m.icon == "mini_teleport")));
+    }
+
+    /// fe_map_icons (b571): the script default `race_gate`, the called skater's `skater`, the teleport's 500 m.
+    #[test]
+    #[ignore = "requires the converted vault (SKATE3_ASSET_ROOT with private/stock/skater-collections.json)"]
+    fn the_retail_map_icons() {
+        let root = std::path::PathBuf::from(std::env::var_os("SKATE3_ASSET_ROOT").expect("SKATE3_ASSET_ROOT"));
+        let icons = map_icons(&crate::collections::Collections::load(&root).unwrap());
+        eprintln!("MAP_ICONS {}: {:?}", icons.len(), icons.iter().map(|(k, v)| (k.as_str(), v.texture.as_str(), v.max_distance)).collect::<Vec<_>>());
+        assert_eq!(icons["race_gate"].texture, "mini_gate");
+        assert_eq!(icons["skater"].texture, "mini_skater");
+        assert_eq!(icons["teleport"].max_distance, 500.0);
+        // The friend-film key script 82849DE8 uses, by name.
+        assert_eq!(map_icon(&icons, "challenge_friendfilm_visualindicator").map(|i| i.texture.as_str()), Some("mini_teleport"));
     }
 }
 

@@ -84,6 +84,14 @@ fn loading_background() -> Result<Vec<u8>, String> {
 }
 
 /// The loading circle at the bottom right: a ring whose bright head turns once a second, its tail fading.
+/// The whole screen black (under the retail loading screen), in the menus' stage space.
+fn draw_black(apt: &mut vita_render::apt::Apt) {
+    use skate_ui::fe::apt_scene::{Draw, Fill, Vertex};
+    let v = |x: f32, y: f32| Vertex { position: [x, y], uv: [0.0, 0.0] };
+    let (x0, y0, x1, y1) = (-1280.0, -720.0, 2560.0, 1440.0);
+    apt.draw(&[Draw { texture: String::new(), vertices: vec![v(x0, y0), v(x1, y0), v(x1, y1), v(x0, y0), v(x1, y1), v(x0, y1)], multiply: [0.0, 0.0, 0.0, 1.0], add: [0.0; 4], fill: Fill::Solid }]);
+}
+
 fn draw_spinner(g: &mut Gfx, seconds: f32) {
     const SEGMENTS: usize = 24;
     let (centre, radius) = ([912.0, 496.0], 16.0);
@@ -230,6 +238,10 @@ pub fn run() -> ! {
     let mut marker: Option<crate::retail_hud::Marker> = None;
     let mut marker_tried = false;
     let mut meter: Option<crate::retail_hud::Meter> = None;
+    // The HUD minimap (retail_hud::Minimap) and this frame's player, camera forward and called skaters for it.
+    let mut minimap: Option<crate::retail_hud::Minimap> = None;
+    let mut minimap_view: Option<(Vec3, Vec3)> = None;
+    let mut called_positions: Vec<Vec3> = Vec::new();
     let mut analyzer: Option<crate::retail_hud::Analyzer> = None;
     // R2: the retail front end on upstream's runtime, the main and pause menu (the plain menus without it).
     let mut fe_menus = crate::fe_menus::FeMenus::Idle;
@@ -307,6 +319,12 @@ pub fn run() -> ! {
     let mut car_instances: Vec<vita_render::scene::CarInstance> = Vec::new();
     // The NPC skaters of the shown tick and their palettes.
     let mut npc_poses: Vec<skate_sim::NpcPose> = Vec::new();
+    // The called skaters' trails (called_trails.rs): their NPC serials as of the last tick, the trails to draw and the
+    // seconds of play this frame.
+    let mut called_trails = crate::called_trails::CalledTrails::default();
+    // A world load was showing last frame (the retail loading screen starts on a load's first frame only).
+    let mut was_loading = false;
+    let (mut called_serials, mut trail_instances, mut trail_dt) = (Vec::<u32>::new(), Vec::<vita_render::scene::TrailInstance>::new(), 0.0);
     let mut npc_palettes: Vec<(Vec<Mat4>, f32, Vec3)> = Vec::new();
     // The peds of the shown tick, each model's binding to the ped rig, their palettes.
     let mut ped_poses: Vec<skate_sim::PedPose> = Vec::new();
@@ -374,6 +392,12 @@ pub fn run() -> ! {
                 break;
             }
             pending_park = s.park_render.take();
+            // No trails in a replay (its NPCs are the recording's); they stand still while paused.
+            called_serials.clear();
+            if screen != Screen::Replay {
+                called_serials.extend_from_slice(&s.called_serials);
+            }
+            trail_dt = if screen == Screen::Playing && !s.paused { frame_dt } else { 0.0 };
             pending_props = s.props_render.take();
             pending_cars = s.cars_render.take();
             pending_peds = s.peds_render.take();
@@ -398,6 +422,12 @@ pub fn run() -> ! {
                         match crate::retail_hud::Meter::load(&mut apt) {
                             Ok(m) => meter = Some(m),
                             Err(e) => println!("manual meter off: {e}"),
+                        }
+                    }
+                    if crate::retail_hud::screen_present(crate::retail_hud::Minimap::FILE) {
+                        match crate::retail_hud::Minimap::load(&mut apt) {
+                            Ok(m) => minimap = Some(m),
+                            Err(e) => println!("minimap off: {e}"),
                         }
                     }
                     if crate::retail_hud::screen_present(crate::retail_hud::Analyzer::FILE) {
@@ -474,8 +504,9 @@ pub fn run() -> ! {
                 let mut mapping = settings.controls;
                 (mapping.rear_touch_bumpers, mapping.front_touch_thumbs, mapping.dpad_bumpers) = (true, true, false);
                 let values = skate_core::input::xbox::convert(&input.xbox(&sample, &mapping), 0);
-                let update = fe_menus.update(&values, frame_dt, &mut settings);
+                let update = fe_menus.update(&values, frame_dt, &mut settings, &s.called_skaters);
                 changed |= update.settings_changed;
+                s.skater_calls.extend(update.skater_calls);
                 let mut left = false;
                 for choice in update.choices {
                     use crate::vita_menus::Choice;
@@ -677,7 +708,8 @@ pub fn run() -> ! {
             fe_menus.frame(&mut apt, frame_dt);
             // The simulation is held while the HUD movie of a new session is built.
             let hud_wait = screen == Screen::Playing && retail.building() && !AUTOPLAY;
-            s.paused = !screen.live() || hud_wait || teleporters.asking();
+            // The retail loading screen's close (fade out, close, fade in) runs before play resumes.
+            s.paused = !screen.live() || hud_wait || teleporters.asking() || fe_menus.loading_screen();
             s.want_camera_world = screen == Screen::Replay;
             boot_note = in_menu && retail.booting();
             // The loading screen: until the world and every UI loader are ready (the pause menu included), then
@@ -696,6 +728,8 @@ pub fn run() -> ! {
             }
             // A world loading (startup, or another park or district) shows the loading screen.
             loading_view = screen == Screen::Loading || (screen == Screen::Playing && (s.loading || s.reload) && !AUTOPLAY);
+            fe_menus.set_loading(loading_view, loading_view && !was_loading);
+            was_loading = loading_view;
             hud_note = hud_wait;
             marker_view = s.marker;
             manual_view = s.manual;
@@ -942,6 +976,10 @@ pub fn run() -> ! {
             }
         }
         if let Some((w, render)) = pending_park {
+            called_trails.clear(&mut scene);
+            if let Some(m) = &mut minimap {
+                m.reset();
+            }
             let started = Instant::now();
             match render {
                 Some(render) => scene.load_park(render),
@@ -1005,20 +1043,27 @@ pub fn run() -> ! {
                 }
                 _ => None,
             };
-            if loading_view {
+            if fe_menus.loading_covered() {
+                // The retail loading screen (FE 52) is up, or the fader black around it: black under the menus.
+                draw_black(&mut apt);
+            } else if loading_view {
                 apt.draw_screen(LOADING_BACKGROUND);
-                draw_spinner(&mut gfx, started.elapsed().as_secs_f32());
+                if !fe_menus.loading_screen() {
+                    draw_spinner(&mut gfx, started.elapsed().as_secs_f32());
+                }
             } else if let (Some(v), Some(binding)) = (&demo_view, &mut binding) {
                 binding.palette(&v.snapshot, &v.snapshot, 1.0, &mut demo_palette);
                 let view_proj = math::projection_far(v.fov.unwrap_or(1.0), 100.0) * math::view(v.camera);
                 let eye = v.camera.w_axis.truncate();
-                scene.draw_demo(&Frame { view_proj, eye, palette: &demo_palette, props: &[], cars: &[], npcs: &[], peds: &[], hand_props: &[], icons: &[] });
+                scene.draw_demo(&Frame { view_proj, eye, palette: &demo_palette, props: &[], cars: &[], npcs: &[], peds: &[], hand_props: &[], icons: &[], trails: &[] });
             } else if frozen {
                 apt.draw_screen(FROZEN_WORLD);
             } else {
             let mut eye = Vec3::ZERO;
             let mut view_proj = math::projection(1.0) * math::view(Mat4::from_translation(Vec3::new(0.0, 4.0, 14.0)));
             icon_instances.clear();
+            trail_instances.clear();
+            minimap_view = None;
             if let Some(alpha) = view {
                 let (camera, fov) = skin::camera(&a, &b, alpha);
                 eye = camera.w_axis.truncate();
@@ -1029,6 +1074,13 @@ pub fn run() -> ! {
                     let player = a.root.translation.lerp(b.root.translation, alpha);
                     i.instances(world, &icon_anchors, player, &camera, &mut icons);
                     icon_instances.extend(icons.iter().map(|c| vita_render::scene::IconInstance { model: c.model, front: c.front, background: c.background }));
+                }
+                // The minimap's centre and heading inputs, and its called skaters' icons.
+                minimap_view = Some((a.root.translation.lerp(b.root.translation, alpha), -camera.z_axis.truncate()));
+                called_positions.clear();
+                called_positions.extend(npc_poses.iter().filter(|n| called_serials.contains(&n.serial)).map(|n| n.previous.root.translation.lerp(n.current.root.translation, alpha)));
+                if let Some(i) = teleporter_icons.as_ref().filter(|i| i.has_trail()) {
+                    called_trails.update(i, &called_serials, &npc_poses, alpha, trail_dt, &rig_names, &camera, &mut scene, &mut trail_instances);
                 }
                 // A district draws to 250 m; its tiles stream in around the camera.
                 let far = if streamer.active() { 260.0 } else { math::FAR };
@@ -1124,7 +1176,7 @@ pub fn run() -> ! {
                 None
             };
             scene.set_grade(grade.unwrap_or(vita_render::scene::Grade::IDENTITY));
-            scene.draw(&Frame { view_proj, eye, palette: if skinned { &palette } else { &[] }, props: &prop_instances, cars: &car_instances, npcs: &npcs, peds: &peds, hand_props: &hand_instances, icons: &icon_instances });
+            scene.draw(&Frame { view_proj, eye, palette: if skinned { &palette } else { &[] }, props: &prop_instances, cars: &car_instances, npcs: &npcs, peds: &peds, hand_props: &hand_instances, icons: &icon_instances, trails: &trail_instances });
             if freeze && paused_frames >= FREEZE_AFTER_FRAMES {
                 let started = Instant::now();
                 apt.add_texture(FROZEN_WORLD, math::WIDTH as u32, math::HEIGHT as u32, &vita_render::read_rgba());
@@ -1172,7 +1224,7 @@ pub fn run() -> ! {
                 help_turns = 0;
                 finish_popup = false;
             }
-            if screen == Screen::Playing {
+            if screen == Screen::Playing && !fe_menus.loading_screen() {
                 if let Some(m) = &mut marker {
                     m.draw_dissolve(&marker_view);
                 }
@@ -1183,6 +1235,14 @@ pub fn run() -> ! {
                     } else {
                         println!("manual meter off: script error");
                         meter = None;
+                    }
+                }
+                if let (Some(m), Some((player, forward))) = (&mut minimap, minimap_view) {
+                    if m.frame(frame_dt, settings.minimap, player, forward, &called_positions) {
+                        m.draw(&mut apt);
+                    } else {
+                        println!("minimap off: script error");
+                        minimap = None;
                     }
                 }
                 if settings.trick_analyzer {

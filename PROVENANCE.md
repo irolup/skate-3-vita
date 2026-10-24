@@ -4,7 +4,7 @@ These are the reference repositories this project copies from or follows. Pinned
 
 | Reference | URL | Commit |
 |---|---|---|
-| skate-3-rust-engine | https://github.com/SK8-ENGINE/skate-3-rust-engine | `74c124a`, a commit of pull request #52 (copied at `cb79689`, resynced 2026-10-08 to `b3c9679`, 2026-10-13 to `2e16697`, 2026-10-17 to `618e824`, 2026-10-19 to `fad5aae`, 2026-10-21 to `b110bab` and 2026-10-23 to `74c124a`: see **Resync to b3c9679**, **Resync to 2e16697**, **L1 resync to PR #52 head `618e824`**, **L1 resync to PR #52 head `fad5aae`** **Resync to PR #52 head `b110bab`** and **Resync to PR #52 head `74c124a`**; the replay editor, teleporters and menus are still at `b110bab` until its steps 2 to 4) |
+| skate-3-rust-engine | https://github.com/SK8-ENGINE/skate-3-rust-engine | `0947dea5`, a commit of pull request #52 (copied at `cb79689`, resynced 2026-10-08 to `b3c9679`, 2026-10-13 to `2e16697`, 2026-10-17 to `618e824`, 2026-10-19 to `fad5aae`, 2026-10-21 to `b110bab`, 2026-10-23 to `74c124a` and 2026-10-24 to `36018e19`, then `0947dea5`: see **Resync to b3c9679**, **Resync to 2e16697**, **L1 resync to PR #52 head `618e824`**, **L1 resync to PR #52 head `fad5aae`**, **Resync to PR #52 head `b110bab`**, **Resync to PR #52 head `74c124a`** and **Resync to PR #52 head `36018e19`** (steps 6 and 7: `0947dea5`)) |
 | cargo-vita | https://github.com/vita-rust/cargo-vita | `c6bbf22` |
 | vitasdk-sys | https://github.com/vita-rust/vitasdk-sys | `cee132f` |
 | examples | https://github.com/vita-rust/examples | `5ef9e08` |
@@ -662,3 +662,80 @@ Data: upstream setup's `teleporters.py` and `visual_indicators.py` at `74c124a` 
 | skate-vita `vita_menus.rs` tests | the parks pick moves to the main menu (the pause menu reaches the worlds through the Challenge Map) | ours |
 
 Not taken: menu movie set versions 12 (every DLC pack's text) and 13 (the Credits screen, still greyed upstream): the set stays at 11; the cheat entry's popup style (upstream's on-screen keyboard; ours is the system keyboard). Vita: checked by the user.
+
+## Resync to PR #52 head `36018e19`, step 1: simulation and living world (2026-10-24)
+
+The PR moved 6 commits after `74c124a`: Spawn / Call Skater, Free Play options and the HUD minimap (`06f439e0`, later steps), the map switch's ambience read-ahead (`c871c2f0`), camera slow motion (`351f0366`), the NPC body pool (`18bbb37d`), PC setup and docs (`93f11780`, `36018e19`, not taken).
+
+| Part | What | Edits |
+|---|---|---|
+| skate-core `living_world/{config, mod, population, skaters}.rs` and tests | upstream at `36018e19` (our copies were `74c124a`'s, comments aside): called skaters (`call_skater` / `dismiss_skater`, `Companion`, 3 slots, the 4 m inner radius while one waits, research b544 / b563) | verbatim; the Vita's slot count is set with Call Skater (step 3) |
+| skate-sim `physics/{frame, clock}.rs`, `tests/physics_startup.rs` | the camera graph's slow-motion requests are dropped, not applied (retail does not slow down on a long air) | upstream's `CAMERA_SLOW_MOTION` log lines not taken |
+
+Not taken: the NPC body pool fix (`18bbb37d`: we have no simulated NPC tier, `npc_sim` holds only its helpers); the map switch's ambience read-ahead (`c871c2f0`: our zone beds stream from the card, no bed file is read whole on the game thread); the frame-time overlay move. Reference: built from `36018e19`, its 20 Course dumps bit-identical to `oracle/ref`; the port 20/20, no-fma 20/20. Tests: skate-core 1188 passed, skate-sim as before (`embedded_static_rwcm_hits_distinct_actor_query_ids`; the ignored startup test still fails at the standing kickturn, as on `main`). DownTown perf bench: `PERF_HASH 77fc1129ae1e3070` (unchanged: no skater is called), 0.85 to 0.90 ms a tick against 0.91 for `main` on the same machine the same day.
+Vita: DownTown 60 fps median, sim 20.9 ms median (21.1 at `74c124a`); the slow frames in the prop-heavy block are render-side (CPU 30 to 70 ms at up to 921 draws, sim 15 to 25 ms), as before; checked by the user.
+
+## Resync to PR #52 head `36018e19`, step 2: the teleporter Yes (2026-10-24)
+
+Nothing to port: upstream's replay popup handler took every engine popup answer (`06f439e0`); our `fe_menus.rs` already copies only the replay's own answers out of `popup_choices` (`REPLAY_POPUP`) and the teleporter reads its `CONFIRM` answers from the same frame.
+
+## Resync to PR #52 head `36018e19`, step 3a: Call Skater and the Free Play options (2026-10-24)
+
+| Part | What | Edits |
+|---|---|---|
+| skate-core `spawn_skater.rs`, `free_skate_options.rs` | upstream at `36018e19` (`06f439e0`): FE 62 SpawnSkater's rows, picks and keys (b543 / b544), FE 34's Traffic / Pedestrians / A.I. Skaters rows (b548 / b564) | verbatim |
+| skate-ui `fe/spawn_skater_host.rs`, `fe/free_skate_options_host.rs`, `fe/crossbar_host.rs`, `fe/menu_stage.rs`, `fe/retail_menus.rs` | skate-game `spawn_skater_host.rs`, `free_skate_options_host.rs`, `retail_menu_stage.rs`: the `SkaterSpawner` / `FreeSkateOption` natives, the pause items' handlers and FE 62's mode, FE 62 / FE 34 input, open / close, first states, the limit popup | ours: Call Skater lists the skater profiles' pros with retail's attribute 0xCABC362B1B05CA19 (upstream: living world pool membership), labelled with their `name_id`; Free Play lists only You (no player character swap on the Vita, owner 2026-10-24); the limit popup is a standard popup with its option, and with a cap other than retail's 3 its text is ours (`limit_text`: retail's says "three skaters"); the actions and values are frame output, not Bevy messages; the Vita's cap of 1 caller (`set_callable`) |
+| skate-sim `living_world.rs`, `physics/live.rs` | `apply_called_skaters` (skate-game `living_world/mod.rs`): calls and dismisses to the population's companions | ours: `companion_slots` (the Vita's 1, owner 2026-10-24) and the session's `call_skater` / `dismiss_skater` / `called_skaters` |
+| skate-vita `settings.rs`, `fe_menus.rs`, `lab.rs`, `app.rs` | — | ours: FE 34 opens on the Traffic / Pedestrians levels' densities and its values go back to the nearest level (a tie to the lower); the calls go to the sim thread |
+| skate-ui `fe/retail_menu_movies.rs` `VERSION`, `fe/menu_stage.rs` `PAUSE_ROOTS` | menu set version 14 (upstream `VERSION`): spawnskater and freeskate_options in the lean set | (step 5 brought forward: the screens need the set) |
+
+Data: the menu set re-exported with `tools/prepare_menu_screens.py --reference <36018e19>` (version 14, 46 movies; the version 11 set kept as `menu-movies.v11`); ui.pak rebaked (old ui.pak.pre-36018). Not taken: the greenscreen (no Replay Mode), the preview of the highlighted skater, the called skater's trail (step 3b). Checks: skate-ui test (Call Skater calls, the limit popup at 1, X dismisses; Free Play's X opens FE 34, Right steps Traffic, B writes back); `FE_HASH 3bc34026d85cc590` (was `67632849c692e697`: the version 14 set, and the two rows enabled). The skate-ui test build was broken since `74c124a` step 4 (`map_debug` missing in a test `MenuData`): fixed. Vita: Call Skater calls, the limit popup, X dismisses, Free Play's options; DownTown 60 fps median, sim 22.2 ms median with a called skater part of the run; checked by the user (who asked for the limit text to match the cap).
+
+## Resync to PR #52 head `36018e19`, step 3b: the called skater's trail (2026-10-24)
+
+| Part | What | Edits |
+|---|---|---|
+| skate-core `indicator_trail.rs` | upstream at `36018e19` (`06f439e0`): the trail's sampling (every 0.05 s, 0.25 m spacing, 71 points, cleared on a jump) and retail's B-spline (b566 / b567) | verbatim |
+| skate-vita `called_trails.rs`, `teleporter_icons.rs` | skate-game `visual_indicators.rs` `companion_trails` / `strips`: one trail per called skater (4 at most) on its `Skateboard_Root` + 0.25 m, the `trail_follow` style's strips, fade and passes | ours: the bone from the NPC's published step poses (relative to the root, interpolated); the mesh uploaded only when a point is added; no trail in a replay |
+| vita-render `scene.rs` `set_trail` / `TrailInstance` | — | ours: trail slots drawn in world space with the icons' two passes |
+| vita-bake `ui.rs` | the trail style row (`trail_follow`, exported as `Hash_8330C6CBB7402726`) kept in the slim `visual-indicators.json` | — |
+
+Data: ui.pak rebaked (ui.pak.pre-36018 is the pack before step 3a). Checks: skate-vita trail mesh / fade test; skate-core trail tests. Vita: the trail follows the called skater's board (bone 25 of 36), DownTown 60 fps median; checked by the user.
+
+## Resync to PR #52 head `36018e19`, step 4: the HUD minimap (2026-10-24)
+
+| Part | What | Edits |
+|---|---|---|
+| skate-core `minimap.rs` | upstream at `36018e19` (`06f439e0`): when the minimap shows (82665278), the smoothed heading (82665388), the icon placement and fade (8268CB40) and the north pointer's turn (b568 to b571) | verbatim |
+| skate-ui `minimap.rs` | skate-game `hud_minimap.rs` and its part of `scoring_hud.rs`: the frame movie's Show and needle clip, the heading at the console's 30 HUD updates a second, the called skaters' `mini_skater` icons and the north pointer quad over the frame | ours: the movie as a linked screen on `menu_runtime` (as the manual meter); the heading tracker without Bevy |
+| skate-vita `retail_hud.rs` `Minimap`, `app.rs`, `settings.rs`, `vita_menus.rs` | — | ours: loaded with the HUD meters, the icon textures from the menu set's `texture/north_pointer` / `texture/mini_skater`; the setting (on by default, settings version 10) bound to retail's Minimap row (`ID_GAMESETTINGS_MINIMAP_TOGGLE`) |
+| vita-bake `ui.rs` | `hudminimap.linked.json` among the linked screens (its strings trimmed) | — |
+
+Data: `hud2/hudminimap` prepared and linked with `tools/prepare_ui_screen.py` / `tools/link_ui_screen.py` into `ui-screens-fad` (upstream exports it with `prepare_hud.py` at `36018e19`; the install's HUD files are unchanged); ui.pak rebaked. Checks: skate-ui minimap tests (the heading, the needle, the linked screen shows 7 draws and hides); skate-vita settings round trip (version 9 files load with the minimap on). Vita: the minimap shows top right, the pointer turns, the called skater's icon moves, the Game Settings row hides and shows it; DownTown 60 fps median, sim 18.1 ms median; checked by the user.
+
+## Resync to PR #52 head `36018e19`, step 5: menu set version 14 (2026-10-24)
+
+The export, `VERSION` 14, the two `PAUSE_ROOTS` and the ui.pak rebake came in with step 3a (the screens need them). Heap on the Vita (device logs of steps 1 and 4): the menu stage loads 42 movies instead of 40, +1,335 KiB for the stage (20,702 KiB, was 19,367 KiB), textures unchanged (336, 7,819 KiB); the run's peak heap 165.0 MB (167.0 MB in step 1's run). Not taken: version 12 (every DLC pack's text) and 13 (the Credits screen) are in the set but unused.
+
+## Resync to PR #52 head `36018e19`, step 6: on to `0947dea5` (2026-10-24)
+
+The PR moved 5 commits during this resync (`4bfa4d7f`, `81ae7419`, `3dd2ee2d`, `05529b4b`, `0947dea5`); the pin moves to `0947dea5` (reference.sh, setup-references.sh).
+
+| Part | What | Edits |
+|---|---|---|
+| skate-data `challenge_map.rs` | `map_icons` / `map_icon`: the fe_map_icons records (texture, max distance; b565 / b571) | `git merge-file` ours / `36018e19` / `0947dea5`, clean; the texture is our interned string |
+| skate-data `collections.rs` | `FieldArray::text_pairs` (the loading screen's hints) | merged clean; sim.pak's binary form does not carry them (`vita-bake` reads the JSON) |
+
+Not taken: the minimap's groups in add order and its hide messages (one group on the Vita, no mods), the render-side hitch split, the map read-ahead and bank prefetch on the map switch, the map upload in slices (desktop Bevy), FE 62's swap fade (no player swap on the Vita), the setup export speed passes, the docs and skills. Data: the install's `tips_loader/default` hints given their `text_pairs` by upstream's `vlt.convert` at `0947dea5` (a driver patches only that array; the old file kept as `skater-collections.json.pre-tips`). Checks: reference built from `0947dea5`, its 20 Course dumps bit-identical to `oracle/ref`; the port 20/20, no-fma 20/20; skate-data `the_retail_map_icons`.
+
+## Resync to PR #52 head `36018e19`, step 7: the retail loading screen (2026-10-24)
+
+| Part | What | Edits |
+|---|---|---|
+| skate-core `tips_loader.rs` | upstream at `0947dea5` (`81ae7419`): FE 52's panel pick, line pick, panel cycle (9 s, 0.5 s outro) and the load sequence (black, push, drop the black, black, close, 4 black updates, fade in; b581) | verbatim |
+| skate-data `tips_loader.rs` | the `tips_loader/default` record's Coach Frank lines and hints | serialisable (ui.pak's `private/tips-loader.json`) |
+| skate-ui `fe/tips_loader_host.rs`, `fe/menu_stage.rs`, `fe/crossbar_host.rs`, `fe/retail_menus.rs` | skate-game `tips_loader_host.rs`, `retail_menu_stage.rs`: the `TipsLoader` natives, FE 52 open / close, the sequence on fader bit 2, a panel each period, no keys while a load runs | ours: the game says when it loads (`set_loading`); `load_covered` for the black under it; tiploader in `PAUSE_ROOTS` |
+| skate-vita `fe_menus.rs`, `app.rs` | — | ours: a load that starts while the menus are ready runs the screen (the first world's keeps the picture and the circle: the menus load after it); black under the screen; no HUD over it; play resumes once it is gone |
+| vita-bake `ui.rs` | `private/tips-loader.json` from the collections | — |
+
+Data: the menu set re-exported at `0947dea5` (tiploader, still version 14; the `36018e19` set kept as `menu-movies.v14-36018`); ui.pak rebaked. Checks: skate-ui `the_loading_screen_runs_around_a_load` (FE 52 opens, the black drops, 74 draws, a panel cycle, closes and fades back in); skate-data `the_retail_tips` (20 lines, 31 hints); `FE_HASH 3bc34026d85cc590` (unchanged). Vita: DownTown -> University through FE 52 (black, push, up, black, close, fade in), University loaded in 15.2 s (13.1 to 14.5 s in earlier runs); the menu stage +1,143 KiB (21,845 KiB), its textures 8,484 KiB (were 7,819), the run's peak heap 164.8 MB; checked by the user.

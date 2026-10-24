@@ -104,6 +104,9 @@ impl<'de> Deserialize<'de> for Interned {
 pub struct FieldArray {
     #[serde(default)]
     pub text_items: Vec<String>,
+    /// Elements of two text pointers each, resolved (the loading screen's hints: title, text).
+    #[serde(default)]
+    pub text_pairs: Vec<[String; 2]>,
     /// The raw elements as big-endian hex.
     #[serde(default)]
     pub items: Vec<String>,
@@ -211,7 +214,8 @@ impl Raw {
                     n => {
                         let text_items = (0..n).map(|_| r.str()).collect::<Result<_, _>>()?;
                         let items = (0..r.u32()?).map(|_| r.str()).collect::<Result<_, _>>()?;
-                        Some(FieldArray { text_items, items })
+                        // The loading screen's hint pairs are not in sim.pak's form (vita-bake reads them from the JSON).
+                        Some(FieldArray { text_items, text_pairs: Vec::new(), items })
                     }
                 };
                 let field = Field { type_name, data, array };

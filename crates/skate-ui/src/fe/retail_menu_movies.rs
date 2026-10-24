@@ -19,10 +19,11 @@ use std::path::Path;
 pub const FORMAT: &str = "skate3-menu-movies";
 /// Manifest version setup writes (3: textured units carry their bitmap id, Milestone 4; 4: screens/main; 5: main.apt's
 /// layer movies; 6: the challenge map; 7: named runtime images, the challenge map pictures; 8: the Skate Profile, FE 61;
-/// 9: Extras, FE 18; 10: the text viewer, FE 3; 11: the replay editor and help, FE 12 / 13).
-pub const VERSION: u64 = 11;
-/// The oldest version this engine still reads (upstream's rule: 6, 8, 9, 10 and 11 only add a movie and 7 an optional
-/// image table).
+/// 9: Extras, FE 18; 10: the text viewer, FE 3; 11: the replay editor and help, FE 12 / 13; 12: every DLC pack's text;
+/// 13: the Credits screen, FE 25; 14: SpawnSkater, FE 62, the Free Play options, FE 34, and the HUD minimap).
+pub const VERSION: u64 = 14;
+/// The oldest version this engine still reads (upstream's rule: 6 and 8 to 14 only add a movie or text and 7 an
+/// optional image table).
 pub const OLDEST_VERSION: u64 = 5;
 /// Texture key prefix of a named runtime image (`Game.ImageRenderer_Load`): `image/<image_key>`.
 pub const NAMED_IMAGE_PREFIX: &str = "image/";

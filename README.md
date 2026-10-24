@@ -97,7 +97,7 @@ The main and pause menus, Game Settings, the replay editor and their popups are 
 ```sh
 python3 tools/prepare_menu_screens.py --game ../game_data/skate3_x360 --assets $INSTALL/assets --work ../game_data/menu-movies-work
 C=$INSTALL/assets/private/stock/skater-collections.json
-for s in hud2/manualmeter hud2/trickanalyser; do
+for s in hud2/manualmeter hud2/trickanalyser hud2/hudminimap; do
     python3 tools/prepare_ui_screen.py --game ../game_data/skate3_x360 --collections $C --output ../game_data/ui-screens --bundle data/fe/source/screens/$s
     python3 tools/link_ui_screen.py --game ../game_data/skate3_x360 --collections $C --output ../game_data/ui-screens --screen ${s##*/}
 done

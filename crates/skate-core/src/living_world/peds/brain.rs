@@ -1,18 +1,5 @@
-//! A pedestrian's behaviour brain: the host the stock ped AI graph (`Pedestrian.stategraph`) runs
-//! on (doc 26 "Ped behaviour runtime"). Retail runs that graph on the same dynamic controller as
-//! the skater's graphs (`82C12E88` via `82C12DD0`; `.local/research/peds/b2-ped-aigraph-interpreter.md`),
-//! so the shared `graph::controller` drives it here too; this module owns what the graph's
-//! operations read and write: wants, timers and flags (the retail brain, `brain+412` wants,
-//! `82E40940` / `82E40A80` timers, `+3232` honker, `+3281` bit 0x80 scatter) and the outputs the
-//! body follows (motion intent, speed suggestion, flee target).
-//!
-//! Operations are parsed once from the graph's attributes ([`PedOp::parse`]); their values stay
-//! data. Operations not ported yet are [`PedOp::Pending`]: their conditions answer false and
-//! their behaviours do nothing, and the game reports them once (no silent default).
-//! Retail bodies (`.local/research/peds/b3-first-slice-operations.md`, main checked Wander and
-//! the warn timer): see each variant.
-//!
-//! Multiplayer: the brain is plain data owned by the host; wants carry stable target ids.
+//! A pedestrian's behaviour brain: the host the stock ped AI graph runs on (wants, timers, flags, outputs).
+//! Details: docs/hails-additions/26g-living-world-ped-interactions.md#ped-brain
 
 use super::super::Vec3;
 use crate::graph::activation::ConditionHost;
@@ -78,6 +65,8 @@ pub struct BrainSettings {
     /// The reaction a failed takedown's trip stores (`826A5068`: Knockdown `830218C0[0]`, FromBack `830218B0[1]`; b326).
     pub trip_kind: super::skater_contact::ReactionKind,
     pub trip_direction: super::skater_contact::ReactionDirection,
+    /// SkaterAvoidance's closest-approach test and Jump / Step limits (`super::avoid`).
+    pub avoid: super::avoid::AvoidRules,
 }
 
 /// ZombieFollow (`826A91A8` / `826A9250` / `826A9518`) [code]: beyond `follow_distance` the goal is the player; inside
@@ -108,7 +97,7 @@ impl Default for ZombieFollowSettings {
 
 impl Default for BrainSettings {
     fn default() -> Self {
-        Self { wander_speed: 2.0, warn_seconds: 3.5, know_about_seconds: 30.0, mood_want_memory_seconds: 30.0, watch_cone: 0.959_931, watch_ahead: 4.0, warn_speech: 53, tazer_draw_seconds: 0.133, tazer_hit_seconds: 0.3, taze_speech: 66, end_taze_speech: 67, tazer_clip_blend: 0.2, tazer_clip_end: 0.2, greet_seconds: 3.5, conversation_turn_seconds: 3.0, conversation_gather_seconds: 30.0, greet_speech: 56, return_greet_speech: 63, chases_enabled: true, aggressive_capture_distance: 2.0, unreachable_radius: 5.0, reach_check_seconds: 10.0 / 30.0, start_chase_speech: 55, new_chasee_speech: 15, hand_prop: Default::default(), zombie_follow: Default::default(), trip_kind: super::skater_contact::ReactionKind::Knockdown, trip_direction: super::skater_contact::ReactionDirection::FromBack }
+        Self { wander_speed: 2.0, warn_seconds: 3.5, know_about_seconds: 30.0, mood_want_memory_seconds: 30.0, watch_cone: 0.959_931, watch_ahead: 4.0, warn_speech: 53, tazer_draw_seconds: 0.133, tazer_hit_seconds: 0.3, taze_speech: 66, end_taze_speech: 67, tazer_clip_blend: 0.2, tazer_clip_end: 0.2, greet_seconds: 3.5, conversation_turn_seconds: 3.0, conversation_gather_seconds: 30.0, greet_speech: 56, return_greet_speech: 63, chases_enabled: true, aggressive_capture_distance: 2.0, unreachable_radius: 5.0, reach_check_seconds: 10.0 / 30.0, start_chase_speech: 55, new_chasee_speech: 15, hand_prop: Default::default(), zombie_follow: Default::default(), trip_kind: super::skater_contact::ReactionKind::Knockdown, trip_direction: super::skater_contact::ReactionDirection::FromBack, avoid: super::avoid::AvoidRules::RETAIL }
     }
 }
 
@@ -346,10 +335,7 @@ pub enum PedOp {
     /// `826A75D8` Begin: save the ped's nav modifier and set it; `826A7658` End: restore it.
     /// Modifiers (factory `826A74C8`): 0 ChaseGlue, 1 Pedestrian, 2 SkaterAvoidance, 3 VehicleAvoidance.
     ChangeNavModifierSetting { modifier: u8, set_to: bool },
-    /// `826A77A8` Begin (factory `826CB3B8`, `stateName`: warn 0, chase 1, tired 2, giveup 3, else
-    /// 4): not in zombie mode, tell the chased player (the chasee, or for `warn` without one the
-    /// flagged warn want's target) the ped's chase state (message `0xEFFA9715`: the marker
-    /// arrows). No speech.
+    /// 826A77A8 Begin (factory 826CB3B8): send the chased player the chase state (message 0xEFFA9715): docs/hails-additions/26g-living-world-ped-interactions.md#send-chase-state
     SendChaseStateMessage { state: u8 },
     /// `826A4838` Update: the takedown target (`brain+2180`) is the chasee.
     ChaserEvaluateWhoToTakeDown,
@@ -442,10 +428,7 @@ pub enum PedOp {
     /// `826A6408` / `826A6428`: in a conversation (`brain+3278` bit 0x04); `826ACE20` reads it.
     PedestrianInConversation,
     PedestrianIsInConversation,
-    /// Waypoint ops (`template/moveontowaypoint.xml`): lock the nearest free waypoint of the
-    /// plugin (`826A62E0`), has one, flat distance to it (`lessEqual` / `greater`, `yTolerance`),
-    /// walk to it at `speed`, stand, turn to its orientation (ours: towards the plugin centre),
-    /// facing it within `FOVAngle` (radians), release it.
+    /// Waypoint ops (`moveontowaypoint.xml`, 826A62E0): lock, walk to, face, release a plugin waypoint.
     LockClosestWaypoint,
     /// `LockFirstWaypoint` (`826A0580`): with no waypoint locked, lock the plugin's first waypoint if it is free.
     LockFirstWaypoint,
@@ -509,12 +492,7 @@ pub enum PedOp {
     ConversationSpeak,
     ConversationListenToSpeaker,
     ConversationIsComplete,
-    /// The mood gate's flags (`brain+3278`): WaitingToReact 0x20 (set by the producer on a pass and
-    /// by these ops, cleared when a want group begins) and IsReactingToMoodEvent 0x10.
-    /// `826A70E0` Begin: the taunt want's target (want 3); speech 65 when the victim is the player, else 19 (host);
-    /// face the target; post the "Taunt" motion intent (motiongraph_taunt: the remapped "Taunt" clip once). The graph
-    /// holds the state while the intent lives (`HasMonitoredIntent SGIntent`). `826A72F0` End: face released, intent
-    /// removed, the taunt want unset.
+    /// Taunt victim (826A70E0 Begin / 826A72F0 End) and the mood gate flags (brain+3278): docs/hails-additions/26g-living-world-ped-interactions.md#takedown-taunt-victim
     TakedownTauntVictim,
     /// `826A7998` Begin: the light throw (`82E3E648` attack 0) at the plugin object's hotpoint 0 (b87 §3, b90 §1);
     /// the release follows in the per-ped step ([`PedBrain::update_hand_prop_release`]).
@@ -840,10 +818,7 @@ impl HandProp {
         list.iter().rev().find(|(_, p)| *p > 0.0).map(|(k, _)| k.as_str())
     }
 
-    /// The ped's starting prop (ped constructor `82E33198` [code]): `chance_roll` and `pick_roll` are retail's two
-    /// `rand() % 100 + 1` rolls (1..=100). The ped carries something when `chance * 100 >= chance_roll` (`8269A588`, the
-    /// entity's `Hash_3DB019A08284F45C`); then the first entry of its `handprop_odds` list whose running total x 100
-    /// reaches `pick_roll` (weights are not normalised: a list summing below 1 can give nothing).
+    /// Ped starting prop (ctor 82E33198, 8269A588): chance and pick rolls: docs/hails-additions/26g-living-world-ped-interactions.md#starting-hand-prop
     pub fn starting_pick(chance: f32, list: &[(String, f32)], chance_roll: u32, pick_roll: u32) -> Option<&str> {
         if chance * 100.0 < chance_roll as f32 {
             return None;
@@ -871,11 +846,7 @@ pub const TAZER_OUT: &str = "TazerOut";
 pub const TAZER_PROP: &str = "tazr";
 
 impl PedBrain {
-    /// The ped update's tazer step (`82E3ED50`) [code, b153 / b248]: `played` is the tazer clip the channel last
-    /// took (`TazerClip`) and whether the ped's anim set had it, `left` the seconds left on the channel. Drawing:
-    /// with `tazer_clip_end` left on the draw clip the cycle clip starts and the tazer is drawn (state 2). Putting
-    /// away: with `tazer_clip_end` left on the holster clip the draw request clears, state 0, and the "tazr" prop is
-    /// deleted (not thrown). A clip the set lacks counts as already at its end.
+    /// Tazer step of the ped update (82E3ED50, b153 / b248): docs/hails-additions/26g-living-world-ped-interactions.md#tazer-clip
     pub fn update_tazer_clip(&mut self, s: &BrainSettings, played: Option<(&str, bool)>, left: f32) {
         let at_end = |clip: &str| played.is_some_and(|(p, ok)| p == clip && (!ok || left <= s.tazer_clip_end));
         match self.tazer_state {
@@ -1182,10 +1153,7 @@ impl PedBrain {
         self.raise_want(want, target, forget_on_unset);
         self.perceptions.know(target, memory);
     }
-    /// `sub_82E42A58(brain, want, 0)`: a set want (0x80) without flag 0x40 counts one finished reaction on its
-    /// target's perception entry (`+68`, when the entry exists); a flag 0x40 want instead forgets its target
-    /// (`sub_82E40FF0`: the mood records about it, game side through [`ChaseRequest::MoodReset`], and its perception
-    /// entry).
+    /// sub_82E42A58(brain, want, 0): count a finished reaction, or forget the target (0x40 wants): docs/hails-additions/26g-living-world-ped-interactions.md#unset-want
     pub fn unset_want(&mut self, want: &str) {
         let Some(w) = self.wants.remove(want) else { return };
         if w.forget_on_unset {
@@ -2013,10 +1981,7 @@ impl Host for BrainHost<'_> {
             PedOp::RestFromChase => b.chase_resting = false,
             PedOp::LostChasee => b.search_point = None,
             PedOp::UnsetIsReactingToMoodEventFlagOnEnd => b.reacting_to_mood = false,
-            // Plugin End (`8269F310`) releases the plugin (`82E0C9E8`: leaves the conversation, which aborts an
-            // unfinished one, and clears the participant's plugin instance): a ped bumped out of a conversation into
-            // Colliding goes on to Wander, not back into it, and runs the mood producer again (b318; laptop
-            // 2026-10-19: conversing peds skipped the warn). The host's ExitPlugin release does that work.
+            // Plugin End (8269F310 -> 82E0C9E8) releases the plugin, so the ped goes on to Wander (b318).
             PedOp::Plugin => {
                 b.in_plugin = false;
                 b.chase_requests.push(ChaseRequest::ExitPlugin);

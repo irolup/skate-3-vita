@@ -35,9 +35,11 @@ pub(super) fn advance(
     physics.exchange = super::SimulationExchange::new(tick);
     //SimController8285C968 dispatches the preceding tick's camera messages
     //before simulation. Keep End/Begin ordering when both occur in one update.
-    // Upstream 351f0366: the camera graph's slow-motion requests are dropped, not applied; on a long air they slowed
-    // the game to 39-48 ticks a second, which retail does not do (the retail condition is not found yet, doc 21).
-    camera.simulation_rate_requests.clear();
+    // Without the controller's subject (retail's graph context, `CameraGraph::slow_motion_subject`) only Begin / End's
+    // 1/60 requests arrive (upstream 8bd84c24; doc 21 "Camera slow motion").
+    for request in camera.simulation_rate_requests.drain(..) {
+        if !physics.network_active { physics.clock.apply(request)?; }
+    }
     if physics.network_active { physics.clock = super::clock::SimulationClock::default(); }
     if physics.ticks == 0 {
         player_state::initialize(physics, skater)?;

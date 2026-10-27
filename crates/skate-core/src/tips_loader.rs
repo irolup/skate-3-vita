@@ -71,14 +71,13 @@ impl Default for TipsLoader {
 }
 
 /// A line of `n` other than the previous one, uniform (sub_82606C98 / sub_82605FA8): `rng % (n - 1)`, shifted past
-/// the previous. One line or none: line 0.
+/// the previous. One line or none: line 0, and the previous stays as it was (retail writes it only on a pick).
 pub fn pick_line(n: usize, last: &mut usize, rng: &mut dyn FnMut() -> u32) -> usize {
-    let line = if n > 1 {
-        let i = rng() as usize % (n - 1);
-        if i >= *last { i + 1 } else { i }
-    } else {
-        0
-    };
+    if n <= 1 {
+        return 0;
+    }
+    let i = rng() as usize % (n - 1);
+    let line = if i >= *last { i + 1 } else { i };
     *last = line;
     line
 }
@@ -128,10 +127,12 @@ impl TipsLoader {
         pick_line(n, &mut self.last_hint, rng)
     }
 
-    /// The screen opened (its data is ready offline at once): back to the first pick.
+    /// The screen opened (its data is ready offline at once): back to the first pick, and no panel counts as shown
+    /// before (sub_82605AA0 clears T+202..207 on every open; the counts and the last shown panel stay, research b588).
     pub fn open(&mut self) {
         self.state = State::Invisible;
         self.timer = 0.0;
+        self.shown_before = [false; 6];
     }
 
     /// One update of `dt` seconds while the screen is up (sub_82605CC0): a pick when invisible, the outro after
@@ -177,9 +178,10 @@ pub enum LoadPhase {
     BlackFrames(u32),
 }
 
-/// FE updates of full black between the screen's close and the fade back in (recomp: about 4, research
-/// report-loading-screen-trace.md step 8).
-pub const BLACK_FRAMES: u32 = 4;
+/// FE updates of full black after the update that sees the screen gone, before the fade back in: none, so the
+/// release comes 2 updates after the close. Retail's hold state (sub_82708D00) waits for 6 ticks of another
+/// thread's counter; the recomp shows 2 to 3 FE updates from close to release (research b588).
+pub const BLACK_FRAMES: u32 = 0;
 
 /// The loading screen around a load (game state 0x82707508 with sub_826E08A8 and LoadScreenManager kind 2; order from
 /// the recomp trace): fade to black, push the screen at black, drop the black at once when it is up, and when the load
@@ -247,6 +249,21 @@ mod tests {
         assert_eq!(last, 4);
         assert_eq!(pick_line(1, &mut last, &mut || 7), 0);
         assert_eq!(pick_line(0, &mut last, &mut || 7), 0);
+        assert_eq!(last, 4, "one line or none leaves the previous one");
+    }
+
+    /// Every open clears "shown before" (sub_82605AA0), so the least-shown rule keeps working load after load.
+    #[test]
+    fn each_open_forgets_shown_before_but_keeps_the_counts() {
+        let mut t = TipsLoader::default();
+        let mut rng = seq(&[0]);
+        assert_eq!(t.pick_panel(OFFLINE, &mut rng), Some(Panel::CoachFrank));
+        t.open();
+        // Coach Frank is no longer "shown before" but was shown more: the hint (count 0) still goes first.
+        assert_eq!(t.pick_panel(OFFLINE, &mut rng), Some(Panel::Hint));
+        t.open();
+        let with_stats = [true, true, true, false, false, false];
+        assert_eq!(t.pick_panel(with_stats, &mut rng), Some(Panel::Stats), "the never shown panel wins");
     }
 
     #[test]

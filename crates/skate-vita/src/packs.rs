@@ -38,6 +38,35 @@ pub static MOUNTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBoo
 /// Set when a pack's background hash check failed (shown on screen).
 pub static DAMAGED: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
+/// The packs that passed their hash check, one line each: path, length, modification time. A pack is checked again
+/// only when it changed (a new upload): hashing every pack took 74 s of card reads at each start, and a district's
+/// 8 s at each of its loads, beside the tile streaming and the collision windows.
+const VERIFIED: &str = "ux0:data/SKATEVITA/verified.txt";
+static VERIFIED_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn stamp(path: &Path) -> Option<String> {
+    let meta = std::fs::metadata(path).ok()?;
+    let modified = meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
+    Some(format!("{} {} {modified}", path.display(), meta.len()))
+}
+
+/// The pack passed its check as it is now.
+fn verified(path: &Path) -> bool {
+    let _guard = VERIFIED_LOCK.lock().unwrap();
+    stamp(path).is_some_and(|s| std::fs::read_to_string(VERIFIED).is_ok_and(|t| t.lines().any(|l| l == s)))
+}
+
+fn mark_verified(path: &Path) {
+    let _guard = VERIFIED_LOCK.lock().unwrap();
+    let Some(line) = stamp(path) else { return };
+    let prefix = format!("{} ", path.display());
+    let mut lines: Vec<String> = std::fs::read_to_string(VERIFIED).unwrap_or_default().lines().filter(|l| !l.starts_with(&prefix)).map(str::to_owned).collect();
+    lines.push(line);
+    if let Err(e) = std::fs::write(VERIFIED, lines.join("\n") + "\n") {
+        println!("{VERIFIED}: {e}");
+    }
+}
+
 /// Mounts sim.pak and anim.pak (strict: the loaders read nothing else). Returns the
 /// asset root to load from, or the fallback folder when the packs are absent.
 ///
@@ -88,13 +117,22 @@ pub fn mount() -> &'static str {
             // Below the window builder (170): hashing must not starve a collision window.
             vita_platform::vita::set_current_thread_priority(190);
             let started = std::time::Instant::now();
+            let mut hashed = 0;
             for (name, path) in checked {
-                if let Err(e) = vita_pack::verify_file(Path::new(&path)) {
-                    println!("{name}: {e}");
-                    *DAMAGED.lock().unwrap() = Some(format!("{name} is damaged: upload the packs again"));
+                let path = Path::new(&path);
+                if verified(path) {
+                    continue;
+                }
+                hashed += 1;
+                match vita_pack::verify_file(path) {
+                    Ok(()) => mark_verified(path),
+                    Err(e) => {
+                        println!("{name}: {e}");
+                        *DAMAGED.lock().unwrap() = Some(format!("{name} is damaged: upload the packs again"));
+                    }
                 }
             }
-            println!("packs verified in {:.1} s", started.elapsed().as_secs_f32());
+            println!("packs verified in {:.1} s ({hashed} hashed, the others unchanged since their check)", started.elapsed().as_secs_f32());
         })
         .expect("spawn the pack check");
     MOUNTED.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -307,19 +345,22 @@ fn load_district(name: &str) -> Result<(skate_data::skate_map::SkateMap, Render)
         limits: district.limits,
     });
     let check = path.clone();
-    let _ = std::thread::Builder::new().name("district-verify".into()).spawn(move || {
+    let _ = (!verified(&check)).then(|| std::thread::Builder::new().name("district-verify".into()).spawn(move || {
         let _ = vita_platform::vita::pin_current_thread(2);
         // Below the window builder (170): hashing 250 MB must not starve a collision window.
         vita_platform::vita::set_current_thread_priority(190);
         let started = std::time::Instant::now();
         match vita_pack::district::verify_file(&check) {
-            Ok(()) => println!("{} verified in {:.1} s", check.display(), started.elapsed().as_secs_f32()),
+            Ok(()) => {
+                println!("{} verified in {:.1} s", check.display(), started.elapsed().as_secs_f32());
+                mark_verified(&check);
+            }
             Err(e) => {
                 println!("{e}");
                 *DAMAGED.lock().unwrap() = Some("a district pack is damaged: upload it again".into());
             }
         }
-    });
+    }));
     let e = &district.sim.environment;
     let horizon = [e.get(3).copied().unwrap_or(0.3), e.get(4).copied().unwrap_or(0.4), e.get(5).copied().unwrap_or(0.5)];
     set_district(Some(std::sync::Arc::new(DistrictView {

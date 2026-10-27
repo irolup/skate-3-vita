@@ -84,10 +84,13 @@ fn lookup(path: &Path) -> Option<Entry> {
 fn read_disk(pack: &Path, offset: u64, len: usize) -> io::Result<Vec<u8>> {
     use std::io::{Read, Seek, SeekFrom};
     let _foreground = crate::io_gate::foreground();
+    let started = std::time::Instant::now();
     let mut file = std::fs::File::open(pack)?;
     file.seek(SeekFrom::Start(offset))?;
     let mut bytes = vec![0u8; len];
     file.read_exact(&mut bytes)?;
+    let source = pack.file_name().map_or(std::borrow::Cow::Borrowed("?"), |n| n.to_string_lossy());
+    crate::io_gate::account(&source, len, started.elapsed().as_micros() as u64);
     Ok(bytes)
 }
 

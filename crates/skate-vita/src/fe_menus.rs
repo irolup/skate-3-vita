@@ -293,6 +293,13 @@ impl FeMenus {
         }
     }
 
+    /// The career stats the loading screen's Stats panel shows from its next open, and the Units setting.
+    pub fn set_career_stats(&mut self, stats: &skate_core::career_stats::CareerStats, imperial: bool) {
+        if let FeMenus::Ready(r) = self {
+            r.stage.set_career_stats(stats, imperial);
+        }
+    }
+
     /// The loading screen runs (the menus draw it over everything).
     pub fn loading_screen(&self) -> bool {
         matches!(self, FeMenus::Ready(r) if r.loading_screen)

@@ -1,10 +1,5 @@
-//! Retail's analog steer of an AI skater in the air (research `.local/research/npc/b123-ai-air-steer.md`):
-//! `sub_8246ACF0`'s airborne arm `sub_8246B358` turns the character toward the recorded skater forward at the near
-//! look-ahead (`pc+208`, turned 180 degrees when the takeoff latch `pc+927` is set), and `sub_82471188` writes the
-//! error as stick input to `Turn`, `BodySpin` and `KickTurn` outside a dead zone. The latch (`sub_8246A700`) is set
-//! on the takeoff edge when the character faces against the current node's recorded skater forward.
-//!
-//! Pure and deterministic. Retail tunables are the defaults (data, a mod may change them).
+//! Retail analog steer of an AI skater in the air (b123; 8246B358 -> 82471188, latch 8246A700). Pure; data.
+//! Details: docs/hails-additions/26e-living-world-skater-ai.md#ai-air-steer
 
 use super::replay::{decode_orientation, retail, rotate, slerp, ReplayLine};
 use super::Vec3;
@@ -110,6 +105,31 @@ mod tests {
         assert!((error([0.0, 0.0, 1.0], UP, left, false) - 30f32.to_radians()).abs() < 1e-4);
         // Latched: the reverse of a backwards target is straight ahead.
         assert!(error([0.0, 0.0, 1.0], UP, [0.0, 0.0, -1.0], true).abs() < 1e-6);
+    }
+
+    /// b616: over a recorded 180 the stick turns the character with the recording, so it lands in the recorded stance,
+    /// or in the opposite one when it took off latched. The turn rate stands in for the body's response.
+    #[test]
+    fn air_steer_follows_a_recorded_180_and_lands_in_the_recorded_stance() {
+        let f = |yaw: f32| [yaw.sin(), 0.0, yaw.cos()];
+        let t = AirSteerTuning::default();
+        let ticks = 40;
+        let recorded = |i: u32| core::f32::consts::PI * i as f32 / ticks as f32;
+        for (start, want_flip) in [(0.0, false), (core::f32::consts::PI, true)] {
+            let mut latch = AirLatch::default();
+            let mut yaw = start;
+            for i in 0..=ticks {
+                latch.tick(true, f(yaw), f(recorded(0)));
+                if let Some(s) = stick(error(f(yaw), UP, f(recorded(i)), latch.flip), &t) {
+                    yaw -= s * 8f32.to_radians();
+                }
+            }
+            assert_eq!(latch.flip, want_flip);
+            let d = dot(f(yaw), f(recorded(ticks)));
+            assert!(if want_flip { d < -0.9 } else { d > 0.9 }, "start {start} landing dot {d}");
+            // Without the steer the body keeps its takeoff yaw: backwards against the recorded landing.
+            assert!(dot(f(start), f(recorded(ticks))) * if want_flip { -1.0 } else { 1.0 } < -0.9);
+        }
     }
 
     #[test]

@@ -52,6 +52,8 @@ pub struct Session {
     /// `start_living_world`: the oracle corpus runs without it).
     map_name: Option<String>,
     pub(crate) living: Option<crate::living_world::LivingWorldState>,
+    /// The local player's career stats (off unless `start_career_stats`: the oracle corpus runs without them).
+    career: Option<crate::career_stats::CareerStatsTracker>,
 }
 
 /// A placed prop streamed in, as the renderer draws it: its template range in the props
@@ -195,6 +197,7 @@ impl Session {
             prop_templates,
             map_name,
             living: None,
+            career: None,
             markers: None,
             asset_root: asset_root.to_path_buf(),
         };
@@ -211,6 +214,18 @@ impl Session {
 
     /// Starts the living world of the loaded world (its population and traffic) with
     /// `settings`; false when the world has no living-world data (parks, the Course).
+    /// Starts the career stats from these totals (the game's saved ones); they count from the next tick.
+    pub fn start_career_stats(&mut self, stats: skate_core::career_stats::CareerStats) {
+        self.career = Some(crate::career_stats::CareerStatsTracker::new(stats));
+    }
+
+    /// The career stats totals when they changed since the last call (the game saves them).
+    pub fn changed_career_stats(&mut self) -> Option<&skate_core::career_stats::CareerStats> {
+        let career = self.career.as_mut().filter(|c| c.dirty)?;
+        career.dirty = false;
+        Some(&career.stats)
+    }
+
     pub fn start_living_world(&mut self, settings: crate::living_world::LivingWorldSettings) -> bool {
         self.living = self.map_name.as_deref().and_then(|map| crate::living_world::LivingWorldState::load(&self.asset_root, map, settings));
         self.living.is_some()
@@ -414,6 +429,18 @@ impl Session {
                 let camera = self.presentation.pair().map(|(_, now)| now.camera.translation);
                 let period = self.physics.period().as_secs_f64();
                 living.after_physics(&mut self.physics, &mut self.skater, period, camera);
+            }
+        }
+        // The career stats after the population (skate-game's `track` after `SimulationSet::Physics`; the ped hits are
+        // the ones `advance_peds` reported this tick).
+        if report.error.is_none() {
+            if let Some(career) = &mut self.career {
+                career.track(&self.physics, &mut self.skater, self.physics.period().as_secs_f32());
+                if let Some(living) = &self.living {
+                    for entity in living.player_ped_hits() {
+                        career.ped_hit(entity);
+                    }
+                }
             }
         }
         // The audio publication after the tick (the reference's `observe` system runs after

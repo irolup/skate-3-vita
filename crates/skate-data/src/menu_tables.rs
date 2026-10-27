@@ -71,6 +71,15 @@ fn hud_off() -> i32 {
     1
 }
 
+/// One row of the career stats table (the Stats object's +0x18 table, TU3 0x83043AE8, 12-byte records: enabled
+/// byte, label string id, value): the loading screen's Stats panel and the Skate Profile read it (doc 31 "Loading
+/// screen (FE 52)", research b589).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StatRow {
+    pub label: String,
+    pub enabled: bool,
+}
+
 /// One sub-option kind's row: label and helper string ids by column ("" = empty).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SubOptionRow {
@@ -155,6 +164,9 @@ pub struct MenuTables {
     /// The Trick Guide's category order and slot name tables. Empty in tables extracted before they were added.
     #[serde(default)]
     pub trick_guide: TrickGuideTables,
+    /// The career stats rows in index order (65 in TU3). Empty in tables extracted before they were added.
+    #[serde(default)]
+    pub career_stats: Vec<StatRow>,
     /// Table addresses in this build (diagnostics only).
     pub addresses: std::collections::BTreeMap<String, String>,
 }

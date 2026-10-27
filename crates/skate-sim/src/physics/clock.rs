@@ -21,8 +21,6 @@ impl Default for SimulationClock {
 }
 
 impl SimulationClock {
-    // Not called while camera slow motion stays off (physics/frame.rs); kept with its tests for the port.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn apply(&mut self, request: SimulationRateRequest) -> Result<(), String> {
         //82857F44..7C rounds the reciprocal to an integer timer frequency.
         let frequency = (1.0_f32 / request.timestep + 0.5).trunc();

@@ -50,8 +50,21 @@ pub(crate) struct Frame {
     pub teleported: bool,
     pub reverting: bool,
 }
+/// What the career stats read (`career_stats_host`, doc 31 "Career stats"), drained every fixed step.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum StatEvent {
+    /// A trick left its slot (the stats' trick end 0x82773D98): its id, whether it completed, whether the player saw
+    /// it announced, and the time held and distance covered when its move ended here (the move tracker 82DB0588;
+    /// 0 when the move carries on as the next trick).
+    TrickEnd { id: usize, success: bool, announced: bool, held: f32, distance: f32 },
+    /// The first tick of a body flip (82DA8EB8 latches it once per flip).
+    BodyFlipAttempt,
+    /// The air ended landed with this many body flips (82773C00, |P+0x2674|).
+    BodyFlips(u32),
+}
 pub(crate) struct Runtime {
     pub data: ScoringData,
+    pub(crate) stat_events: Vec<StatEvent>,
     pub session: Session,
     collector: Collector,
     carriers: [Option<Carrier>; 4],
@@ -124,6 +137,7 @@ impl Runtime {
     pub fn load(data: &Collections) -> Result<Self, String> {
         Ok(Self {
             data: ScoringData::load(data)?,
+            stat_events: Vec::new(),
             session: Session::default(),
             collector: Collector::None,
             carriers: std::array::from_fn(|_| None),
@@ -220,6 +234,8 @@ impl Runtime {
     }
     fn finish(&mut self, slot: usize, complete: bool, keep_metric: bool) {
         if let Some(mut carrier) = self.carriers[slot].take() {
+            let (held, distance) = if keep_metric { (0., 0.) } else { (self.held[slot], self.distance[slot]) };
+            self.stat_events.push(StatEvent::TrickEnd { id: carrier.scorable.id, success: complete, announced: carrier.announced, held, distance });
             if complete {
                 carrier.complete(self.data.unannounced_factor);
                 if self.collector == Collector::Air {
@@ -442,6 +458,10 @@ impl Runtime {
         self.stance
     }
     pub fn advance(&mut self, f: Frame) -> Result<(), String> {
+        // Nothing drains them without the career stats (tests, tools): keep the list bounded.
+        if self.stat_events.len() > 256 {
+            self.stat_events.clear();
+        }
         let bailing = f.category == FilteredCategory::Wipeout;
         if bailing && !self.was_bailing {
             self.bail_seq = self.bail_seq.saturating_add(1);
@@ -498,6 +518,9 @@ impl Runtime {
                 self.finish(slot, complete, false);
             }
             if self.collector == Collector::Air {
+                if complete && self.body_flip_count != 0 {
+                    self.stat_events.push(StatEvent::BodyFlips(self.body_flip_count.unsigned_abs()));
+                }
                 if complete {
                     for (i, reward) in self.air_metrics.into_iter().enumerate() {
                         // Skate 3 ExitAir82DA86B4..86F4 credits built-in metric
@@ -662,6 +685,9 @@ impl Runtime {
             {
                 // 82DA8EB8 retains signed +2348 after the grab/flip is released.
                 let count = if f.front_flip { 1 } else { -1 };
+                if self.body_flip_count == 0 {
+                    self.stat_events.push(StatEvent::BodyFlipAttempt);
+                }
                 if count != self.body_flip_count {
                     self.body_flip_count = count;
                     self.modified_trick = true;

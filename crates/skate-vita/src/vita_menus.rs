@@ -58,6 +58,8 @@ const DIFFICULTY: &str = "ID_GAMESETTINGS_DIFFICULTY_OPTIONS";
 const SFX_VOLUME: &str = "ID_GAMESETTINGS_SFXVOLUME";
 /// Retail's Minimap row (settings +158, default on): the HUD minimap (retail_hud.rs).
 const MINIMAP: &str = "ID_GAMESETTINGS_MINIMAP_TOGGLE";
+/// Retail's Units row (default metric): the loading screen's Stats panel distances.
+const UNITS: &str = "ID_GAMESETTINGS_UNITS_TOGGLE";
 const REAR_TOUCH: &str = "VITA_REAR_TOUCH";
 const DPAD_BUMPERS: &str = "VITA_DPAD_BUMPERS";
 const FRONT_TOUCH: &str = "VITA_FRONT_TOUCH";
@@ -243,10 +245,12 @@ pub fn register(registry: &mut MenuRegistry, settings: &Settings) {
     let traffic: Vec<&str> = TRAFFIC.iter().map(|t| t.0).collect();
     let pedestrians: Vec<&str> = PEDESTRIANS.iter().map(|t| t.0).collect();
     let difficulty: Vec<String> = ["EASY", "NORMAL", "HARDCORE"].iter().map(|l| format!("ID_GAMESETTINGS_DIFFICULTY_{l}")).collect();
-    let rules: [(&str, ValueRule); 13] = [
+    let units = skate_core::menu_values::retail_rule(UNITS).unwrap_or_else(toggle);
+    let rules: [(&str, ValueRule); 14] = [
         (DIFFICULTY, cycle(&difficulty.iter().map(String::as_str).collect::<Vec<_>>())),
         (SFX_VOLUME, ValueRule::retail_slider()),
         (MINIMAP, toggle()),
+        (UNITS, units),
         (REAR_TOUCH, toggle()),
         (DPAD_BUMPERS, toggle()),
         (FRONT_TOUCH, toggle()),
@@ -281,6 +285,7 @@ pub fn write_settings(registry: &mut MenuRegistry, s: &Settings) {
         (DIFFICULTY, int(difficulty)),
         (SFX_VOLUME, SettingValue::Float(f64::from(s.volume.min(10)) / 10.0)),
         (MINIMAP, flag(s.minimap)),
+        (UNITS, flag(s.imperial)),
         (REAR_TOUCH, flag(c.rear_touch_bumpers)),
         (DPAD_BUMPERS, flag(c.dpad_bumpers)),
         (FRONT_TOUCH, flag(c.front_touch_thumbs)),
@@ -310,6 +315,7 @@ pub fn read_setting(registry: &MenuRegistry, id: &str, s: &mut Settings) -> bool
         DIFFICULTY => s.difficulty = [Difficulty::Easy, Difficulty::Normal, Difficulty::Hardcore][index(3) as usize],
         SFX_VOLUME => s.volume = (v * 10.0).round().clamp(0.0, 10.0) as u8,
         MINIMAP => s.minimap = on,
+        UNITS => s.imperial = on,
         REAR_TOUCH => s.controls.rear_touch_bumpers = on,
         DPAD_BUMPERS => s.controls.dpad_bumpers = on,
         FRONT_TOUCH => s.controls.front_touch_thumbs = on,

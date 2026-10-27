@@ -186,6 +186,10 @@ pub(crate) struct Shared {
     /// applies to the new session.
     pub teleport: Option<[[f32; 4]; 4]>,
     pub score: skate_sim::live::Score,
+    /// The career stats totals (loaded by the main thread at boot; the sim thread copies the session's when they
+    /// change, the main thread writes them when `career_changed`).
+    pub career: skate_core::career_stats::CareerStats,
+    pub career_changed: bool,
     pub state_id: u32,
     /// The session marker overlay's state.
     pub marker: skate_sim::MarkerView,
@@ -228,6 +232,11 @@ pub(crate) fn sim_thread(shared: &Mutex<Shared>) {
             s.loading = true;
             s.reload = false;
         }
+        // The last world's recordings go before the next world loads (they are of no use in it): the instant
+        // replay's keys are tens of MB of small blocks spread through the heap, and with them still held a district's
+        // 7.4 MB index found no free piece that large (DownTown to Industrial, streaming benchmark).
+        crate::session_replay::clear();
+        crate::world_replay::clear();
         let started = Instant::now();
         let (world, difficulty) = {
             let s = shared.lock().unwrap();
@@ -343,6 +352,9 @@ pub(crate) fn sim_thread(shared: &Mutex<Shared>) {
         }
         // Manual session markers: LB shows the prompt, LB + D-pad down places, LB +
         // D-pad up held returns (not in the scripted soak, whose pad is a recording).
+        // The career stats count from the saved totals (not in the scripted soak, whose pad is a recording).
+        #[cfg(not(feature = "soak"))]
+        session.start_career_stats(shared.lock().unwrap().career.clone());
         #[cfg(not(feature = "soak"))]
         if let Err(e) = session.set_session_markers(true) {
             println!("session markers unavailable: {e}");
@@ -410,6 +422,7 @@ fn run_session(shared: &Mutex<Shared>, input: &Input, session: &mut Session, mut
         {
             let mut s = shared.lock().unwrap();
             if s.reload {
+                publish_career(&mut s, session);
                 crate::retail_audio::silence();
                 return;
             }
@@ -654,6 +667,7 @@ fn run_session(shared: &Mutex<Shared>, input: &Input, session: &mut Session, mut
                 max_this_second = 0;
             }
             if s.reload {
+                publish_career(&mut s, session);
                 return;
             }
         }
@@ -668,6 +682,7 @@ fn run_session(shared: &Mutex<Shared>, input: &Input, session: &mut Session, mut
             s.state = session.state_name();
             s.animation = session.animation_name().unwrap_or("-").to_owned();
             s.speed = session.board().1;
+            publish_career(&mut s, session);
             drop(s);
             max_this_second = 0;
             second = Instant::now();
@@ -691,6 +706,14 @@ fn run_session(shared: &Mutex<Shared>, input: &Input, session: &mut Session, mut
         if next > now {
             std::thread::sleep(next - now);
         }
+    }
+}
+
+/// The session's career stats totals, when they changed, for the main thread to save.
+fn publish_career(s: &mut Shared, session: &mut Session) {
+    if let Some(stats) = session.changed_career_stats() {
+        s.career.clone_from(stats);
+        s.career_changed = true;
     }
 }
 

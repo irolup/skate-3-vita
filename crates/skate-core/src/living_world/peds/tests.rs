@@ -671,3 +671,41 @@ fn reachable_recipes_hold_every_look_a_census_spawn_can_get() {
         assert!(c.reachable_recipes(&o).contains(&c.choose("aletown", seed, &o).unwrap().recipe));
     }
 }
+
+/// A seated avoid that keeps the seat (SitSmall / ReturnToSit, `avoid::seated`): the clip plays out of the held sit
+/// cycle and the sit sequence goes on from there (held again until released, then the stand-up).
+#[test]
+fn a_seated_step_avoid_returns_to_the_held_sit_cycle() {
+    use super::skater_contact::ReactionStep;
+    let (_, mut set, mut clips) = fixture();
+    let r = |c: &str| vec![RemapClip { clip: c.into(), windows: vec![] }];
+    for (name, frames, looping) in [("TOSIT", 31, false), ("SITCYC", 31, true), ("TOSTAND", 31, false), ("FLINCH", 31, false)] {
+        clips.insert(name.into(), clip(name, frames, 0.0, 0.0, looping, 0.0, vec![]));
+    }
+    set.entries.insert("Stand2Sit".into(), r("TOSIT"));
+    set.entries.insert("SitIdleCyc".into(), r("SITCYC"));
+    set.entries.insert("Sit2Stand".into(), r("TOSTAND"));
+    set.entries.insert("SitAvoidSmallFront".into(), r("FLINCH"));
+    let step = |anim, cycle| ReactionStep { anim, mirror: false, blend: 0.1, cycle };
+    let mut p = PedAnimPlayer::new(&set, 3).unwrap();
+    assert!(p.react(&set, vec![step("Stand2Sit", false), step("SitIdleCyc", true), step("Sit2Stand", false)], f32::INFINITY));
+    let dt = 1.0 / 60.0;
+    let run = |p: &mut PedAnimPlayer, seconds: f32| {
+        for _ in 0..(seconds / dt) as usize {
+            p.step(dt, &set, &clips);
+        }
+    };
+    run(&mut p, 2.0);
+    assert_eq!(p.reaction_anim(), Some("SitIdleCyc"));
+    let mut steps = vec![step("SitAvoidSmallFront", false)];
+    steps.extend(p.remaining_steps());
+    assert!(p.interrupt(&set, steps, f32::INFINITY));
+    assert_eq!(p.reaction_anim(), Some("SitAvoidSmallFront"));
+    run(&mut p, 1.5);
+    assert_eq!(p.reaction_anim(), Some("SitIdleCyc"), "back in the held sit cycle");
+    run(&mut p, 3.0);
+    assert_eq!(p.reaction_anim(), Some("SitIdleCyc"), "still held");
+    p.release_hold();
+    run(&mut p, 0.2);
+    assert_eq!(p.reaction_anim(), Some("Sit2Stand"));
+}

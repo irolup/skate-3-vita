@@ -18,7 +18,7 @@ scratch=${ORACLE_REF_SCRATCH:-$root/target/oracle-reference/src}
 target=${ORACLE_REF_TARGET:-$root/target/oracle-reference/target}
 
 commit=$(git -C "$ref" rev-parse --short HEAD)
-[ "$commit" = "0947dea5" ] || echo "warning: reference is at $commit, PROVENANCE.md pins 0947dea5" >&2
+[ "$commit" = "8df32c51" ] || echo "warning: reference is at $commit, PROVENANCE.md pins 8df32c51" >&2
 
 mkdir -p "$scratch"
 rsync -a --delete --exclude target --exclude .git "$ref/" "$scratch/"

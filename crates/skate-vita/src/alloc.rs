@@ -184,8 +184,18 @@ fn failed(size: usize) {
 const SMALL: usize = 512;
 const LARGE: usize = 4096;
 const CLASSES: usize = SMALL / 16 + (LARGE - SMALL) / 64;
-/// The most blocks a thread keeps per class (a thread that stops leaves them cached).
+/// The most blocks a thread keeps per class (a thread that stops leaves them cached), and at most this many bytes of
+/// them: 128 blocks of every class let one thread cache up to 35 MB. Blocks one thread allocates and another frees
+/// (the tile loader's, freed by the main thread) filled the main thread's lists of the big classes, and DownTown's
+/// small blocks grew 86 -> 124 MB beside 159 MB of large ones until a 194 KB block no longer fitted the 304 MB heap
+/// (the streaming benchmark at 24 m/s). Classes up to 512 bytes keep their 128.
 const KEEP: u32 = 128;
+const KEEP_BYTES: usize = 64 << 10;
+
+#[inline]
+fn keep(slot: usize) -> u32 {
+    ((KEEP_BYTES / slot_size(slot)) as u32).clamp(16, KEEP)
+}
 
 #[inline]
 fn class_of(size: usize) -> usize {
@@ -316,7 +326,7 @@ unsafe impl GlobalAlloc for Cached {
         #[cfg(feature = "mem-log")]
         tags::small(-(slot_size(slot) as isize));
         let kept = LISTS.try_with(|l| {
-            if l.count[slot].get() >= KEEP {
+            if l.count[slot].get() >= keep(slot) {
                 return false;
             }
             unsafe { *(p as *mut *mut u8) = l.head[slot].get() };
@@ -358,6 +368,15 @@ unsafe impl GlobalAlloc for Cached {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn caches_keep_at_most_their_bytes_and_all_small_classes_keep_128() {
+        assert_eq!(keep(slot_of(&Layout::from_size_align(16, 8).unwrap())), KEEP);
+        assert_eq!(keep(slot_of(&Layout::from_size_align(512, 16).unwrap())), KEEP);
+        assert_eq!(keep(slot_of(&Layout::from_size_align(4096, 8).unwrap())), 16);
+        let worst: usize = (0..SLOTS).map(|s| keep(s) as usize * slot_size(s)).sum();
+        assert!(worst < 10 << 20, "{worst}");
+    }
 
     #[test]
     fn classes_cover_every_small_size_and_round_up() {

@@ -140,7 +140,8 @@ fn stock_skater_startup_builds_the_graphs_and_physical_body_from_the_same_rig() 
     .unwrap();
     assert_eq!(physics.ticks, 1);
     assert!(camera.simulation_rate_requests.is_empty());
-    assert_eq!(physics.clock.period(), normal_period, "camera slow motion is not applied (retail shows none, 2026-10-23)");
+    // A slower request applies (82857EC8); the stock graph only sends one with the controller's subject (doc 21).
+    assert!(physics.clock.period() > normal_period);
     assert_eq!(physics.settings.step.simulation.time_step, physical_step);
     assert_eq!(skater.player_input.processed.timestep_2604, physical_step);
     //Ctor does not publish Ground before the initial input reset. The stock

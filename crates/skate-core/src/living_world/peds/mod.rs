@@ -1,26 +1,5 @@
-//! Pedestrian body (doc 26, peds milestone M2): which entity / model a census spawn becomes, the
-//! ped animation player and the foot events the audio reads; navigation (milestone M3): the
-//! NavPower navmesh (`nav`), retail's wander goal and avoidance (`wander`), the mod crosswalk
-//! rule's walk lights (`crosswalk`). Pure and engine-independent (no
-//! ECS, no I/O); `skate-data::ped_anim` fills the data types from the user's export, the game
-//! (`skate-game::living_world::peds`) hosts it.
-//!
-//! Retail reference (TU3, addresses are evidence only):
-//! - entity inside the census category: `sub_826B8B88` after the category roll; the draw is
-//!   `sub_826BB058` (world RNG u32 x 2^-32, `0x822F88F4`), the index
-//!   `trunc(draw x 100) % entities.len()` (`0x820ED57C` = 100) [code];
-//! - model tints: `sub_827B4170`: one rand `r`, `secondary_colours[r % na]` (`tints_a`) and
-//!   `chassis_colours[r % nb]` (`tints_b`) [code]; the ped shaders recolour the atlas's mask
-//!   texels with them (`colorize`) [code, shader];
-//! - clips: `PedestrianSkeletonPres.abin`, additive over its `PEDESTRIAN_RIG_TPOSE` pose record
-//!   (the clips hold 6 of the rig's 10 parts: bones 0..=26) [data];
-//! - foot plants: the clips' `LEFTTOEDOWN` / `RIGHTTOEDOWN` attributes (phase windows), the
-//!   body falls `BODYFALLTYPE` (value windows) [data]; retail's audio reads them as `S+74` /
-//!   `S+73` and `S+76` (`world-ped-audio.md`).
-//!
-//! Multiplayer: a ped's look is a pure function of its spawn record (category + seed) and the
-//! catalog; its animation steps once per world tick from that seed, so the state follows from
-//! the spawn record and the tick.
+//! Pedestrian body and navigation core: entity / model choice, animation, foot events, navmesh, wander. Pure.
+//! Retail reference (826B8B88, 826BB058, 827B4170): docs/hails-additions/26f-living-world-peds.md#ped-core
 
 pub mod anim;
 pub mod brain;
@@ -28,6 +7,7 @@ pub mod chase;
 pub mod chase_alert;
 pub mod conversation;
 pub mod perception;
+pub mod avoid;
 pub mod takedown;
 pub mod choice;
 pub mod colorize;

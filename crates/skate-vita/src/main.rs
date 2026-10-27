@@ -4,6 +4,8 @@ mod app;
 mod autoplay;
 #[cfg(all(target_os = "vita", feature = "soak"))]
 mod soak;
+#[cfg(all(target_os = "vita", feature = "stream-bench"))]
+mod stream_bench;
 #[cfg(target_os = "vita")]
 mod lab;
 #[cfg(target_os = "vita")]
@@ -31,6 +33,7 @@ mod called_trails;
 #[cfg(target_os = "vita")]
 mod colour_grade;
 mod settings;
+mod career;
 mod vita_menus;
 mod trick_demo;
 mod skin;

@@ -4,7 +4,7 @@ These are the reference repositories this project copies from or follows. Pinned
 
 | Reference | URL | Commit |
 |---|---|---|
-| skate-3-rust-engine | https://github.com/SK8-ENGINE/skate-3-rust-engine | `0947dea5`, a commit of pull request #52 (copied at `cb79689`, resynced 2026-10-08 to `b3c9679`, 2026-10-13 to `2e16697`, 2026-10-17 to `618e824`, 2026-10-19 to `fad5aae`, 2026-10-21 to `b110bab`, 2026-10-23 to `74c124a` and 2026-10-24 to `36018e19`, then `0947dea5`: see **Resync to b3c9679**, **Resync to 2e16697**, **L1 resync to PR #52 head `618e824`**, **L1 resync to PR #52 head `fad5aae`**, **Resync to PR #52 head `b110bab`**, **Resync to PR #52 head `74c124a`** and **Resync to PR #52 head `36018e19`** (steps 6 and 7: `0947dea5`)) |
+| skate-3-rust-engine | https://github.com/SK8-ENGINE/skate-3-rust-engine | `8df32c51`, a commit of pull request #52 (copied at `cb79689`, resynced 2026-10-08 to `b3c9679`, 2026-10-13 to `2e16697`, 2026-10-17 to `618e824`, 2026-10-19 to `fad5aae`, 2026-10-21 to `b110bab`, 2026-10-23 to `74c124a`, 2026-10-24 to `36018e19`, then `0947dea5`, and 2026-10-26 to `8df32c51`: see **Resync to b3c9679**, **Resync to 2e16697**, **L1 resync to PR #52 head `618e824`**, **L1 resync to PR #52 head `fad5aae`**, **Resync to PR #52 head `b110bab`**, **Resync to PR #52 head `74c124a`** and **Resync to PR #52 head `36018e19`** (steps 6 and 7: `0947dea5`) and **Resync to PR #52 head `8df32c51`**) |
 | cargo-vita | https://github.com/vita-rust/cargo-vita | `c6bbf22` |
 | vitasdk-sys | https://github.com/vita-rust/vitasdk-sys | `cee132f` |
 | examples | https://github.com/vita-rust/examples | `5ef9e08` |
@@ -770,3 +770,53 @@ Packs (`vita-bake maps`): MegaPark 13.4 MB (279 draws, 59k triangles, 74k vertic
 | skate-ui `fe/menu_stage.rs` `register_teleports` | upstream `register_teleports` over (kind, id) pairs | ours: World rows as well as locations |
 
 The skate.Park tab's five rows (Stadium, PCU Training Full and Basic, Team HQ, Downtown Full) were greyed since `74c124a` (left out with no layouts on the Vita). Every park loads its Fullpark layout (owner), so PCU Training - Basic loads the Fullpark too. ui.pak rebaked (74 teleports). Vita (all four parks through the Challenge Map, the Stadium also from University's teleporter): loads 4.3 to 10.2 s; 60 fps median everywhere; draws median 238 in the Stadium (the bowl stays in view, CPU 11 ms), 46 to 97 elsewhere; heap peak 160.5 MB; checked by the user. Owner (2026-10-24): retail does not offer these parks from the start; they stay open on the Vita until the career (Phase 5) brings their unlocks.
+
+## Resync to PR #52 head `8df32c51`, step 1: simulation and living world (2026-10-26)
+
+The PR moved 47 commits after `0947dea5`; about half are PC-only (setup speed, build stamps, the fixed-step executor, the PC overlay, custom models, mods, docs and skills) and are not taken.
+
+| Part | What | Edits |
+|---|---|---|
+| skate-sim `camera/graph.rs`, `physics/{frame, clock}.rs`, `tests/physics_startup.rs` | upstream `8bd84c24`: retail's subject gate on the SlowMotionController's Update (no subject, no slower request, no time passes), the rate requests applied again | the test `without_its_subject_the_controller_neither_posts_nor_advances`; our step 1 of `36018e19` (requests dropped) undone |
+| skate-core `living_world/{air_steer, ground_steer}.rs`, `living_world/peds/{anim, avoid, brain, mod, plugins, tests}.rs` | upstream at `8df32c51` (ours were `0947dea5`'s, comments aside): NPC air steer and lane rejoin (used by the simulated NPC tier, not ported: no effect on the Vita), seated peds' SkaterAvoidance (`avoid.rs`), the bench water rule at 0.8 m | verbatim |
+| skate-sim `living_world/peds.rs` | upstream `46e6266b`: a seated ped flinches or jumps up when a skater comes at it (closest approach within 10 m / 0.75 s / 3 m, the escape point on the navmesh) | the patch applied to ours; the observers are our slice |
+| skate-sim `physics/prop_dynamics.rs` | upstream `1db9eb41`: skater mesh contacts as rows in the prop solve (retail b617; the volume a body with its velocity and mass, the board side 8 kg), a closing touch wakes a resting prop, the impulse push only with `skater_rows` off | ours always tests the prop's mesh (no box fallback), so `npc_skater_bench_push_is_deterministic` checks the impulse with the rows off and the rows' determinism; `PROP_PUSHED` diagnostics not taken |
+
+Not taken: NPC Skater Physics and Ped Speech on by default (the simulated tier is not ported; speech waits for Phase 4), the ped material (render), the custom model swap fixes (no player swap on the Vita). Checks: reference built from `8df32c51`, its 20 Course dumps bit-identical to `oracle/ref`; the port 20/20, no-fma 20/20; skate-core 1211 passed, skate-sim as before; DownTown `PERF_HASH bd5e031e28835b47` (was `77fc1129ae1e3070`: the prop rows and the seated peds), 0.76 to 0.79 ms a tick (as before).
+
+## Resync to PR #52 head `8df32c51`, steps 2 to 4: replay cameras, career stats, loading screen, menus (2026-10-26)
+
+| Part | What | Edits |
+|---|---|---|
+| skate-vita `replay_camera.rs` `constrain` | upstream `e1ef4c59` (`replay/camera_collision.rs`): the camera sweep is one-sided, a surface stops a move only into its front face (a cut from the skater's feet is not pulled down, a camera under the ground can come back up) | the filter wraps our sweep; two tests |
+| skate-core `career_stats.rs`, `hall_of_meat.rs` | upstream at `8df32c51` (`86c59e5c`, `a34b0bfe`, `2fde61a8`, `2b427cbf`): the 65-row career table, the push latch, the Hall of Meat bail record, injuries and body tweak poses | verbatim; `pub mod` lines in `lib.rs` |
+| skate-core `scoring/catalog.rs`, `fe_fade.rs`, `tips_loader.rs` | upstream at `8df32c51`: the categories the stats read; the FE fade at 60 ticks a second (`8817f3a9`); every open clears "shown before" and the release comes 2 updates after the close (`1e377aad`) | verbatim (ours were `0947dea5`'s, comments aside) |
+| skate-sim `scoring_runtime.rs` | upstream's `StatEvent` rows (trick ends with their time and distance, body flips) | three-way merge, clean |
+| skate-sim `physics/settings.rs` | upstream's Hall of Meat tuning and BodyTweak poses from the collections | three-way merge; `bevy::log::warn!` → `tracing::warn!` |
+| skate-sim `career_stats.rs` (new) | upstream `career_stats_host.rs` `track`, `hits` and `event`: time played, distance on and off the board, skitching, pushes, wipeouts and bail distance, the Hall of Meat rows, ped hits by entity key | Bevy-free and without the file: `Session::start_career_stats` / `changed_career_stats`, run after the living world in `Session::step` (off for the oracle); the ped hits are this step's `PedEvent::Hit` by the player (`LivingWorldState::player_ped_hits`); a map change is a new session, so no transition check |
+| skate-data `menu_tables.rs` | upstream's `StatRow` and `career_stats` (serde default) | the struct and field only: the extractor stays in the reference checkout (`tools/menu-tables` builds against it) |
+| skate-ui `fe/tips_loader_host.rs`, `fe/menu_stage.rs` | upstream `57ed60e9`, `8817f3a9`: the Stats panel rows (`panel_rows` as `stat_rows`), GetStats shuffled on every call, no SD screen edge offset, the autosave layer's corner wheel while the loading screen is up | the totals and the Units setting come from the game (`MenuStage::set_career_stats`); no mods' lines, holds or timing (`LoadingMods`) |
+| skate-ui `fe/menu_stage.rs` `show_popup` | upstream `d64617ce`, `4548d316`: the popup shown log line and the small-popup-with-options warning | log lines in the stage log; our cheat and limit popups were already standard popups |
+| skate-vita `career.rs` (new), `lab.rs`, `app.rs`, `fe_menus.rs` | upstream's `settings/career-stats.json` format at `ux0:data/SKATEVITA/career-stats.json` | the main thread loads it at boot and writes it every 30 s when changed and on quit; the sim thread copies the session's totals once a second |
+| skate-vita `settings.rs`, `vita_menus.rs` | upstream's Units row enabled (removed from `NO_EFFECT_YET`) | settings version 11 adds the units byte (older files read metric); the row uses retail's Metric / Imperial rule |
+
+Not taken: the loading screen for PC overlay loads, mods' `sdk.loading`, the ped material (render), the replay editor's Follow eye frame and keyed-clip camera pick (our editor's keys differ). Checks: parity 20/20 and no-fma 20/20; DownTown `PERF_HASH bd5e031e28835b47` (unchanged: no stats in the bench); `menu-tables.json` written by the reference's `8df32c51` extractor (65 rows, 47 enabled, as upstream's test) and ui.pak rebaked; the loading screen stage test shows Stats rows on the b110 menu set.
+
+## Optimization phase before Phase 5 (2026-10-26)
+
+Ours, measured with the new streaming benchmark (`skate-vita` feature `stream-bench`: the camera flies a loop through each district at 12 and 24 m/s, each leg without and with the change).
+
+| Part | What |
+|---|---|
+| skate-vita `district_stream.rs` | tiles are wanted and ranked by the nearer of the camera and where it will be in 1.5 s (at most 40 m ahead): far tiles missing in 9-31% of frames before, 0-0.9% after; queued uploads go with a restarted district |
+| skate-sim `collision_window.rs` | a background window is built around where the deck will be in 1.5 s (at most 14 m ahead; the desktop oracle's windows are unchanged) |
+| skate-vita `packs.rs` | a pack is hashed again only when it changed (`verified.txt`: path, length, time): 67 s of card reads at every start, and each district's 30-100 s at its loads, beside the streaming |
+| skate-vita `alloc.rs` | a thread keeps at most 64 KiB of free blocks per size class (classes up to 512 bytes keep their 128) |
+| skate-vita `district_stream.rs`, vita-pack `district.rs` | lean reads: a tile's middle and far levels (side by side in the pack) come in one read and stay while it is near, the near level goes beyond 160 m, levels on their way are not read again, and a tile's textures are read in runs (neighbours within 32 KB, at most 512 KB a read). The card's small reads were slow while the tiles, the collision windows and the audio shared it (holes in front of the camera in Industrial); the streaming benchmark's loader reads at 24 m/s in DownTown: 1088 before, 374 after |
+| skate-vita `district_stream.rs`, `retail_audio.rs` | the tile loader runs on core 0 or 2 just below the main thread (pinned to core 2 it starved beside the retail audio render); the retail audio plays at most 16 voices at once (owner; 20 took 5.2 ms of each 5.33 ms block on Industrial's roads) |
+| vita-render `district.rs`, skate-vita `district_stream.rs` | beyond 160 m a tile's draws of at most 64 triangles are not submitted (owner; about a fifth of DownTown's draws in its dense streets); the streamer plans (wanted tiles, drops, the loader's view) every 4th frame and drops at most about 1 ms of tile levels a frame. Dense DownTown: main thread 15.8 -> 13.7 ms a frame, stutters 5.5 -> 2.5 a second |
+| skate-vita `app.rs`, vita-render `scene.rs` | diagnostics: `MAIN` (the main thread's frame split each second) and `SCENE` (the scene draw's passes every 10 s) log lines |
+| skate-vita `app.rs` | diagnostics: the RENDER line counts frames shown more than 20 ms after the last and gives the slowest frame's CPU time and the streamer's part of it |
+| skate-vita `lab.rs` | the replay recordings are cleared before the next world loads (a district's 7.4 MB index found no free piece with the last world's replay keys still spread through the heap) |
+| skate-data `io_gate.rs`, `vfs.rs`, skate-audio `stream.rs` | diagnostics: card reads counted by source (`CARD` log line every 10 s with the district stream line) |
+| skate-core `replay_buffer.rs` | edit to the copied file: a key is allocated at its exact size (the moved translations and scales were not counted, so most skeleton keys doubled), and a key's overhead is counted as 64 bytes. The Vita's instant replay held about twice its 24 MB budget; DownTown ran out of heap in the benchmark |

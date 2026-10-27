@@ -25,6 +25,9 @@ use std::sync::Mutex;
 pub const VERSION: u32 = 2;
 /// Reads whose gap is at most this many bytes are merged into one.
 const MERGE_GAP: u64 = 8 * 1024;
+/// Textures closer than this in the file are read together (`DistrictFile::read_textures`).
+const TEXTURE_GAP: u64 = 32 * 1024;
+const TEXTURE_RUN: u64 = 512 * 1024;
 
 /// One render tile: its cell and where its levels of detail are (offset, size; size 0 = none).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -322,11 +325,18 @@ impl DistrictFile {
     /// A foreground read (`skate_data::io_gate`): the background pack checks,
     /// which read whole packs, wait while the game reads collision or render data.
     pub fn read_range(&self, offset: u64, len: u32) -> Result<Vec<u8>, String> {
+        self.read_range_for("district", offset, len)
+    }
+
+    /// [`Self::read_range`] counted for `source` (`skate_data::io_gate::account`).
+    pub fn read_range_for(&self, source: &str, offset: u64, len: u32) -> Result<Vec<u8>, String> {
         let _foreground = skate_data::io_gate::foreground();
+        let started = std::time::Instant::now();
         let mut out = vec![0u8; len as usize];
         let mut file = self.file.lock().map_err(|_| "district file lock poisoned".to_string())?;
         file.seek(SeekFrom::Start(self.data_start + offset)).map_err(|e| e.to_string())?;
         file.read_exact(&mut out).map_err(|e| e.to_string())?;
+        skate_data::io_gate::account(source, len as usize, started.elapsed().as_micros() as u64);
         Ok(out)
     }
 
@@ -336,12 +346,43 @@ impl DistrictFile {
         if size == 0 {
             return Ok(Vec::new());
         }
-        self.read_range(offset, size)
+        self.read_range_for("district tiles", offset, size)
+    }
+
+    /// Textures of the table in file order, neighbours within `TEXTURE_GAP` merged into one read each (a tile's
+    /// textures mostly lie together; the card's small reads are slow when the streaming, the collision and the audio
+    /// share it). Returned in the order asked.
+    pub fn read_textures(&self, entries: &[(u64, u32)]) -> Result<Vec<crate::texture::Texture>, String> {
+        let mut order: Vec<usize> = (0..entries.len()).collect();
+        order.sort_by_key(|&k| entries[k].0);
+        let mut out: Vec<Option<crate::texture::Texture>> = (0..entries.len()).map(|_| None).collect();
+        let mut i = 0;
+        while i < order.len() {
+            let start = entries[order[i]].0;
+            let mut end = start + u64::from(entries[order[i]].1);
+            let mut j = i + 1;
+            // At most `TEXTURE_RUN` a read: one buffer of a few MB would need that much in one piece of the heap.
+            while j < order.len() && entries[order[j]].0 <= end + TEXTURE_GAP && entries[order[j]].0 + u64::from(entries[order[j]].1) - start <= TEXTURE_RUN {
+                end = end.max(entries[order[j]].0 + u64::from(entries[order[j]].1));
+                j += 1;
+            }
+            let run = self.read_range_for("district textures", start, (end - start) as u32)?;
+            for &k in &order[i..j] {
+                let (o, s) = entries[k];
+                let mut r = Reader::new(&run[(o - start) as usize..(o - start) as usize + s as usize]);
+                let t = crate::texture::Texture::read(&mut r)?;
+                r.done()?;
+                t.validate()?;
+                out[k] = Some(t);
+            }
+            i = j;
+        }
+        Ok(out.into_iter().flatten().collect())
     }
 
     /// A texture of the table.
     pub fn read_texture(&self, entry: (u64, u32)) -> Result<crate::texture::Texture, String> {
-        let bytes = self.read_range(entry.0, entry.1)?;
+        let bytes = self.read_range_for("district textures", entry.0, entry.1)?;
         let mut r = Reader::new(&bytes);
         let t = crate::texture::Texture::read(&mut r)?;
         r.done()?;
@@ -377,7 +418,7 @@ impl ClusterSource for DistrictFile {
                 end = end.max(o + u64::from(s));
                 j += 1;
             }
-            let run = self.read_range(start, (end - start) as u32)?;
+            let run = self.read_range_for("district collision", start, (end - start) as u32)?;
             for &k in &order[i..j] {
                 let (o, s) = at(k)?;
                 out[k] = run[(o - start) as usize..(o - start) as usize + s as usize].to_vec();

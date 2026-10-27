@@ -275,6 +275,11 @@ pub(crate) struct PropSolverSettings {
     /// `82C56BA0`; spawns `82C4E940` -> `82E0E338` give the same pair, trace .local/research/prop-types). The on-foot
     /// walker's queries reject types 13 and 14, so only the heavier props are ground for it.
     pub walkable_mass: f32,
+    /// true = skater mesh contacts are rows in the prop's row solve, against its floor friction (retail: one shared
+    /// solve, 82AE1AE8 / 82AE27D0, research b617; upstream 1db9eb41); false = the older impulse push (NOT RETAIL).
+    pub skater_rows: bool,
+    /// Mass (kg) of the board side of a skater row (our board solver's `board_mass`, 8).
+    pub board_row_mass: f32,
     /// Retail's ground contact reduction (`82779EB0`): coplanar contacts of a prop against the world keep at most four
     /// points (upstream `b110bab`..`74c124a`).
     pub ground_reduction: skate_core::physics::contact_reduction::ReductionRules,
@@ -295,6 +300,8 @@ impl Default for PropSolverSettings {
             bail_heavy_mass: 200.0,
             bail_blend: 0.5,
             walkable_mass: 5.5,
+            skater_rows: true,
+            board_row_mass: 8.0,
             ground_reduction: Default::default(),
         }
     }
@@ -848,6 +855,9 @@ pub(crate) struct PropDynamics {
     /// Pushers (actor ids, [`LOCAL_PUSHER`] for the local skater) bailing this tick (`set_bailing`): their contacts
     /// apply the bail clamp.
     bailing: Vec<u64>,
+    /// This tick's skater mesh contacts for the row solve (`PropSolverSettings::skater_rows`): prop index, manifold
+    /// (prop toward the skater volume), the volume's velocity, its mass and material.
+    skater_contacts: Vec<(usize, PrimitiveContactManifold, Vector3, f32, RetailContactMaterial)>,
     /// Pushers that are not a 75 kg skater (`set_actor_push_mass`): actor id, kg. Peds' body A (10 kg, b342).
     actor_push_mass: Vec<(u64, f32)>,
 }
@@ -1146,6 +1156,7 @@ impl PropDynamics {
             rail_bodies: Vec::new(),
             live_rail_bodies: Vec::new(),
             bailing: Vec::new(),
+            skater_contacts: Vec::new(),
             actor_push_mass: Vec::new(),
         };
         dynamics.reorder();
@@ -2405,6 +2416,7 @@ impl PropDynamics {
         self.prepare_streamed(world, layer);
         let time_step = self.step_simulation().time_step;
         self.apply_upright(time_step);
+        self.skater_contacts.clear();
         let push = skate_core::profile::scope("z_sp_push");
         // skate_vita (performance): the volumes' bounds once per step (upstream: per body and volume) and their
         // union: a body outside it can touch none of them (it skips them; the counters below run as before).
@@ -2458,9 +2470,22 @@ impl PropDynamics {
                     }
                     let pushes = self.stats.skater_pushes;
                     let push_mass = self.actor_push_mass.iter().find(|a| a.0 == actor).map(|a| a.1);
-                    let contact = self.push_from_skater(index, volume, &manifold, push_mass);
+                    let rows = self.tuning.solver.skater_rows && self.tuning.solver.row_solver;
+                    let contact = self.push_from_skater(index, volume, &manifold, push_mass, rows);
                     if self.stats.skater_pushes > pushes {
                         self.bodies[index].pushed_by = Some(actor);
+                    }
+                    // A bailing actor's contacts only clamp the prop (bail clamp below), so they add no rows.
+                    if rows && contact != SkaterContact::Separate && !self.bailing.contains(&actor) {
+                        let board = matches!(volume.body, skate_core::physics::board_step::CollisionBody::Board(_));
+                        let mass = if board { self.tuning.solver.board_row_mass } else { push_mass.unwrap_or(self.bodies[index].tuning.skater_push_mass) };
+                        // A closing touch wakes a resting prop (ours until retail's wake source is found, b617); the rows then
+                        // push it only as far as the contact and its floor friction allow.
+                        if contact == SkaterContact::Closing {
+                            self.bodies[index].wake();
+                            self.bodies[index].pushed_by = Some(actor);
+                        }
+                        self.skater_contacts.push((index, manifold, volume.motion.linear_velocity, mass, volume.material));
                     }
                     match contact {
                         SkaterContact::Closing => closing = true,
@@ -2710,6 +2735,7 @@ impl PropDynamics {
         volume: &BoardWorldVolume,
         manifold: &PrimitiveContactManifold,
         push_mass: Option<f32>,
+        rows: bool,
     ) -> SkaterContact {
         let tuning = self.bodies[index].tuning;
         // The overlap nudge stops once the volume has sat inside for
@@ -2745,7 +2771,8 @@ impl PropDynamics {
         } else {
             SkaterContact::Separate
         };
-        if strongest <= 0.0 {
+        // As skater rows (upstream 1db9eb41) the push is the row solve's, not this impulse.
+        if strongest <= 0.0 || rows {
             return contact;
         }
         // Momentum-style transfer: the skater shares its closing speed through
@@ -2964,7 +2991,32 @@ impl PropDynamics {
                 push_rows(&mut rows, &manifold, material, a, b);
             }
         }
-        let mut reactions = vec![RetailReactionCorrections::default(); count + 1];
+        // Skater mesh contacts (b617): the volume is body A with its own mass and velocity and a reaction slot of its
+        // own, the prop body B; only the prop's correction is used (the board solver handles the skater side).
+        let skaters = std::mem::take(&mut self.skater_contacts);
+        for (k, (index, manifold, velocity, mass, material)) in skaters.iter().enumerate() {
+            if !awake.contains(index) || *mass <= 0.0 {
+                continue;
+            }
+            let skater = RetailContactBodyState {
+                contact_body_id: u32::MAX - 1 - k as u32,
+                reaction_id: (count + 1 + k) as u32,
+                center_of_mass: manifold.points[0].a,
+                inverse_inertia_full: Vector3::ZERO,
+                inverse_inertia_split: Vector3::ZERO,
+                inverse_mass: 1.0 / mass,
+                state: ACTIVE_BODY,
+                force_acceleration: Vector3::ZERO,
+                torque_acceleration: Vector3::ZERO,
+                linear_velocity: *velocity,
+                angular_velocity: Vector3::ZERO,
+                kinetic_energy: 0.0,
+                cool_down: 0,
+            };
+            self.bodies[*index].contacts += 1;
+            push_rows(&mut rows, manifold, self.contact_material(*index, *material), skater, self.row_body(*index));
+        }
+        let mut reactions = vec![RetailReactionCorrections::default(); count + 1 + skaters.len()];
         solve_constraints(&mut rows, &mut [], &mut [], &mut reactions, iterations);
         for other in wake {
             self.bodies[other].wake();
@@ -3826,6 +3878,8 @@ mod tests {
         let (world, mut layer, mut dynamics) = fixture([0., REST_Y, 0.]);
         let mut table = PropTuningTable::default();
         table.default.board_push_speed = 0.8;
+        // The impulse push's cap (upstream 1db9eb41: the rows have no such cap).
+        table.solver.skater_rows = false;
         dynamics.set_tuning(table);
         let mut fastest = 0.0_f32;
         for tick in 0..60 {
@@ -5068,15 +5122,20 @@ mod tests {
     /// the result is identical bit for bit on a second run (seeded, ordered by actor id).
     #[test]
     fn npc_skater_bench_push_is_deterministic() {
-        let runs: Vec<Vec<(f32, f32)>> = (0..2)
-            .map(|_| {
-                let (world, mut layer, mut dynamics) = box_fixture([0., BENCH_REST_Y, 0.], BENCH_HALF);
-                npc_run(&mut dynamics, &world, &mut layer, -3.0, 5.0, 120, true)
-            })
-            .collect();
-        assert_eq!(runs[0], runs[1]);
-        let (end_prop, _) = *runs[0].last().unwrap();
-        assert!(end_prop > 0.5, "bench pushed along the line: x {end_prop}");
+        // skate_vita: our push always tests the prop's mesh, so the box fixture takes the rows (upstream's box fallback
+        // keeps the impulse): the impulse push's distance is checked with the rows off, the rows' determinism as well.
+        for skater_rows in [false, true] {
+            let runs: Vec<Vec<(f32, f32)>> = (0..2)
+                .map(|_| {
+                    let (world, mut layer, mut dynamics) = box_fixture([0., BENCH_REST_Y, 0.], BENCH_HALF);
+                    dynamics.set_tuning(PropTuningTable { solver: PropSolverSettings { skater_rows, ..Default::default() }, ..Default::default() });
+                    npc_run(&mut dynamics, &world, &mut layer, -3.0, 5.0, 120, true)
+                })
+                .collect();
+            assert_eq!(runs[0], runs[1]);
+            let (end_prop, _) = *runs[0].last().unwrap();
+            assert!(end_prop > if skater_rows { 0.2 } else { 0.5 }, "bench pushed along the line: x {end_prop} (rows {skater_rows})");
+        }
     }
 
     /// NPC volumes and the local player's both push in one step; the last actually pushing actor

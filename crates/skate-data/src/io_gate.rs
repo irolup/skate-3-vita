@@ -50,6 +50,33 @@ pub fn wait_background(max: Duration) {
     }
 }
 
+/// skate_vita (optimization phase): card reads by source since the last [`take_accounts`] (count, bytes, µs, slowest
+/// µs), for the device log.
+static ACCOUNTS: std::sync::Mutex<Vec<(String, [u64; 4])>> = std::sync::Mutex::new(Vec::new());
+
+/// Counts one card read of `bytes` that took `us` for `source`.
+pub fn account(source: &str, bytes: usize, us: u64) {
+    let Ok(mut accounts) = ACCOUNTS.lock() else { return };
+    let slot = match accounts.iter().position(|(s, _)| s == source) {
+        Some(i) => &mut accounts[i].1,
+        None => {
+            accounts.push((source.to_owned(), [0; 4]));
+            &mut accounts.last_mut().unwrap().1
+        }
+    };
+    slot[0] += 1;
+    slot[1] += bytes as u64;
+    slot[2] += us;
+    slot[3] = slot[3].max(us);
+}
+
+/// The reads counted since the last call, busiest (by time) first; the counts restart.
+pub fn take_accounts() -> Vec<(String, [u64; 4])> {
+    let mut out = ACCOUNTS.lock().map(|mut a| a.drain(..).collect::<Vec<_>>()).unwrap_or_default();
+    out.sort_by(|a, b| b.1[2].cmp(&a.1[2]));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

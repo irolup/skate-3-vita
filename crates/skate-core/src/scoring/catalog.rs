@@ -363,6 +363,13 @@ pub const LINKS: [(u16, i16, i16); 18] = [
 /// The ollie (`EScorableID` 128), the base of the late flips.
 pub const OLLIE: i16 = 128;
 
+/// Categories (+16, see [`category`]) the career stats read.
+pub const FLIP: usize = 2;
+pub const GRIND: usize = 5;
+pub const HANDPLANT: usize = 6;
+pub const MANUAL: usize = 8;
+pub const POWERSLIDE: usize = 9;
+
 /// Table row of a trick id, `None` outside 0..332.
 fn row(id: i16) -> Option<usize> {
     usize::try_from(id).ok().filter(|&i| i < IDENTIFIERS.len())

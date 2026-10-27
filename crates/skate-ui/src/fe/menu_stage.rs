@@ -300,6 +300,11 @@ pub struct MenuStage {
     load_up: bool,
     load_gone: bool,
     loading: bool,
+    /// The career stats table (menu tables `career_stats`; empty: no Stats panel), the game's totals and its Units
+    /// setting ([`Self::set_career_stats`]).
+    career_table: Vec<skate_data::menu_tables::StatRow>,
+    career_stats: skate_core::career_stats::CareerStats,
+    imperial: bool,
     cheats: skate_core::cheats::CheatRules,
     /// The cheats in effect (the game's flags, [`Self::set_cheats`]): entering a code toggles them.
     cheats_on: skate_core::cheats::CheatState,
@@ -379,7 +384,7 @@ fn boot_registration(stage: &mut Stage, fe: &mut FrontEnd, tables: Option<&MenuT
     }
     stage.call_path("_level0._root.SetPlatform", vec![text("0")], fe)?;
     stage.call_path("_level0._root.SetScreenSize", vec![text("1280"), text("720")], fe)?;
-    stage.call_path("_level0._root.SetScreenEdgeOffset", vec![text("136")], fe)?;
+    // No SetScreenEdgeOffset: retail sends its SD value "136" only without the HD flag (doc 31 "Screen edge offset").
     stage.call_path("_level0._root.UpdatePALMode", vec![text("false")], fe)?;
     Ok(names)
 }
@@ -464,6 +469,7 @@ impl MenuStage {
         let (mut data, loaded) = tables.as_ref().map_or_else(Default::default, |t| (t.to_menu_data(), true));
         let mut sub_options = tables.as_ref().map(|t| t.sub_options.clone()).unwrap_or_default();
         let mut settings_titles = tables.as_mut().map(|t| std::mem::take(&mut t.settings_titles)).unwrap_or_default();
+        let career_table = tables.as_mut().map(|t| std::mem::take(&mut t.career_stats)).unwrap_or_default();
         // The Challenge Map's tree, pictures and markers (vita-bake), when the movie is in the set.
         let map = read(CHALLENGE_MAP_DATA)
             .ok()
@@ -639,6 +645,9 @@ impl MenuStage {
             load_up: false,
             load_gone: false,
             loading: false,
+            career_table,
+            career_stats: Default::default(),
+            imperial: false,
             cheats: Default::default(),
             cheats_on: Default::default(),
             pending_entry: None,
@@ -1169,9 +1178,15 @@ impl MenuStage {
                         log.push(format!("open loading screen (FE {i})"));
                         fe.tips_loader.open = true;
                         fe.tips_loader.tips.open();
+                        // The Stats panel's rows (offline fetch sub_82607840); none = no Stats panel.
+                        let mut seed = fe.tips_loader.seed;
+                        let numbers = crate::fe::fe_language::NumberFormat::default();
+                        fe.tips_loader.stats = crate::fe::tips_loader_host::stat_rows(&self.career_stats, &self.career_table, fe.language, &numbers, self.imperial, &mut || crate::fe::tips_loader_host::lcg(&mut seed));
+                        fe.tips_loader.seed = seed;
                         self.load_up = false;
                         self.load_gone = false;
                         open_screen(stage, TIPS_LOADER_PATH, TIPS_LOADER, &mut fe)?;
+                        load_tag(stage, true, &mut fe, log);
                     }
                     Effect::Close(i) if Some(i) == loader => {
                         log.push(format!("close loading screen (FE {i})"));
@@ -1179,6 +1194,7 @@ impl MenuStage {
                         self.load_up = false;
                         self.load_gone = true;
                         close(stage, loader_id, &mut fe)?;
+                        load_tag(stage, false, &mut fe, log);
                     }
                     Effect::Close(i) if Some(i) == free => {
                         log.push(format!("close Free Play options (FE {i})"));
@@ -2014,6 +2030,13 @@ impl MenuStage {
         matches!(self.load.phase, LoadPhase::Opening | LoadPhase::Up | LoadPhase::Closing | LoadPhase::Closed)
     }
 
+    /// The career stats the loading screen's Stats panel shows from its next open, and Game Settings > Units (feet when
+    /// imperial).
+    pub fn set_career_stats(&mut self, stats: &skate_core::career_stats::CareerStats, imperial: bool) {
+        self.career_stats.clone_from(stats);
+        self.imperial = imperial;
+    }
+
     /// The session's Free Play values FE 34 opens with (Traffic, Pedestrians, A.I. Skaters).
     pub fn set_free_play(&mut self, values: skate_core::living_world::FreePlay) {
         self.free_play = values;
@@ -2136,11 +2159,16 @@ fn show_popup(
         log.push(format!("popup {popup} has no movie ({})", request.kind.template()));
         return Ok(());
     };
+    // small_popup reads no options and answers only B when cancelable (doc 31 "Popup kinds").
+    if request.kind == PopupKind::Small && !request.cancelable && !request.options.is_empty() {
+        log.push(format!("popup {popup} ({}) is small with options but not cancelable: no press can close it", request.callback));
+    }
     fe.popup.shown = Some(request.clone());
     set_state(stage, handle, 1, fe)?;
     show_screen(stage, handle, true, fe)?;
     sounds.push("core_popup".into());
     fe.popup.input_ready = true;
+    log.push(format!("popup {popup} shown ({}, screen {handle}, {})", request.kind.template(), request.callback));
     Ok(())
 }
 
@@ -2153,6 +2181,15 @@ fn flush_offline_profile(stage: &mut Stage, id: i32, fe: &mut FrontEnd) -> Resul
         set_state(stage, id, state, fe)?;
     }
     Ok(())
+}
+
+/// The autosave layer's corner wheel while the loading screen is up, as in the recomp's loads (doc 31 "Loading screen
+/// (FE 52)"). A menu set without the autosave layer has no such function; the load runs without the wheel.
+fn load_tag(stage: &mut Stage, on: bool, fe: &mut FrontEnd, log: &mut Vec<String>) {
+    let (path, args) = if on { ("_global.Load_EnableTag", vec![Value::Bool(true)]) } else { ("_global.Load_HideTag", Vec::new()) };
+    if let Err(e) = stage.call_path(path, args, fe) {
+        log.push(format!("{path}: {e}"));
+    }
 }
 
 fn open_screen(stage: &mut Stage, path: &str, template: &str, fe: &mut FrontEnd) -> Result<(), String> {
@@ -2443,10 +2480,18 @@ mod tests {
                 assert!(!ms.failed, "{log:?}");
             }
         };
+        // Career stats for the Stats panel (rows only with the tables' career stats table).
+        let mut stats = skate_core::career_stats::CareerStats::default();
+        stats.record(skate_core::career_stats::row::DISTANCE, 1234.5);
+        stats.record(skate_core::career_stats::row::SUCCESSFUL_TRICKS, 42.0);
+        ms.set_career_stats(&stats, false);
         ms.set_loading(true);
         run(&mut ms, &mut log, 120);
         assert!(ms.load_covered() && ms.fade.alpha == 0.0, "up, the black dropped: {log:?}");
         assert!(log.iter().any(|l| l.starts_with("open loading screen")), "{log:?}");
+        assert!(!log.iter().any(|l| l.starts_with("_global.Load_")), "the autosave wheel: {log:?}");
+        assert_eq!(ms.tips_loader.stats.is_empty(), ms.career_table.is_empty(), "Stats rows with the table");
+        eprintln!("stats rows {:?}", ms.tips_loader.stats);
         let draws = ms.draw();
         eprintln!("loading screen draws {}; natives {:?}", draws.len(), ms.stage.unhandled());
         assert!(!draws.is_empty());

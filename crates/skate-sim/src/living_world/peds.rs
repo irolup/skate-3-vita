@@ -515,12 +515,9 @@ pub(crate) const SEAT_PUSH_STEP_SQ: f32 = 2.5e-5;
 pub(crate) const SEAT_PUSH_STEP_SECONDS: f32 = 1.0 / 60.0;
 /// `82C539A8`'s seat probe tolerance, m (the navmesh point within this of the seat in x and z).
 pub(crate) const SEAT_PROBE_TOLERANCE: f32 = 0.1;
-/// The sit plugin's held cycle (`plugin_motion` Sit) and the Avoid graph's forward jump off a seat
-/// (`motiongraph_avoid.xml` JumpForward, `PlayRemappedAnimation SitAvoidFwd`) [data].
+/// The sit plugin's held cycle (`plugin_motion` Sit); the Avoid graph's clips out of it are
+/// `skate_core::living_world::peds::avoid::seated` [data].
 pub(crate) const SIT_CYCLE: &str = "SitIdleCyc";
-pub(crate) const SIT_AVOID_CLIP: &str = "SitAvoidFwd";
-/// `motiongraph_avoid.xml` SitJump: `PedestrianSpeech` PedestrianAvoidJump [data].
-pub(crate) const SIT_AVOID_SPEECH: i32 = 4;
 
 /// The animation set's collision rules for one contact: DisableHeavyCollision (`brain+3277` bit 0x20) turns the
 /// knock-down off and leaves the standing stumble (`sub_82E38FB8` clears its knock-down test when the bit is set).
@@ -856,9 +853,10 @@ pub(crate) struct PedMind {
     plugin_state: Option<usize>,
     /// Which plugin graph `plugin_controller` was made for (the prop class, or the conversation graph).
     plugin_graph: Option<String>,
-    /// The seat's prop moved under the seated owner: the body jumps off forward (`82E3DBE0`). Held until the jump
-    /// clip starts or the ped is no longer sitting (a one-tick pulse lost the race against the plugin's stand-up).
-    sit_avoid: bool,
+    /// A seated avoid to play: the seat's prop moved under the owner (`82E3DBE0`, the forward jump) or a skater comes
+    /// at it (SkaterAvoidance, `skate_core::living_world::peds::avoid`). Held until the clip starts or the ped is no
+    /// longer sitting (a one-tick pulse lost the race against the plugin's stand-up).
+    sit_avoid: Option<skate_core::living_world::peds::avoid::SeatedAvoid>,
     /// Where the jump off started (`PED_SIT_AVOID_DONE` reports how far the ped got).
     sit_avoid_from: Option<[f32; 3]>,
     /// The speech value last sent to the audio side (`PedestrianSpeech` requests a line only when
@@ -1179,9 +1177,15 @@ pub(crate) fn advance_peds(
             // A plugin state's clips (sit, ATM, vending machine, water fountain, newspaper box).
             let run = &mut body.plugin_motion;
             // The Avoid graph's SitJump out of the sitting cycle (`think_peds` raises `sit_avoid`).
-            if mind.is_some_and(|m| m.sit_avoid) && body.player.reaction_anim() == Some(SIT_CYCLE) {
-                let steps = vec![skate_core::living_world::peds::skater_contact::ReactionStep { anim: SIT_AVOID_CLIP, mirror: false, blend: 0.1, cycle: false }];
-                if body.player.interrupt(set, steps, 0.0) {
+            // Leaving the seat ends the sit sequence; the others play the clip and go on with it (ReturnToSit / SitSmall).
+            if let Some(avoid) = mind.and_then(|m| m.sit_avoid).filter(|_| body.player.reaction_anim() == Some(SIT_CYCLE)) {
+                let mut steps = vec![skate_core::living_world::peds::skater_contact::ReactionStep { anim: avoid.clip, mirror: avoid.mirror, blend: 0.1, cycle: false }];
+                if !avoid.leaves_seat {
+                    steps.extend(body.player.remaining_steps());
+                }
+                // The sit plugin's cycle holds until its StandUp intent (the sequence started with no ground time limit).
+                let hold = if avoid.leaves_seat { 0.0 } else { f32::INFINITY };
+                if body.player.interrupt(set, steps, hold) && avoid.leaves_seat {
                     run.state = TauntClip::Done;
                 }
             }
@@ -2369,7 +2373,7 @@ pub(crate) fn think_peds(
             skate_core::living_world::peds::takedown::choose(table, at, forward, ped_speed, p, v)
         };
         // The seat's carried steps move the seated ped's root and its lock with it (`82E36D70`, b219).
-        if mind.brain.own_plugin_object && !mind.sit_avoid {
+        if mind.brain.own_plugin_object && mind.sit_avoid.is_none() {
             for (_, d) in seat_carry.iter().filter(|(o, _)| *o == me) {
                 if let Some(p) = mind.brain.locked_at.as_mut() {
                     (p[0], p[2]) = (p[0] + d[0], p[2] + d[2]);
@@ -2420,16 +2424,49 @@ pub(crate) fn think_peds(
             // The body plays it (`advance_peds`) while the flag is up.
             let anim = body.player.reaction_anim();
             let seated = mind.brain.own_plugin_object && anim == Some(SIT_CYCLE);
-            if seat_pushed.contains(&me) && seated && !mind.sit_avoid {
-                mind.brain.speech = Some(SIT_AVOID_SPEECH);
-                mind.sit_avoid = true;
+            use skate_core::living_world::peds::avoid;
+            // A skater coming at the seated ped (SkaterAvoidance, every `period` on the ped's own phase): the first
+            // skater whose closest approach qualifies decides (docs/hails-additions/26f-living-world-peds.md#seated-peds-avoid-an-approaching-skater).
+            let rules = settings.ped_brain.values.avoid;
+            let every = ((rules.period / dt).round() as u64).max(1);
+            let skater_avoid = if seated && mind.sit_avoid.is_none() && (tick + u64::from(ped.id.serial)) % every == 0
+                && mind.brain.nav_modifier(skate_core::living_world::peds::brain::nav_modifier::SKATER_AVOIDANCE)
+            {
+                observers.iter().enumerate().find_map(|(i, o)| {
+                    let d = avoid::decide(at, forward, o.position, o.velocity, &rules)?;
+                    let ground = data.nav.as_ref().is_none_or(|nav| {
+                        nav.locate_any(d.escape_point).is_some_and(|q| (q.position[0] - d.escape_point[0]).abs() <= SEAT_PROBE_TOLERANCE && (q.position[2] - d.escape_point[2]).abs() <= SEAT_PROBE_TOLERANCE)
+                    });
+                    if !ground {
+                        info!("PED_AVOID_SKIP ped=#{} skater={i} why=off_ground {} {} t={:.2} miss={:.2} tick={tick}", ped.id.serial, d.kind.name(), d.dir.name(), d.t, d.miss);
+                    }
+                    ground.then_some((i, d))
+                })
+            } else {
+                None
+            };
+            if seat_pushed.contains(&me) && seated && mind.sit_avoid.is_none() {
+                let jump = avoid::seated(avoid::AvoidKind::Jump, avoid::AvoidDir::Forward);
+                mind.brain.speech = jump.speech;
+                mind.sit_avoid = Some(jump);
                 mind.sit_avoid_from = Some(at);
                 info!("PED_SIT_AVOID ped=#{} jumps off forward (its seat moved) locked={} tick={tick}", ped.id.serial, mind.brain.locked_at.is_some());
-            } else if mind.sit_avoid && !seated {
-                // `advance_peds` started the jump (or the ped left the seat another way first).
-                mind.sit_avoid = false;
-                info!("PED_SIT_AVOID ped=#{} played={} anim={anim:?} locked={} tick={tick}", ped.id.serial, anim == Some(SIT_AVOID_CLIP), mind.brain.locked_at.is_some());
-            } else if !mind.sit_avoid && anim != Some(SIT_AVOID_CLIP) {
+            } else if let Some((skater, d)) = skater_avoid {
+                let play = avoid::seated(d.kind, d.dir);
+                if play.speech.is_some() {
+                    mind.brain.speech = play.speech;
+                }
+                mind.sit_avoid = Some(play);
+                mind.sit_avoid_from = Some(at);
+                info!(
+                    "PED_AVOID ped=#{} skater={skater} {} {} seated clip={}{} leaves_seat={} t={:.2} miss={:.2} speed={:.2} angle={:.2} tick={tick}",
+                    ped.id.serial, d.kind.name(), d.dir.name(), play.clip, if play.mirror { " mirrored" } else { "" }, play.leaves_seat, d.t, d.miss, d.speed, d.angle
+                );
+            } else if let Some(played) = mind.sit_avoid.filter(|_| !seated) {
+                // `advance_peds` started the clip (or the ped left the seat another way first).
+                mind.sit_avoid = None;
+                info!("PED_SIT_AVOID ped=#{} played={} anim={anim:?} locked={} tick={tick}", ped.id.serial, anim == Some(played.clip), mind.brain.locked_at.is_some());
+            } else if mind.sit_avoid.is_none() && !anim.is_some_and(|a| avoid::SEATED_CLIPS.contains(&a)) {
                 if let Some(from) = mind.sit_avoid_from.take() {
                     let moved = ((at[0] - from[0]).powi(2) + (at[2] - from[2]).powi(2)).sqrt();
                     info!("PED_SIT_AVOID_DONE ped=#{} moved={moved:.2} anim={anim:?} tick={tick}", ped.id.serial);

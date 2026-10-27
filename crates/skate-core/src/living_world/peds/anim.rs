@@ -1,28 +1,5 @@
 //! Ped animation player for the 50-bone ped rig (`PedestrianSkeletonPres.abin`).
-//!
-//! What it ports (tags as in doc 26):
-//! - clips are additive over the bank's `PEDESTRIAN_RIG_TPOSE` pose record and carry only the
-//!   first 6 rig parts (bones 0..=26: trajectory, torso, head, arms, legs, prop); fingers, face
-//!   and twist helpers have no data in the bank [data]. Final local = `AddSQT(clip, reference)`
-//!   like the skater's `AddBindPose` (`pose_add`, `0x828CCC08`).
-//! - sampling: `select_frames` / `sample_key` (`0x82D20788`), length `(frames - 1) / fps`
-//!   (`clip_clock`), the trajectory delta with the clip's loop transform on a wrap
-//!   (`pose_trajectory::delta`, `0x82D178D8`): that delta is the root motion.
-//! - logical names through `livingworld_entity_animation` (`PlayRemappedAnimation`): an entry is
-//!   one clip or a list (uniform pick); `tAnimAttributes` entries add branch windows [data].
-//! - the locomotion part of `MotionGraph_Pedestrian.xml` M2 needs [data]: `IdleBasicCyc`
-//!   (blendTime 0.1, `cycleSwappingPercentage` 0.5), `Stand2Walk` (0.25, leaves 0.03 s before its
-//!   end), `FwdWalkCyc` (0.1), `Walk2Stand` (0.15, leaves 0.1 s before its end, entered inside a
-//!   walk branch window), `StandTurnR180` (0.15, mirrored for the left turn).
-//! - mirror: `pose_mirror::mirror` (`0x828CDAF8`, trajectory mode 1) with the rig's partner
-//!   table, on the full pose (delta + reference); the root motion is reflected on x.
-//! - foot plants and body falls: clip attributes `LEFTTOEDOWN` / `RIGHTTOEDOWN` /
-//!   `BODYFALLTYPE`, phase windows x length (`playback_clip` attribute status) [data].
-//!
-//! Simplifications until the behaviour runtime (M4) runs the real motion graph: the crossfade
-//! weight is linear over `blendTime` (retail's transition curve is not read); the cycle swap is a
-//! uniform draw at each wrap; the intent (idle / walk / turn) comes from [`TestPath`] or the
-//! caller, not from the AI graph.
+//! What it ports and the simplifications: docs/hails-additions/26f-living-world-peds.md#ped-animation-player
 
 use crate::animation::output::Sqt;
 use crate::animation::{pose_add, pose_blend, pose_mirror, pose_sample, pose_trajectory};
@@ -165,7 +142,8 @@ pub mod names {
         // motiongraph_taunt.
         "Taunt",
         // The plugin states (`super::plugin_motion`): sit, ATM, vending machine, water fountain, newspaper box.
-        "Stand2Sit", "SitIdleCyc", "Sit2Stand", "SitAvoidFwd", "ATMInsertCard", "ATMMakeSelection", "ATMCollectMoney", "ATMCollectCard",
+        "Stand2Sit", "SitIdleCyc", "Sit2Stand", "SitAvoidFwd", "SitAvoidLeft", "SitAvoidBack", "SitAvoidSmallFront",
+        "SitAvoidSmallLeft", "SitAvoidSmallBack", "ATMInsertCard", "ATMMakeSelection", "ATMCollectMoney", "ATMCollectCard",
         "VendInsert", "VendSelect", "VendCollect", "WaterFountainInto", "WaterFountainCyc", "WaterFountainOut", "NewspaperCollect",
         // The light hand prop throw (`super::hand_prop::light_throw_clip`).
         "HandPropThrowLightForward", "HandPropThrowLightL45", "HandPropThrowLightL90", "HandPropThrowLightR180",
@@ -424,10 +402,7 @@ impl PedAnimPlayer {
         self.reaction.as_ref().is_some_and(|r| r.knockdown.is_some())
     }
 
-    /// A contact on a knocked-down ped ([code] `sub_82E38FB8` sets `c+8` unless `c+9`; `sub_8269E058` /
-    /// `sub_8269E170` consume it). Down: it waits for the timer's expiry, which then re-arms the timer. Getting up:
-    /// a re-hit whose posture comes from the get-up clip's time (`sub_8269E460`); LyingDown keeps the stored
-    /// direction, Crouched / Standing take `direction` and reset the expiry count.
+    /// A contact on a knocked-down ped (82E38FB8; consumed by 8269E058 / 8269E170): docs/hails-additions/26f-living-world-peds.md#knockdown-contact
     pub fn knockdown_contact(&mut self, set: &PedAnimSet, direction: super::skater_contact::ReactionDirection) -> KnockdownContact {
         use super::skater_contact::{rehit_steps, Posture};
         let rules = set.collision;
@@ -480,6 +455,11 @@ impl PedAnimPlayer {
                 r.ground_left = 0.0;
             }
         }
+    }
+
+    /// The running reaction's steps from the current one on (a clip that returns to it plays these after).
+    pub fn remaining_steps(&self) -> Vec<super::skater_contact::ReactionStep> {
+        self.reaction.as_ref().map(|r| r.steps[r.index..].to_vec()).unwrap_or_default()
     }
 
     /// Whether a reaction (or plugin sequence) is running.
@@ -667,11 +647,7 @@ impl PedAnimPlayer {
                 }
             }
             Locomotion::Reaction => {
-                // [data] `WillExpire InTime=0.01` ends a clip step; the ground cycle runs until the
-                // AI's `Recover` (the set's ground time); then back to locomotion (idle). The ground
-                // time counts from the reaction's Begin, not from the cycle (b372: `sub_8269DA00` starts
-                // it with the fall, `sub_8269E058` posts Recover at expiry), so the get-up comes at the
-                // later of the fall's end and `ground_seconds` after the hit.
+                // Ground cycle until Recover; ground time counts from the reaction Begin (b372): docs/hails-additions/26f-living-world-peds.md#ground-time
                 let next = match self.reaction.as_mut() {
                     Some(r) => {
                         r.ground_left -= dt;
@@ -720,17 +696,7 @@ impl PedAnimPlayer {
         out
     }
 
-    /// The local pose (one SQT per rig bone, reference added, trajectory zeroed) at the player's
-    /// time plus `ahead` seconds (render interpolation; no state change).
-    ///
-    /// Each layer is made a full pose (clip delta added onto the reference) BEFORE it is
-    /// mirrored: `pose_mirror::mirror` with trajectory mode 1 is a full-pose operation (it
-    /// multiplies the root's children by the literal 180 degree quaternion that the rig's
-    /// reference hips carry), so mirroring a bare delta turned the whole body upside down in the
-    /// mirrored left turn. The reference is symmetric under it (the export: every bone within
-    /// 7 degrees), so a zero delta mirrors to the reference. Blending the full poses equals
-    /// blending the deltas and then adding (the add is a left multiply / affine map, which
-    /// nlerp and lerp commute with).
+    /// Local pose at the player time plus `ahead`; each layer made a full pose before mirroring: docs/hails-additions/26f-living-world-peds.md#ped-pose-and-mirror
     pub fn pose(&self, rig: &PedRig, clips: &dyn PedClips, ahead: f32) -> Option<PedFrame> {
         let sample = |layer: &Layer| -> Option<PedFrame> {
             let clip = clips.clip(&layer.clip)?;

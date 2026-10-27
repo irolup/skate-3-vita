@@ -679,6 +679,18 @@ impl LivingWorldState {
 
     /// After the physics: `gather_observers`, `step_population`, the obstacle update, then
     /// `apply_vehicle_records`, `apply_vehicle_hits`, `drive_traffic` and `log_traffic`.
+    /// skate_vita: the entity keys of the peds the local player knocked down or made stumble in the last step (the
+    /// hits `advance_peds` reported after `think_peds` read the events; upstream's `career_stats_host::hits`).
+    pub(crate) fn player_ped_hits(&self) -> impl Iterator<Item = &str> {
+        let fresh = &self.peds.events[self.peds.think.cursor.min(self.peds.events.len())..];
+        fresh.iter().filter_map(|e| match e {
+            peds::PedEvent::Hit { id, toucher, .. } if *toucher == peds::PLAYER_TARGET_BASE => {
+                Some(self.peds.index.get(id).map_or("", |p| p.ped.entity.as_str()))
+            }
+            _ => None,
+        })
+    }
+
     pub(crate) fn after_physics(&mut self, physics: &mut crate::physics::GamePhysics, skater: &mut crate::physics::SkaterRuntime, seconds: f64, camera: Option<glam::Vec3>) {
         let observers: Vec<_> = local_observer(physics, skater).into_iter().collect();
         let mut decisions = self.step_population(&observers, seconds);

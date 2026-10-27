@@ -220,8 +220,9 @@ impl ReplayBuffer {
     }
 }
 
-/// Bookkeeping per key (time + vector header), counted against the budget.
-const KEY_OVERHEAD: usize = 32;
+/// Bookkeeping per key (time + vector header), counted against the budget. skate_vita: 64, what a key costs beside
+/// its bytes on the Vita (its 24-byte slot, the block's header and its size class's rounding, up to 63 bytes).
+const KEY_OVERHEAD: usize = 64;
 
 impl Track {
     fn bytes(&self) -> usize {
@@ -238,18 +239,21 @@ const FLAG_HIDDEN: u8 = 2;
 fn encode(pose: &ActorPose, rest: &[[f32; 3]]) -> Vec<u8> {
     let scaled = pose.joints.iter().any(|j| j.scale.iter().any(|s| (s - 1.0).abs() > 1.0e-4));
     let n = pose.joints.len();
-    let mut out = Vec::with_capacity(3 + 40 + n.div_ceil(8) + n * 8);
-    out.push(if scaled { FLAG_SCALE } else { 0 } | if pose.hidden { FLAG_HIDDEN } else { 0 });
-    out.extend_from_slice(&(n as u16).to_le_bytes());
-    put_f32s(&mut out, &pose.root.translation);
-    put_quat(&mut out, pose.root.rotation);
-    put_f32s(&mut out, &pose.root.scale);
     let moved: Vec<bool> = pose
         .joints
         .iter()
         .zip(rest)
         .map(|(j, r)| j.translation.iter().zip(r).any(|(a, b)| (a - b).abs() > REST_EPSILON))
         .collect();
+    // skate_vita: the key's exact size (the moved translations and the scales were left out, so a key with a joint
+    // off its rest grew to twice its size: the Vita's 24 MB recording held about 35 MB of keys).
+    let size = 3 + 32 + n.div_ceil(8) + 12 * moved.iter().filter(|m| **m).count() + n * 8 + if scaled { n * 12 } else { 0 };
+    let mut out = Vec::with_capacity(size);
+    out.push(if scaled { FLAG_SCALE } else { 0 } | if pose.hidden { FLAG_HIDDEN } else { 0 });
+    out.extend_from_slice(&(n as u16).to_le_bytes());
+    put_f32s(&mut out, &pose.root.translation);
+    put_quat(&mut out, pose.root.rotation);
+    put_f32s(&mut out, &pose.root.scale);
     let mut mask = vec![0u8; n.div_ceil(8)];
     for (i, _) in moved.iter().enumerate().filter(|(_, m)| **m) {
         mask[i / 8] |= 1 << (i % 8);
@@ -266,6 +270,7 @@ fn encode(pose: &ActorPose, rest: &[[f32; 3]]) -> Vec<u8> {
             put_f32s(&mut out, &joint.scale);
         }
     }
+    debug_assert_eq!(out.len(), size);
     out
 }
 

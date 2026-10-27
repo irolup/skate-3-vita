@@ -16,6 +16,10 @@ pub(super) struct CameraGraph {
     behaviors: Vec<Behavior>,
     slow_motion: Vec<Option<SlowMotionController>>,
     slow_motion_settings: SlowMotionSettings,
+    /// The SlowMotionController's subject (word 1 of the graph's context block, a copy of the camera system's subject
+    /// taken when retail builds the graph; `82BB1EE0` returns before advancing without it). The recomp's copy was null
+    /// through a mega ramp air, so retail's Update never slowed the game there: doc 21 "Camera slow motion".
+    pub slow_motion_subject: bool,
 }
 enum Behavior {
     Choose { names: Vec<String>, incoming: f32, outgoing: f32 },
@@ -57,7 +61,7 @@ impl CameraGraph {
         }
         let controller = Controller::new(binding.states.len());
         let slow_motion = vec![None; behaviors.len()];
-        Ok(Self { program, controller, conditions, behaviors, slow_motion, slow_motion_settings })
+        Ok(Self { program, controller, conditions, behaviors, slow_motion, slow_motion_settings, slow_motion_subject: false })
     }
 
     pub fn update(&mut self, dt: f32, manager: &mut CameraMan, subject: &ManagerSubject,
@@ -66,7 +70,7 @@ impl CameraGraph {
         let mut host = CameraHost { manager, subject, physical, world, database,
             conditions: &self.conditions, behaviors: &self.behaviors, error: None,
             slow_motion: &mut self.slow_motion, slow_motion_settings: self.slow_motion_settings,
-            rates: Vec::new() };
+            slow_motion_subject: self.slow_motion_subject, rates: Vec::new() };
         self.controller.update(&self.program.program, dt, &mut host);
         if let Some(error) = host.error { Err(error) } else { Ok(host.rates) }
     }
@@ -82,6 +86,7 @@ struct CameraHost<'a> {
     error: Option<String>,
     slow_motion: &'a mut [Option<SlowMotionController>],
     slow_motion_settings: SlowMotionSettings,
+    slow_motion_subject: bool,
     rates: Vec<SimulationRateRequest>,
 }
 impl ConditionHost for CameraHost<'_> {
@@ -114,14 +119,42 @@ impl Host for CameraHost<'_> {
     }
     // CameraChooseShot Update/End both resolve to TU382B61BB8 (return).
     fn update(&mut self, id: usize, _: [u32; 6], frame: &Frame) {
-        if let Some(instance) = &mut self.slow_motion[id] {
-            self.rates.push(instance.update(frame.dt, self.physical.slow_motion_air_duration,
-                self.slow_motion_settings));
-        }
+        let request = slow_motion_update(self.slow_motion[id].as_mut(), self.slow_motion_subject, frame.dt,
+            self.physical.slow_motion_air_duration, self.slow_motion_settings);
+        self.rates.extend(request);
     }
     fn end(&mut self, id: usize, _: [u32; 6], _: &Frame) {
         if self.slow_motion[id].take().is_some() { self.rates.push(SlowMotionController::end()); }
     }
     fn hook(&mut self, _: usize, _: &Frame) { unreachable!("camera hooks rejected during load") }
     fn release(&mut self, _: u32) {}
+}
+
+/// SlowMotionController Update (`82BB1EE0`): nothing (and no time passes) without the context's subject.
+fn slow_motion_update(instance: Option<&mut SlowMotionController>, subject: bool, dt: f32, air: f32,
+    settings: SlowMotionSettings) -> Option<SimulationRateRequest> {
+    instance.filter(|_| subject).map(|i| i.update(dt, air, settings))
+}
+
+#[cfg(test)]
+mod slow_motion_tests {
+    use super::*;
+
+    #[test]
+    fn without_its_subject_the_controller_neither_posts_nor_advances() {
+        let timescale = skate_core::point_graph::PointGraph {
+            x: std::array::from_fn(|i| i as f32 / 15.0),
+            y: std::array::from_fn(|i| i as f32 / 15.0),
+        };
+        let settings = SlowMotionSettings { timescale, fps_at_scale_one: 35.0 };
+        let (mut c, begin) = SlowMotionController::begin(settings);
+        assert_eq!(begin.timestep, 1.0 / 60.0, "Begin asks for the normal rate (the curve at 0)");
+        for _ in 0..30 {
+            assert!(slow_motion_update(Some(&mut c), false, 0.1, 1.0, settings).is_none());
+        }
+        // With a subject the first update is at the curve's start (0.1 s of a 1 s air: 57.5 a second); had the 3 s
+        // without one counted it would be at the end (35).
+        let first = slow_motion_update(Some(&mut c), true, 0.1, 1.0, settings).unwrap();
+        assert!((first.timestep - 1.0 / 57.5).abs() < 1e-6, "{}", 1.0 / first.timestep);
+    }
 }

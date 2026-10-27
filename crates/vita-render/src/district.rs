@@ -20,6 +20,10 @@ pub const RADIUS: f32 = 250.0;
 /// 960 x 544) is not submitted: a dense street has hundreds of small pieces per tile and the
 /// frame is bound by the number of draw calls, not by triangles.
 pub const SMALL: f32 = 0.010;
+/// Beyond the middle level's range (`LOD_RANGES[1]`) a draw of at most this many triangles is not submitted: 74% of the
+/// far level's draws are that small (signs, trims, clutter) and the draw count is what bounds the frame (DownTown's
+/// dense streets: about a fifth of the draws; owner, 2026-10-27).
+pub const FAR_MIN_TRIANGLES: u32 = 64;
 /// Fog start and end (m).
 pub const FOG: [f32; 2] = [150.0, 235.0];
 
@@ -60,12 +64,14 @@ pub struct DistrictGpu {
     frame: u64,
     pub mesh_bytes: usize,
     pub texture_bytes: usize,
+    /// Draws the last frame skipped because a texture had not arrived (diagnostics).
+    pub texture_waits: u32,
 }
 
 impl DistrictGpu {
     pub fn new(tile_size: f32, horizon: [f32; 3], scale: f32) -> Self {
         let grey = upload_texture(&Texture { width: 1, height: 1, format: vita_pack::texture::Format::Rgba8, mips: vec![vec![150, 150, 150, 255]] });
-        Self { tile_size, horizon, scale, tiles: HashMap::new(), building: HashMap::new(), textures: HashMap::new(), grey, frame: 0, mesh_bytes: 0, texture_bytes: 0 }
+        Self { tile_size, horizon, scale, tiles: HashMap::new(), building: HashMap::new(), textures: HashMap::new(), grey, frame: 0, mesh_bytes: 0, texture_bytes: 0, texture_waits: 0 }
     }
 
     /// The exposure scale the tiles are drawn with (the props in the district use it too).
@@ -213,6 +219,7 @@ impl DistrictGpu {
     /// Returns (submitted, culled).
     pub fn draw(&mut self, opaque: &ParkProgram, masked: &ParkProgram, white: GLuint, view_proj: &glam::Mat4, eye: Vec3) -> (u32, u32) {
         self.frame += 1;
+        self.texture_waits = 0;
         let planes: [Vec4; 6] = frustum(view_proj);
         let vp = view_proj.to_cols_array();
         let mut tiles: Vec<((i32, i32), f32)> = self.tiles.keys().map(|&t| (t, self.distance(t, eye))).filter(|(_, d)| *d < RADIUS).collect();
@@ -248,6 +255,10 @@ impl DistrictGpu {
                                 culled += 1;
                                 continue;
                             }
+                            if distance >= LOD_RANGES[1] && d.index_count / 3 <= FAR_MIN_TRIANGLES {
+                                culled += 1;
+                                continue;
+                            }
                             let centre = (d.min + d.max) * 0.5;
                             if (d.max - d.min).length() * 0.5 < (centre - eye).length() * SMALL {
                                 culled += 1;
@@ -256,7 +267,10 @@ impl DistrictGpu {
                             let albedo = if d.albedo == NO_TEXTURE { Some(white) } else { self.textures.get_mut(&d.albedo).map(|t| { t.used = frame; t.id }) };
                             let lightmap = if d.lightmap == NO_TEXTURE { Some(white) } else if d.lightmap == GREY_LIGHTMAP { Some(grey) } else { self.textures.get_mut(&d.lightmap).map(|t| { t.used = frame; t.id }) };
                             // A texture still on its way: the draw waits (no white flash).
-                            let (Some(albedo), Some(lightmap)) = (albedo, lightmap) else { continue };
+                            let (Some(albedo), Some(lightmap)) = (albedo, lightmap) else {
+                                self.texture_waits += 1;
+                                continue;
+                            };
                             if !bound {
                                 glBindBuffer(GL_ARRAY_BUFFER, mesh.vbo);
                                 glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, mesh.ibo);

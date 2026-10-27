@@ -436,8 +436,9 @@ impl GamePhysics {
         let p = self.board.bodies()[6].rates.position;
         let root = skater.animated_skeleton.roots.animation_to_world[3];
         let foci = [[p.x, p.y, p.z], [root[0], root[1], root[2]]];
+        let v = self.board.bodies()[6].rates.linear_velocity;
         let builds = window.builds;
-        window.follow(&foci, &mut self.world)?;
+        window.follow(&foci, [v.x, v.y, v.z], &mut self.world)?;
         if window.builds != builds && (cfg!(target_os = "vita") || std::env::var_os("WINDOW_LOG").is_some()) {
             println!("WINDOW tick={} build={} deck=({:.1},{:.1},{:.1}) skater=({:.1},{:.1},{:.1}) triangles={} build_ms={:.0} waits={}", self.ticks, window.builds, p.x, p.y, p.z, root[0], root[1], root[2], window.triangles, window.last_ms, window.waits);
         }

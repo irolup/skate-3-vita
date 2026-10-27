@@ -31,7 +31,7 @@ use crate::skin::{self, Binding};
 
 const SKATER_PACK: &str = "ux0:data/SKATEVITA/skater.pak";
 /// Scripted builds (benchmark replay, soak) start in play and ignore Start.
-const AUTOPLAY: bool = cfg!(any(feature = "replay", feature = "soak"));
+const AUTOPLAY: bool = cfg!(any(feature = "replay", feature = "soak", feature = "stream-bench"));
 const TRICK_NAMES: &str = "vfs:/assets/private/hud/trick-names.txt";
 /// The APT texture holding the world behind the pause menu, and the paused frames drawn before it is captured.
 const FROZEN_WORLD: &str = "frozen-world";
@@ -213,12 +213,18 @@ pub fn run() -> ! {
     {
         let mut s = shared.lock().unwrap();
         (s.world, s.world_loaded) = (world, world);
+        #[cfg(feature = "stream-bench")]
+        {
+            s.world = crate::stream_bench::first_world();
+        }
         s.difficulty = settings.difficulty;
         s.solver_iterations = settings.solver_iterations();
         s.living = settings.living();
         s.settings = settings.controls;
         s.paused = !AUTOPLAY;
+        s.career = crate::career::load();
     }
+    let mut career_saved = Instant::now();
     {
         let shared = shared.clone();
         std::thread::Builder::new()
@@ -266,6 +272,10 @@ pub fn run() -> ! {
     let started = Instant::now();
     let mut scene = Scene::new(&course::mesh(&live::course_surfaces()));
     let mut streamer = crate::district_stream::Streamer::default();
+    // The scene draw's passes, logged every 10 s.
+    let mut scene_log = Instant::now();
+    #[cfg(feature = "stream-bench")]
+    let mut bench = crate::stream_bench::Bench::default();
     let (joints, pack_error) = match std::fs::read(SKATER_PACK)
         .map_err(|e| format!("{SKATER_PACK}: {e}"))
         .and_then(|bytes| Skater::from_pack(&bytes))
@@ -369,9 +379,30 @@ pub fn run() -> ! {
         }
         let prev_frame = last_frame;
         last_frame = frame_start;
+        // The career stats, written outside the shared lock (the simulation keeps running).
+        if career_saved.elapsed() >= Duration::from_secs(crate::career::SAVE_SECONDS) {
+            career_saved = frame_start;
+            let changed = {
+                let mut s = shared.lock().unwrap();
+                std::mem::take(&mut s.career_changed).then(|| s.career.clone())
+            };
+            if let Some(stats) = changed {
+                crate::career::save(&stats);
+            }
+        }
         let pad = vita::pad();
         let pressed = buttons.pressed(pad.buttons);
         let frame_dt = (frame_start - prev_frame).as_secs_f32().min(0.1);
+        // The district streamer's time this frame (uploads and drops), and when the world's drawing started, its
+        // scene draw started and ended, for the RENDER line's split of the main thread's frame.
+        let mut stream_us = 0u64;
+        let mut world_at: Option<Instant> = None;
+        let mut draw_at: Option<(Instant, Instant)> = None;
+        // The streaming benchmark's camera (None: the game's).
+        #[cfg(feature = "stream-bench")]
+        let bench_camera;
+        #[cfg(not(feature = "stream-bench"))]
+        let bench_camera: Option<Mat4> = None;
         let mut view: Option<f32> = None;
         let mut photo_request = false;
         let marker_view;
@@ -728,6 +759,13 @@ pub fn run() -> ! {
             }
             // A world loading (startup, or another park or district) shows the loading screen.
             loading_view = screen == Screen::Loading || (screen == Screen::Playing && (s.loading || s.reload) && !AUTOPLAY);
+            #[cfg(feature = "stream-bench")]
+            {
+                bench_camera = bench.update(&mut s, frame_dt);
+            }
+            if loading_view && !was_loading {
+                fe_menus.set_career_stats(&s.career, settings.imperial);
+            }
             fe_menus.set_loading(loading_view, loading_view && !was_loading);
             was_loading = loading_view;
             hud_note = hud_wait;
@@ -1059,6 +1097,7 @@ pub fn run() -> ! {
             } else if frozen {
                 apt.draw_screen(FROZEN_WORLD);
             } else {
+            world_at = Some(Instant::now());
             let mut eye = Vec3::ZERO;
             let mut view_proj = math::projection(1.0) * math::view(Mat4::from_translation(Vec3::new(0.0, 4.0, 14.0)));
             icon_instances.clear();
@@ -1066,6 +1105,7 @@ pub fn run() -> ! {
             minimap_view = None;
             if let Some(alpha) = view {
                 let (camera, fov) = skin::camera(&a, &b, alpha);
+                let camera = bench_camera.unwrap_or(camera);
                 eye = camera.w_axis.truncate();
                 // The teleporter icons of the loaded world, from the player and this camera.
                 if let (Some(i), Some(w)) = (teleporter_icons.as_ref(), icon_world) {
@@ -1090,7 +1130,18 @@ pub fn run() -> ! {
                 }
             }
             let skinned = view.is_some() && binding.is_some();
+            #[cfg(feature = "stream-bench")]
+            {
+                streamer.lean = bench.lean();
+                if bench.take_restart() {
+                    streamer.restart();
+                }
+            }
+            let stream_started = Instant::now();
             streamer.frame(&mut scene, eye, view.is_some());
+            stream_us = stream_started.elapsed().as_micros() as u64;
+            #[cfg(feature = "stream-bench")]
+            bench.measure((frame_start - prev_frame).as_secs_f32(), streamer.coverage());
             prop_instances.clear();
             prop_instances.extend(prop_poses.iter().filter_map(|p| {
                 let template = *prop_templates.get(&(p.first_index, p.index_count))?;
@@ -1176,7 +1227,18 @@ pub fn run() -> ! {
                 None
             };
             scene.set_grade(grade.unwrap_or(vita_render::scene::Grade::IDENTITY));
+            let draw_started = Instant::now();
             scene.draw(&Frame { view_proj, eye, palette: if skinned { &palette } else { &[] }, props: &prop_instances, cars: &car_instances, npcs: &npcs, peds: &peds, hand_props: &hand_instances, icons: &icon_instances, trails: &trail_instances });
+            draw_at = Some((draw_started, Instant::now()));
+            if scene_log.elapsed() >= Duration::from_secs(10) {
+                scene_log = Instant::now();
+                if let Some(p) = scene.take_pass_times() {
+                    println!(
+                        "SCENE ms/frame (draws): world {:.2} ({:.0}), props {:.2} ({:.0}), cars {:.2} ({:.0}), peds {:.2} ({:.0}), skaters and the rest {:.2} ({:.0})",
+                        p[0].0, p[0].1, p[1].0, p[1].1, p[2].0, p[2].1, p[3].0, p[3].1, p[4].0, p[4].1
+                    );
+                }
+            }
             if freeze && paused_frames >= FREEZE_AFTER_FRAMES {
                 let started = Instant::now();
                 apt.add_texture(FROZEN_WORLD, math::WIDTH as u32, math::HEIGHT as u32, &vita_render::read_rgba());
@@ -1265,12 +1327,32 @@ pub fn run() -> ! {
                 gfx.text(12.0, 530.0, 1.0, RED, &lab::truncate(&problem, 110));
             }
             gfx.draw();
-            stats.cpu_us_sum += frame_start.elapsed().as_micros() as u64;
+            let cpu_us = frame_start.elapsed().as_micros() as u64;
+            stats.cpu_us_sum += cpu_us;
+            if let (Some(world), Some((draw_start, draw_end))) = (world_at, draw_at) {
+                let us = |d: Duration| d.as_micros() as u64;
+                let parts = [
+                    us(world - frame_start),
+                    us(draw_start - world).saturating_sub(stream_us),
+                    stream_us,
+                    us(draw_end - draw_start),
+                    us(draw_end.elapsed()),
+                ];
+                for (sum, part) in stats.parts_us.iter_mut().zip(parts) {
+                    *sum += part;
+                }
+                stats.parts_frames += 1;
+            }
+            if cpu_us > stats.cpu_max_us {
+                (stats.cpu_max_us, stats.stream_at_max_us) = (cpu_us, stream_us);
+            }
+            stats.gaps += u32::from(frame_start - prev_frame > Duration::from_millis(20));
             vita_render::swap(fe_menus.keyboard_running());
         }
         stats.frame(&info);
     }
     settings.save();
+    crate::career::save(&shared.lock().unwrap().career);
     stats.log_heap(0);
     println!("quit, exiting");
     // Let PrincessLog send the last line before the process goes away.
@@ -1795,6 +1877,15 @@ struct Stats {
     cpu_ms: f32,
     draws: (u32, u32),
     heap_peak: usize,
+    /// This second: frames shown more than 20 ms after the last (a visible stutter), the slowest frame's CPU time
+    /// and the part of it the district streamer took (uploads and drops).
+    gaps: u32,
+    cpu_max_us: u64,
+    stream_at_max_us: u64,
+    /// This second's main thread frames split (sums): before the world (input, shared state, HUD and menus), the
+    /// world's preparation (instances, palettes), the streamer, the scene draw, after it (HUD draws, overlays).
+    parts_us: [u64; 5],
+    parts_frames: u32,
 }
 impl Stats {
     fn frame(&mut self, info: &Info) {
@@ -1805,9 +1896,15 @@ impl Stats {
             self.fps = self.frames as f32 / elapsed.as_secs_f32();
             self.cpu_ms = self.cpu_us_sum as f32 / 1000.0 / self.frames.max(1) as f32;
             println!(
-                "RENDER fps={:.1} cpu_ms={:.2} holds={} draws={} culled={} sim_ms={:.1} sim_max_ms={:.1} dropped={} world={} state={}",
-                self.fps, self.cpu_ms, self.holds, self.draws.0, self.draws.1, info.tick_ms, info.tick_max_ms, info.dropped, info.world, info.state
+                "RENDER fps={:.1} cpu_ms={:.2} holds={} draws={} culled={} sim_ms={:.1} sim_max_ms={:.1} dropped={} world={} state={} gaps={} cpu_max_ms={:.1} stream_at_max_ms={:.1}",
+                self.fps, self.cpu_ms, self.holds, self.draws.0, self.draws.1, info.tick_ms, info.tick_max_ms, info.dropped, info.world, info.state,
+                self.gaps, self.cpu_max_us as f32 / 1000.0, self.stream_at_max_us as f32 / 1000.0
             );
+            if self.parts_frames > 0 {
+                let ms = |i: usize| self.parts_us[i] as f32 / 1000.0 / self.parts_frames as f32;
+                println!("MAIN ms/frame: before the world {:.2}, world prep {:.2}, streamer {:.2}, scene draw {:.2}, after {:.2}", ms(0), ms(1), ms(2), ms(3), ms(4));
+            }
+            (self.gaps, self.cpu_max_us, self.stream_at_max_us, self.parts_us, self.parts_frames) = (0, 0, 0, [0; 5], 0);
             self.seconds += 1;
             if self.seconds % 10 == 0 {
                 self.log_heap(info.animation_bytes);

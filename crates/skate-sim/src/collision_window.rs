@@ -340,7 +340,9 @@ impl ClusterSet {
         )
         .map_err(str::to_owned)?;
         // skate_vita: on the device with the `stage-profile` feature too (no environment there).
-        if cfg!(feature = "stage-profile") || std::env::var_os("WINDOW_PHASES").is_some() {
+        if cfg!(target_os = "vita") {
+            println!("WINDOW_PHASES read {:.1} ms ({} clusters), decode and copy {:.1} ms, index {:.1} ms", t_read.as_secs_f32() * 1000.0, missing.len(), (t_decode - t_read).as_secs_f32() * 1000.0, (t0.elapsed() - t_decode).as_secs_f32() * 1000.0);
+        } else if cfg!(feature = "stage-profile") || std::env::var_os("WINDOW_PHASES").is_some() {
             eprintln!("WINDOW_PHASES read {:.1} ms, decode {:.1} ms (buffers at {:.1} ms, {}), index {:.1} ms ({} triangles, {} meshes, {} clusters decoded of {})", t_read.as_secs_f32() * 1000.0, (t_decode - t_read).as_secs_f32() * 1000.0, t_buffers.as_secs_f32() * 1000.0, if fresh { "fresh" } else { "reused" }, (t0.elapsed() - t_decode).as_secs_f32() * 1000.0, world.triangles().len(), world.query_metadata().map_or(0, |m| m.meshes.len()), missing.len(), ids.len());
         }
         // A window pads its queries as the whole world does (the limits of the whole set).
@@ -387,6 +389,34 @@ impl Drop for Window {
 /// on it while the next window is being built: the farthest any query of a tick reaches is
 /// well below this (stage 1: exact with a 56 m margin under every scenario).
 const SAFE_REACH: f32 = 40.0;
+/// skate_vita: a background window is built around where the foci will be this many seconds on (their velocity), at
+/// most `MAX_LEAD` metres ahead, so a fast skater reaches the new window's middle instead of the old one's edge (at
+/// 20 m/s a build of 0.5-1 s used to end with the skater past the safe zone, and the tick waited 0.3-0.65 s).
+const LEAD_SECONDS: f32 = 1.5;
+/// Below `half - SAFE_REACH` (20 m): the foci are still safe in the window built for their lead.
+const MAX_LEAD: f32 = 14.0;
+
+/// The horizontal offset a background window is built ahead by (`LEAD_SECONDS`, at most `MAX_LEAD`).
+fn lead(velocity: [f32; 3]) -> [f32; 3] {
+    let (x, z) = (velocity[0] * LEAD_SECONDS, velocity[2] * LEAD_SECONDS);
+    let length = (x * x + z * z).sqrt();
+    if !length.is_finite() {
+        return [0.0; 3];
+    }
+    let scale = if length > MAX_LEAD { MAX_LEAD / length } else { 1.0 };
+    [x * scale, 0.0, z * scale]
+}
+
+#[cfg(test)]
+mod lead_tests {
+    #[test]
+    fn the_lead_follows_the_velocity_up_to_its_cap() {
+        assert_eq!(super::lead([4.0, -9.0, 0.0]), [6.0, 0.0, 0.0]);
+        let fast = super::lead([0.0, 0.0, 30.0]);
+        assert!((fast[2] - super::MAX_LEAD).abs() < 1e-4 && fast[0] == 0.0);
+        assert_eq!(super::lead([f32::NAN, 0.0, 1.0]), [0.0; 3]);
+    }
+}
 
 impl Window {
     /// A window over an RWCM archive in memory.
@@ -486,8 +516,12 @@ impl Window {
     /// thread and swapped in between ticks; the old one stays in use meanwhile, and the tick
     /// waits only if the foci are no longer safely inside it. Without one the old window
     /// goes first and the new one is built here (the desktop oracle: deterministic).
-    pub(crate) fn follow(&mut self, foci: &[[f32; 3]], world: &mut BoardWorld) -> Result<(), String> {
+    pub(crate) fn follow(&mut self, foci: &[[f32; 3]], velocity: [f32; 3], world: &mut BoardWorld) -> Result<(), String> {
         let background = BACKGROUND.load(Ordering::Relaxed);
+        // Where the windows are built around: ahead of the foci on the device (`LEAD_SECONDS`), the foci themselves
+        // in the tick (the desktop oracle: its windows stay where they were).
+        let lead = if background { lead(velocity) } else { [0.0; 3] };
+        let aims: Vec<[f32; 3]> = foci.iter().map(|f| [f[0] + lead[0], f[1], f[2] + lead[2]]).collect();
         // At most two rounds: a window that arrives may be for foci the skater has since
         // left (a teleport), and the next one is then waited for.
         for _ in 0..2 {
@@ -508,7 +542,7 @@ impl Window {
                 let old = std::mem::replace(world, fresh);
                 self.retire(old);
             }
-            if !self.moved(foci) {
+            if !self.moved(&aims) && foci.iter().all(|f| self.covers(*f, SAFE_REACH)) {
                 return Ok(());
             }
             if !background {
@@ -518,7 +552,7 @@ impl Window {
                 return Ok(());
             }
             let (tx, rx) = std::sync::mpsc::channel();
-            let (set, regions) = (self.set.clone(), self.regions(foci));
+            let (set, regions) = (self.set.clone(), self.regions(&aims));
             let init = *INIT.lock().unwrap();
             std::thread::Builder::new()
                 .name("window-build".into())
@@ -534,7 +568,7 @@ impl Window {
                     }
                 })
                 .map_err(|e| e.to_string())?;
-            self.pending = Some((foci.to_vec(), rx));
+            self.pending = Some((aims.clone(), rx));
             // Near the old window the simulation goes on (the loop returns at the top); far
             // from it (a teleport) the new window is waited for.
             if foci.iter().all(|f| self.covers(*f, SAFE_REACH)) {

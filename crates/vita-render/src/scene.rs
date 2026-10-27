@@ -196,6 +196,10 @@ pub struct Scene {
     district: Option<crate::district::DistrictGpu>,
     /// Draws submitted / culled in the last frame.
     pub last_draws: (u32, u32),
+    /// Per pass of `draw` since `take_pass_times`: µs, draws, and the frames.
+    pass_us: [u64; 5],
+    pass_draws: [u64; 5],
+    pass_frames: u32,
     /// The world's movable props (template meshes) and their programs.
     props: Option<PropsGpu>,
     prop: ParkProgram,
@@ -437,6 +441,9 @@ impl Scene {
                 demo_gpu: None,
                 district: None,
                 last_draws: (0, 0),
+                pass_us: [0; 5],
+                pass_draws: [0; 5],
+                pass_frames: 0,
                 props: None,
                 prop,
                 prop_mask,
@@ -960,6 +967,13 @@ impl Scene {
             glFrontFace(GL_CCW);
             glCullFace(GL_BACK);
             let vp = frame.view_proj.to_cols_array();
+            // Diagnostics: each pass's time and draws (`take_pass_times`).
+            let mark = |slot: usize, at: &mut std::time::Instant, us: &mut [u64; 5], draws: &mut [u32; 5], drawn: u32| {
+                us[slot] += at.elapsed().as_micros() as u64;
+                draws[slot] += drawn;
+                *at = std::time::Instant::now();
+            };
+            let (mut at, mut us, mut draws) = (std::time::Instant::now(), [0u64; 5], [0u32; 5]);
 
             if let Some(district) = &mut self.district {
                 self.last_draws = district.draw(&self.park, &self.park_mask, self.white, &frame.view_proj, frame.eye);
@@ -986,6 +1000,7 @@ impl Scene {
             glDrawArrays(GL_TRIANGLES, 0, self.course_vertices);
             self.last_draws = (1, 0);
             }
+            mark(0, &mut at, &mut us, &mut draws, self.last_draws.0);
 
             // The movable props, once their textures are in, with the world's light and fog.
             if let Some(props) = &self.props {
@@ -999,21 +1014,25 @@ impl Scene {
                     let (submitted, culled) = draw_props(props, frame.props, self.white, &self.prop, &self.prop_mask, frame, &vp, horizon, scale);
                     self.last_draws.0 += submitted;
                     self.last_draws.1 += culled;
+                    draws[1] += submitted;
                 }
             }
+            mark(1, &mut at, &mut us, &mut draws, 0);
 
             // The cars' bodies (opaque), then the glass after the skater.
             let visible_cars = self.draw_cars(frame, &vp, false);
             self.last_draws.0 += visible_cars;
+            mark(2, &mut at, &mut us, &mut draws, visible_cars);
 
             // The peds.
             let (drawn, culled) = self.draw_peds(frame.peds, &self.peds, &frame.view_proj, &vp);
             self.last_draws.0 += drawn;
             self.last_draws.1 += culled;
             // The hand props (held at a ped's hand, or released bodies).
-            let (drawn, culled) = self.draw_peds(frame.hand_props, &self.hand_props, &frame.view_proj, &vp);
-            self.last_draws.0 += drawn;
+            let (hand_drawn, culled) = self.draw_peds(frame.hand_props, &self.hand_props, &frame.view_proj, &vp);
+            self.last_draws.0 += hand_drawn;
             self.last_draws.1 += culled;
+            mark(3, &mut at, &mut us, &mut draws, drawn + hand_drawn);
 
             // Skater and board, then the NPC skaters (the same mesh, their own palettes).
             if self.skater.is_some() {
@@ -1032,7 +1051,21 @@ impl Scene {
             self.draw_cars(frame, &vp, true);
             // The teleporter icons, blended over everything.
             self.draw_icons(frame.icons, frame.trails, &vp);
+            mark(4, &mut at, &mut us, &mut draws, 1 + frame.npcs.len() as u32);
+            for i in 0..5 {
+                self.pass_us[i] += us[i];
+                self.pass_draws[i] += u64::from(draws[i]);
+            }
+            self.pass_frames += 1;
         }
+    }
+
+    /// The scene draw's passes since the last call, per frame: (ms, draws) for the world, the props, the cars, the
+    /// peds and hand props, and the skaters with the rest (diagnostics).
+    pub fn take_pass_times(&mut self) -> Option<[(f32, f32); 5]> {
+        let frames = std::mem::take(&mut self.pass_frames);
+        let (us, draws) = (std::mem::take(&mut self.pass_us), std::mem::take(&mut self.pass_draws));
+        (frames > 0).then(|| std::array::from_fn(|i| (us[i] as f32 / 1000.0 / frames as f32, draws[i] as f32 / frames as f32)))
     }
 
     /// The skater mesh with one palette: opaque materials first, masked last; below

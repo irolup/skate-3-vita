@@ -3,7 +3,9 @@
 use vita_platform::controls::{self, StickGain};
 
 pub const PATH: &str = "ux0:data/SKATEVITA/settings.bin";
-const MAGIC: &[u8; 8] = b"SKVSET10";
+const MAGIC: &[u8; 8] = b"SKVSET11";
+/// Version 10 (before the units setting): the same record without its byte.
+const MAGIC_V10: &[u8; 8] = b"SKVSET10";
 /// Version 9 (before the minimap setting): the same record without its byte.
 const MAGIC_V9: &[u8; 8] = b"SKVSET09";
 /// Version 8: the same record; its pedestrians byte read as the new default (Off), since version 8
@@ -96,6 +98,9 @@ pub struct Settings {
     pub pedestrians: u8,
     /// The HUD minimap (Game Settings > Minimap; retail's default on, owner 2026-10-24).
     pub minimap: bool,
+    /// Game Settings > Units: imperial (feet) instead of metric on the loading screen's Stats panel (retail's default
+    /// metric).
+    pub imperial: bool,
     /// The zombie cheat (Extras > Enter Cheat Code `zombie`): for the session only, never saved (retail keeps it on
     /// the simulation, not in the profile, b304).
     pub zombie: bool,
@@ -191,6 +196,7 @@ impl Default for Settings {
             ai_skaters: true,
             pedestrians: PEDESTRIANS_DEFAULT,
             minimap: true,
+            imperial: false,
             zombie: false,
         }
     }
@@ -217,6 +223,7 @@ impl Settings {
             u8::from(self.ai_skaters),
             self.pedestrians,
             u8::from(self.minimap),
+            u8::from(self.imperial),
         ]);
         for g in [c.left_gain.x, c.left_gain.y, c.right_gain.x, c.right_gain.y] {
             b.extend_from_slice(&g.to_le_bytes());
@@ -228,7 +235,7 @@ impl Settings {
         // Version 2 has one more byte (the menu style) after the seven of version 1, version 3
         // two more (the manual meter, the trick analyzer), version 4 another (fast physics),
         // version 5 another (retail audio), version 6 another (traffic), version 7 (AI skaters), 8 / 9
-        // (pedestrians) and 10 (minimap) another each; the gains follow. Older files read as the defaults.
+        // (pedestrians), 10 (minimap) and 11 (units) another each; the gains follow. Older files read as the defaults.
         let v1 = b.len() == 8 + 7 + 16 && &b[..8] == MAGIC_V1;
         let v2 = b.len() == 8 + 8 + 16 && &b[..8] == MAGIC_V2;
         let v3 = b.len() == 8 + 10 + 16 && &b[..8] == MAGIC_V3;
@@ -238,10 +245,11 @@ impl Settings {
         let v7 = b.len() == 8 + 14 + 16 && &b[..8] == MAGIC_V7;
         let v8 = b.len() == 8 + 15 + 16 && &b[..8] == MAGIC_V8;
         let v9 = b.len() == 8 + 15 + 16 && &b[..8] == MAGIC_V9;
-        if !v1 && !v2 && !v3 && !v4 && !v5 && !v6 && !v7 && !v8 && !v9 && (b.len() != 8 + 16 + 16 || &b[..8] != MAGIC) {
+        let v10 = b.len() == 8 + 16 + 16 && &b[..8] == MAGIC_V10;
+        if !v1 && !v2 && !v3 && !v4 && !v5 && !v6 && !v7 && !v8 && !v9 && !v10 && (b.len() != 8 + 17 + 16 || &b[..8] != MAGIC) {
             return None;
         }
-        let shift = if v1 { 0 } else if v2 { 1 } else if v3 { 3 } else if v4 { 4 } else if v5 { 5 } else if v6 { 6 } else if v7 { 7 } else if v8 || v9 { 8 } else { 9 };
+        let shift = if v1 { 0 } else if v2 { 1 } else if v3 { 3 } else if v4 { 4 } else if v5 { 5 } else if v6 { 6 } else if v7 { 7 } else if v8 || v9 { 8 } else if v10 { 9 } else { 10 };
         let f = |at: usize| f32::from_le_bytes(b[at..at + 4].try_into().unwrap());
         let gain = |v: f32| if v.is_finite() && (0.5..=2.0).contains(&v) { v } else { 1.0 };
         Some(Self {
@@ -267,6 +275,7 @@ impl Settings {
             ai_skaters: v1 || v2 || v3 || v4 || v5 || v6 || b[21] != 0,
             pedestrians: if v1 || v2 || v3 || v4 || v5 || v6 || v7 || v8 { PEDESTRIANS_DEFAULT } else { b[22].min(PEDESTRIANS.len() as u8 - 1) },
             minimap: v1 || v2 || v3 || v4 || v5 || v6 || v7 || v8 || v9 || b[23] != 0,
+            imperial: !(v1 || v2 || v3 || v4 || v5 || v6 || v7 || v8 || v9 || v10) && b[24] != 0,
             zombie: false,
         })
     }
@@ -300,14 +309,14 @@ mod tests {
         // A version 1 file (no menu-style byte) still loads, with the default for it.
         let mut v1 = b"SKVSET01".to_vec();
         v1.extend_from_slice(&s.encode()[8..8 + 7]);
-        v1.extend_from_slice(&s.encode()[8 + 16..]);
+        v1.extend_from_slice(&s.encode()[8 + 17..]);
         let loaded = Settings::decode(&v1).unwrap();
         assert!(loaded.retail_menus && !loaded.manual_meter);
         assert_eq!((loaded.volume, loaded.world, loaded.controls.left_gain.y), (3, 6, 1.1));
         // A version 2 file (no meter byte) loads with the meter off.
         let mut v2 = b"SKVSET02".to_vec();
         v2.extend_from_slice(&s.encode()[8..8 + 8]);
-        v2.extend_from_slice(&s.encode()[8 + 16..]);
+        v2.extend_from_slice(&s.encode()[8 + 17..]);
         let loaded = Settings::decode(&v2).unwrap();
         assert!(!loaded.retail_menus && !loaded.manual_meter);
         assert_eq!(loaded.controls.left_gain.y, 1.1);
@@ -316,7 +325,7 @@ mod tests {
         // A version 3 file (no physics byte) loads with fast physics.
         let mut v3 = b"SKVSET03".to_vec();
         v3.extend_from_slice(&s.encode()[8..8 + 10]);
-        v3.extend_from_slice(&s.encode()[8 + 16..]);
+        v3.extend_from_slice(&s.encode()[8 + 17..]);
         let loaded = Settings::decode(&v3).unwrap();
         assert!(loaded.fast_physics && loaded.manual_meter);
         assert_eq!(loaded.controls.left_gain.y, 1.1);
@@ -326,7 +335,7 @@ mod tests {
         s.retail_audio = false;
         let mut v4 = b"SKVSET04".to_vec();
         v4.extend_from_slice(&s.encode()[8..8 + 11]);
-        v4.extend_from_slice(&s.encode()[8 + 16..]);
+        v4.extend_from_slice(&s.encode()[8 + 17..]);
         let loaded = Settings::decode(&v4).unwrap();
         assert!(loaded.retail_audio && !loaded.fast_physics);
         assert_eq!(loaded.controls.left_gain.y, 1.1);
@@ -337,7 +346,7 @@ mod tests {
         s.traffic = 3;
         let mut v5 = b"SKVSET05".to_vec();
         v5.extend_from_slice(&s.encode()[8..8 + 12]);
-        v5.extend_from_slice(&s.encode()[8 + 16..]);
+        v5.extend_from_slice(&s.encode()[8 + 17..]);
         let loaded = Settings::decode(&v5).unwrap();
         assert_eq!((loaded.traffic, loaded.controls.left_gain.y), (TRAFFIC_DEFAULT, 1.1));
         assert_eq!(Settings::decode(&s.encode()), Some(s));
@@ -345,7 +354,7 @@ mod tests {
         s.ai_skaters = false;
         let mut v6 = b"SKVSET06".to_vec();
         v6.extend_from_slice(&s.encode()[8..8 + 13]);
-        v6.extend_from_slice(&s.encode()[8 + 16..]);
+        v6.extend_from_slice(&s.encode()[8 + 17..]);
         let loaded = Settings::decode(&v6).unwrap();
         assert!(loaded.ai_skaters && loaded.traffic == 3);
         assert_eq!(Settings::decode(&s.encode()), Some(s));
@@ -353,7 +362,7 @@ mod tests {
         s.pedestrians = 3;
         let mut v7 = b"SKVSET07".to_vec();
         v7.extend_from_slice(&s.encode()[8..8 + 14]);
-        v7.extend_from_slice(&s.encode()[8 + 16..]);
+        v7.extend_from_slice(&s.encode()[8 + 17..]);
         let loaded = Settings::decode(&v7).unwrap();
         assert_eq!(loaded.pedestrians, PEDESTRIANS_DEFAULT);
         assert_eq!(Settings::decode(&s.encode()), Some(s));
@@ -361,13 +370,22 @@ mod tests {
         s.minimap = false;
         let mut v9 = b"SKVSET09".to_vec();
         v9.extend_from_slice(&s.encode()[8..8 + 15]);
-        v9.extend_from_slice(&s.encode()[8 + 16..]);
+        v9.extend_from_slice(&s.encode()[8 + 17..]);
         let loaded = Settings::decode(&v9).unwrap();
         assert!(loaded.minimap && loaded.pedestrians == 3);
         assert_eq!(Settings::decode(&s.encode()), Some(s));
+        // A version 10 file (no units byte) loads metric.
+        s.imperial = true;
+        let mut v10 = b"SKVSET10".to_vec();
+        v10.extend_from_slice(&s.encode()[8..8 + 16]);
+        v10.extend_from_slice(&s.encode()[8 + 17..]);
+        let loaded = Settings::decode(&v10).unwrap();
+        assert!(!loaded.imperial && !loaded.minimap);
+        assert_eq!(loaded.controls.left_gain.y, 1.1);
+        assert_eq!(Settings::decode(&s.encode()), Some(s));
         assert_eq!(Settings::decode(b"garbage"), None);
         let mut bad = s.encode();
-        bad[24..28].copy_from_slice(&f32::NAN.to_le_bytes());
+        bad[25..29].copy_from_slice(&f32::NAN.to_le_bytes());
         assert_eq!(Settings::decode(&bad).unwrap().controls.left_gain.x, 1.0);
     }
 

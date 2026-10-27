@@ -1,10 +1,5 @@
-//! Retail's analog steer of an AI skater on the ground (research `.local/research/npc/b121-ai-ground-steer.md`):
-//! `sub_8246AA00` turns the skater's heading against its line into the error `pc+824`, and `sub_82471070` writes it
-//! as stick input to `Turn`, `BodySpin` and `KickTurn`. It runs on and off the path: off the path (beyond 0.4 m) it
-//! aims from the far look-ahead point toward the near one, all near from 3 m, which turns a skater back to its line
-//! while the steering record carries no target (`sub_8246DB50`).
-//!
-//! Pure and deterministic. Retail constants are the tuning defaults (data, a mod may change them).
+//! Retail analog steer of an AI skater on the ground (b121; 8246AA00 -> 82471070). Pure; tuning is data.
+//! Details: docs/hails-additions/26e-living-world-skater-ai.md#ai-ground-steer
 
 use super::Vec3;
 
@@ -106,6 +101,13 @@ pub fn yaw(a: Vec3, b: Vec3, up: Vec3) -> f32 {
     angle
 }
 
+/// `sub_8246AA00`'s lane flags, also the record's steering bits (`sub_8246DE38`): `pc+944` centred (inside the lane,
+/// near its centre) and `pc+945` rejoining (`8.cpp` stores after `pc+933`, the category 9 test and `pc+828`; b602).
+pub fn lane_flags(inside_lane: bool, lateral: f32, dist: f32, avoiding: bool, category_9: bool, t: &GroundSteerTuning) -> (bool, bool) {
+    let centred = inside_lane && lateral.abs() < t.lane_centre;
+    (centred, !avoiding && !category_9 && !centred && dist > t.rejoin_start)
+}
+
 /// `sub_8246AA00`.
 pub fn heading_error(i: &GroundSteerInput, t: &GroundSteerTuning) -> GroundSteer {
     let cur = if i.fakie { i.forward.map(|x| -x) } else { i.forward };
@@ -114,8 +116,7 @@ pub fn heading_error(i: &GroundSteerInput, t: &GroundSteerTuning) -> GroundSteer
         target = target.map(|x| -x);
     }
     let e0 = yaw(cur, target, i.up);
-    let centred = i.inside_lane && i.lateral.abs() < t.lane_centre;
-    let rejoining = !i.avoiding && !i.category_9 && !centred && i.dist > t.rejoin_start;
+    let (centred, rejoining) = lane_flags(i.inside_lane, i.lateral, i.dist, i.avoiding, i.category_9, t);
     let aim = if !rejoining {
         i.far
     } else if i.dist > t.rejoin_full {
@@ -150,6 +151,18 @@ pub fn intents(s: f32) -> Vec<(&'static str, f32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// b602: the record's `pc+944` / `pc+945` (retail 0.6 lane ratio, 0.4 m): centred near the lane centre; rejoining
+    /// once 0.4 m off and not centred, unless avoid-steering or a category 9 trick.
+    #[test]
+    fn lane_flags_mark_centred_and_rejoining_as_retail() {
+        let t = GroundSteerTuning::default();
+        assert_eq!(lane_flags(true, 0.2, 0.2, false, false, &t), (true, false));
+        assert_eq!(lane_flags(true, 1.5, 1.5, false, false, &t), (false, true), "inside the lane but 1.5 m off");
+        assert_eq!(lane_flags(false, 0.3, 0.3, false, false, &t), (false, false), "0.3 m off: not yet rejoining");
+        assert_eq!(lane_flags(false, 2.0, 2.0, true, false, &t), (false, false), "avoid-steering");
+        assert_eq!(lane_flags(false, 2.0, 2.0, false, true, &t), (false, false), "category 9");
+    }
 
     const UP: Vec3 = [0.0, 1.0, 0.0];
 

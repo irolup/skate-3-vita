@@ -43,6 +43,13 @@ type Init = fn();
 static THREAD_INIT: OnceLock<Init> = OnceLock::new();
 static POOL: Mutex<Vec<Weak<StreamSource>>> = Mutex::new(Vec::new());
 static UNDERRUNS: AtomicU32 = AtomicU32::new(0);
+/// skate_vita (optimization phase): chunk reads from the card since the last [`take_reads`] (count, bytes, µs, slowest).
+static READS: Mutex<[u64; 4]> = Mutex::new([0; 4]);
+
+/// The chunk reads counted since the last call; the counts restart.
+pub fn take_reads() -> [u64; 4] {
+    READS.lock().map(|mut r| std::mem::take(&mut *r)).unwrap_or_default()
+}
 
 /// Blocks of every stream that read as silence because the card was too slow (diagnostics).
 pub fn underruns_total() -> u32 {
@@ -131,9 +138,17 @@ impl StreamSource {
         let n = CHUNK_BLOCKS.min(blocks - first);
         let mut bytes = vec![0u8; n * BLOCK_BYTES];
         let err = |e: std::io::Error| format!("{}: {e}", self.path.display());
+        let started = std::time::Instant::now();
         let mut file = std::fs::File::open(&self.path).map_err(err)?;
         file.seek(SeekFrom::Start(self.offset + (first * BLOCK_BYTES) as u64)).map_err(err)?;
         file.read_exact(&mut bytes).map_err(err)?;
+        if let Ok(mut r) = READS.lock() {
+            let us = started.elapsed().as_micros() as u64;
+            r[0] += 1;
+            r[1] += bytes.len() as u64;
+            r[2] += us;
+            r[3] = r[3].max(us);
+        }
         Ok(bytes.into())
     }
 

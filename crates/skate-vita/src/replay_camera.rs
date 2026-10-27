@@ -233,6 +233,10 @@ pub struct Constrained {
 /// `free` = retail camera type 2 (keeps its rotation). `sweep(from, to, radius)` is the world query.
 pub fn constrain(old: Option<Vec3>, new: Vec3, anchor: Vec3, free: bool, rules: &CameraCollision,
     mut sweep: impl FnMut(Vec3, Vec3, f32) -> Option<Hit>) -> Constrained {
+    // One-sided (upstream e1ef4c59): a surface stops a move only into its front face. A move leaving a surface it
+    // touches or coming from behind it (the anchor is the skater root on the ground; a camera that got under the
+    // ground) passes, so the camera is never pulled to the skater's feet or held under the map.
+    let mut sweep = |from: Vec3, to: Vec3, radius: f32| sweep(from, to, radius).filter(|h| (to - from).dot(h.normal) < 0.0);
     let offset = new - anchor;
     let new = if offset.length() > rules.leash { anchor + offset.normalize_or_zero() * rules.leash } else { new };
     let keep = Constrained { position: new, relook: false };
@@ -504,6 +508,31 @@ mod collision_tests {
         let anchor = Vec3::new(5.0, 0.0, 0.0);
         assert!(constrain(Some(Vec3::ZERO), Vec3::new(2.0, 0.0, 1.0), anchor, false, &Default::default(), behind).relook);
         assert!(!constrain(Some(Vec3::ZERO), Vec3::new(2.0, 0.0, 1.0), anchor, true, &Default::default(), behind).relook);
+    }
+
+    /// A floor at y = 0 facing up: the anchor stands on it, so the line of sight starts in contact.
+    fn floor(from: Vec3, to: Vec3, r: f32) -> Option<Hit> {
+        let lo = from.y.min(to.y) - r;
+        (lo <= 0.0 && from.y.max(to.y) + r >= 0.0).then(|| {
+            let fraction = if (to.y - from.y).abs() < 1e-6 { 0.0 } else { ((r - from.y) / (to.y - from.y)).clamp(0.0, 1.0) };
+            Hit { fraction, normal: Vec3::Y }
+        })
+    }
+
+    #[test]
+    fn a_cut_from_the_skaters_feet_keeps_the_camera_above_the_ground() {
+        let eye = Vec3::new(3.0, 2.0, 0.0);
+        let c = constrain(None, eye, Vec3::ZERO, false, &Default::default(), floor);
+        assert_eq!(c.position, eye, "not pulled to the feet");
+    }
+
+    #[test]
+    fn a_camera_under_the_ground_can_move_up_and_along_but_not_down_through_it() {
+        let under = Vec3::new(0.0, -0.5, 0.0);
+        assert_eq!(constrain(Some(under), Vec3::new(0.0, 1.0, 0.0), Vec3::new(5.0, 0.0, 0.0), true, &Default::default(), floor).position, Vec3::new(0.0, 1.0, 0.0));
+        let above = Vec3::new(0.0, 1.0, 0.0);
+        let c = constrain(Some(above), Vec3::new(0.0, -1.0, 0.0), Vec3::new(5.0, 0.0, 0.0), true, &Default::default(), floor);
+        assert!(c.position.y > 0.0, "{c:?}");
     }
 
     #[test]

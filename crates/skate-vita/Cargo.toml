@@ -45,6 +45,9 @@ state-log = []
 # skate-core stage timers (the prop paths) and the sim's tracing spans: ms per tick in STAGES and
 # SPANS log lines every 600 ticks.
 stage-profile = ["skate-sim/stage-profile", "dep:tracing"]
+# District streaming benchmark: the camera flies a loop through each district at set speeds and logs the near tiles'
+# coverage and the frame times (src/stream_bench.rs), then the app exits.
+stream-bench = []
 # R2: the retail front end's phase times in a FE_MENUS spans log line (skate-ui `fe::profile`).
 fe-profile = ["skate-ui/fe-profile"]
 

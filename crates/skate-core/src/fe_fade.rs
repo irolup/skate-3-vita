@@ -1,8 +1,5 @@
-//! The front end's fade to black (doc 31 "Fade to black"): retail's FE fader object (`[[0x830CFE14]+304]`, TU3).
-//! A screen change holds a bit: the alpha rises 0.04 per FE tick, and when the screen is black the waiting actions
-//! run (hold sub_825E6B30, tick sub_825E69A0). Releasing the last bit fades back in at 0.04 per tick (release
-//! sub_825E6BF8; with its instant flag in one tick). Alpha 1 = black. Values are data (`FeFadeParams`), retail's
-//! the defaults.
+//! The front end's fade to black (FE fader, hold 825E6B30, tick 825E69A0, release 825E6BF8); data.
+//! Details: docs/hails-additions/31-retail-menus.md#fe-fade
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FeFadeParams {
@@ -10,12 +7,13 @@ pub struct FeFadeParams {
     pub step: f32,
     /// Alpha change per tick back (0x822F88F8 = -0.04).
     pub release_step: f32,
-    /// FE ticks per second. NOT RETAIL YET: the console's 30 Hz cadence is assumed (as fe_blur).
+    /// FE ticks per second: 60 (the PS3 game in RPCS3 and the recomp both step 0.04 every 1/60 s, doc 31 "Loading
+    /// screen (FE 52)").
     pub tick_hz: f32,
 }
 
 impl FeFadeParams {
-    pub const RETAIL: Self = Self { step: 0.04, release_step: -0.04, tick_hz: 30.0 };
+    pub const RETAIL: Self = Self { step: 0.04, release_step: -0.04, tick_hz: 60.0 };
 }
 
 impl Default for FeFadeParams {
@@ -136,10 +134,14 @@ mod tests {
         f.release(0, true, &p);
         f.tick();
         assert_eq!(f.alpha, 0.0);
-        // 25 ticks at 30 Hz: black after 25 / 30 s whatever the frame time.
+        // 25 ticks at 60 Hz: black after 25 / 60 s whatever the frame time.
         f.hold(0, None, false, &p);
-        for _ in 0..50 {
-            f.advance(1.0 / 60.0, &p);
+        for _ in 0..90 {
+            f.advance(1.0 / 240.0, &p);
+        }
+        assert!(f.alpha < 0.95, "not black after 0.375 s: {}", f.alpha);
+        for _ in 0..12 {
+            f.advance(1.0 / 240.0, &p);
         }
         assert!((f.alpha - 1.0).abs() < 1e-5 || f.alpha > 0.99, "{}", f.alpha);
     }

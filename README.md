@@ -2,7 +2,7 @@
 
 A PS Vita Skate 3 port of the [skate-3-rust-engine](https://github.com/SK8-ENGINE/skate-3-rust-engine) from the Xbox 360 Skate 3.
 
-Not in this beta yet: the career (challenges, progression, saves), the Trick Guide, Game Settings, online play.
+Not in this beta yet: the career (challenges, progression, unlocks), online play.
 
 **Known issues:** in DownTown with traffic, AI skaters and pedestrians all on, the simulation runs slightly over its time budget and drops some ticks. Graphics are reduced to fit the Vita: low-resolution textures, no shadows, baked lighting.
 

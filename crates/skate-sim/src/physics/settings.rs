@@ -50,6 +50,10 @@ pub(crate) struct PhysicsSettings {
     pub move_object: skate_core::player::offboard::move_object::MoveObjectTuning,
     /// `physics_ai` `default`: the AI board path gains (`82C05EC0`).
     pub physics_ai: skate_core::riding::grounded::state::board_path::PhysicsAiTuning,
+    /// `scoring_wipeouts` `default`: the Hall of Meat bones and impact scale; None leaves the injury stats unfed.
+    pub hall_of_meat: Option<skate_core::hall_of_meat::Tuning>,
+    /// The same record's BodyTweak poses and gesture dead zone; None leaves the pose stats unfed.
+    pub hall_of_meat_poses: Option<skate_core::hall_of_meat::PoseTable>,
 }
 
 impl PhysicsSettings {
@@ -171,6 +175,50 @@ impl PhysicsSettings {
                 tracing::warn!("SKATE_PHYSICS_AI: stock physics_ai missing ({error}); using the default record's values");
                 Default::default()
             }),
+            hall_of_meat: load_hall_of_meat(data).map_err(|error| tracing::warn!("HALL_OF_MEAT: no scoring_wipeouts tuning ({error})")).ok(),
+            hall_of_meat_poses: load_hall_of_meat_poses(data).map_err(|error| tracing::warn!("HALL_OF_MEAT: no BodyTweak poses ({error})")).ok(),
         })
+    }
+}
+
+/// `scoring_wipeouts/default` (class 9E4C471BC6EAB615): BoneSet at layout +0 and the impact scale at +0xBFC
+/// (`Hash_B7514DE7EBDE9D01`; b594 read the layout offsets from the schema).
+pub(crate) fn load_hall_of_meat(data: &Collections) -> Result<skate_core::hall_of_meat::Tuning, String> {
+    const CLASS: &str = "Hash_9E4C471BC6EAB615";
+    let words = data.words::<525>(CLASS, "default", "Hash_1F9B5EA147CBEEE9")?;
+    let scale = data.float(CLASS, "default", "Hash_B7514DE7EBDE9D01")?;
+    skate_core::hall_of_meat::Tuning::from_words(&words, scale).ok_or_else(|| "BoneSet size".to_owned())
+}
+
+/// `scoring_wipeouts/default` BodyTweak elements (`Hash_5717CFCCCA59BD47`, 24 bytes each) and the gesture dead zone
+/// (`Hash_9C494E9614FA5ED6`, read at run time by 0x82DAD728; 0 when missing, as retail).
+pub(crate) fn load_hall_of_meat_poses(data: &Collections) -> Result<skate_core::hall_of_meat::PoseTable, String> {
+    const CLASS: &str = "Hash_9E4C471BC6EAB615";
+    let field = data.field(CLASS, "default", "Hash_5717CFCCCA59BD47")?;
+    let items = field.array.as_ref().ok_or("BodyTweak is not an array")?.items.iter().map(|hex| {
+        let words: Vec<u32> = (0..6).filter_map(|i| hex.get(i * 8..i * 8 + 8).and_then(|w| u32::from_str_radix(w, 16).ok())).collect();
+        <[u32; 6]>::try_from(words).map_err(|_| format!("BodyTweak element {hex}"))
+    }).collect::<Result<Vec<_>, _>>()?;
+    let dead_zone = data.float(CLASS, "default", "Hash_9C494E9614FA5ED6").unwrap_or(0.0);
+    Ok(skate_core::hall_of_meat::PoseTable::from_items(&items, dead_zone))
+}
+
+#[cfg(test)]
+mod hall_of_meat_tests {
+    /// Data-gated: the stock BoneSet has 25 bones (bone 0 links to 23 and 1) and the impact scale is 0.75.
+    #[test]
+    fn stock_hall_of_meat_tuning_loads() {
+        let Some(root) = std::env::var_os("SKATE3_ASSET_ROOT").map(std::path::PathBuf::from) else {
+            eprintln!("skipped: set SKATE3_ASSET_ROOT to the converted assets");
+            return;
+        };
+        let data = super::Collections::load(&root).expect("stock collections");
+        let t = super::load_hall_of_meat(&data).expect("scoring_wipeouts");
+        assert_eq!(t.impact_scale, 0.75);
+        assert_eq!(t.bones[0].links[3], Some((1, 0.5)));
+        assert_eq!(t.bones[0].levels[1], (1000, 14.0));
+        let p = super::load_hall_of_meat_poses(&data).expect("BodyTweak");
+        assert_eq!((p.poses.len(), p.dead_zone), (4, f32::from_bits(0x3F19_999A)));
+        assert_eq!((p.poses[1].pose, p.poses[1].direction, p.poses[1].frames, p.poses[1].points), (2, [1.0, 0.0], 15, 500));
     }
 }

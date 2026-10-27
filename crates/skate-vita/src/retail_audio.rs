@@ -67,8 +67,10 @@ static READY: Mutex<Option<Renderer>> = Mutex::new(None);
 
 /// The most voices that may sound at once on the Vita (the reference allows 96; retail retires
 /// voices by CPU). 24: a profile peaked at 58 with the render over budget, and
-/// 32 still left the render at 4–4.8 ms of each 5.3 ms block.
-pub const MAX_VOICES: usize = 20;
+/// 32 still left the render at 4–4.8 ms of each 5.3 ms block. 16 (owner, 2026-10-27): at 20 the render took 5.2 ms
+/// of each 5.33 ms block on Industrial's roads (about 1.2 ms plus 0.2 ms a voice) and starved the tile streaming
+/// on the same core.
+pub const MAX_VOICES: usize = 16;
 
 const FRAME: f32 = 1.0 / 60.0;
 

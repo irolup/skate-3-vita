@@ -17,6 +17,7 @@ mod audio_events;
 pub use audio_events::Riding as AudioRiding;
 mod animation_pose;
 mod camera;
+mod career_stats;
 // The living world's items the physics names, and stand-ins for upstream's diagnostics and mod hooks.
 mod frame_timing;
 mod living_world;

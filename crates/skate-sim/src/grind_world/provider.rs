@@ -30,6 +30,8 @@ pub(crate) struct StaticProvider {
     source_for_primitive: Vec<usize>,
     #[cfg(test)]
     source_rail_indices: Vec<u64>,
+    /// skate_vita: each park piece's asset (`with_pieces`), for the Object Dropper's re-pose.
+    piece_assets: Vec<(u32, usize)>,
 }
 
 impl StaticProvider {
@@ -37,10 +39,10 @@ impl StaticProvider {
     /// Missing provenance is an explicit conversion prerequisite, not a ray miss.
     pub fn new(map: Option<&SkateMap>) -> Result<Self, String> {
         let Some(map) = map else {
-            return Ok(Self { primitives: vec![], metadata: vec![], #[cfg(test)] rail_guids: vec![], assets: vec![], #[cfg(test)] source_for_primitive: vec![], #[cfg(test)] source_rail_indices: vec![] });
+            return Ok(Self { primitives: vec![], metadata: vec![], #[cfg(test)] rail_guids: vec![], assets: vec![], #[cfg(test)] source_for_primitive: vec![], #[cfg(test)] source_rail_indices: vec![], piece_assets: vec![] });
         };
         if map.rails.is_empty() {
-            return Ok(Self { primitives: vec![], metadata: vec![], #[cfg(test)] rail_guids: vec![], assets: vec![], #[cfg(test)] source_for_primitive: vec![], #[cfg(test)] source_rail_indices: vec![] });
+            return Ok(Self { primitives: vec![], metadata: vec![], #[cfg(test)] rail_guids: vec![], assets: vec![], #[cfg(test)] source_for_primitive: vec![], #[cfg(test)] source_rail_indices: vec![], piece_assets: vec![] });
         }
         if map.rails.iter().all(|rail| rail.native.is_none()) { return Self::authored(&map.rails); }
         let mut metadata = map.extensions.iter().filter(|e| e.tag == *b"WMET");
@@ -113,7 +115,7 @@ impl StaticProvider {
             let tree = Octree::new(bounds, indices.iter().map(|&i| spatial_bounds[i]).collect())?;
             Ok(Asset { #[cfg(test)] source: _source, bounds, indices, tree })
         }).collect::<Result<_, String>>()?;
-        Ok(Self { primitives, metadata, #[cfg(test)] rail_guids, assets, #[cfg(test)] source_for_primitive, #[cfg(test)] source_rail_indices })
+        Ok(Self { primitives, metadata, #[cfg(test)] rail_guids, assets, #[cfg(test)] source_for_primitive, #[cfg(test)] source_rail_indices, piece_assets: Vec::new() })
     }
 
     /// Explicit host-authored polylines have no retail source section identity.
@@ -141,7 +143,7 @@ impl StaticProvider {
         } else { vec![] };
         #[cfg(test)]
         let source_rail_indices = primitives.iter().map(|p| p.owner - 1).collect();
-        Ok(Self { #[cfg(test)] source_for_primitive: vec![0; primitives.len()], primitives, metadata, #[cfg(test)] rail_guids, assets, #[cfg(test)] source_rail_indices })
+        Ok(Self { #[cfg(test)] source_for_primitive: vec![0; primitives.len()], primitives, metadata, #[cfg(test)] rail_guids, assets, #[cfg(test)] source_rail_indices, piece_assets: Vec::new() })
     }
 
     /// The placed skate.Park pieces' rails (crate::park_layout::pose_rails), one asset per piece after the map's
@@ -162,6 +164,7 @@ impl StaticProvider {
                 }
             }
             let whole = bounds.iter().copied().reduce(Bounds::union).ok_or("Empty park piece rails")?.padded();
+            self.piece_assets.push((piece.piece, self.assets.len()));
             self.assets.push(Asset {
                 #[cfg(test)]
                 source: SourceIdentity { stream_file: String::new(), asset_id: format!("park piece {}", piece.piece), section_index: 0, section_offset: 0 },
@@ -171,6 +174,26 @@ impl StaticProvider {
             });
         }
         Ok(self)
+    }
+
+    /// skate_vita (Object Dropper): a park piece's rails posed again (the same segments, `crate::park_layout::pose_rails`
+    /// at its new placement); its asset's bounds and octree rebuilt. False for a piece without rails or a segment
+    /// count that differs.
+    pub(crate) fn repose_piece(&mut self, piece: u32, segments: &[(Primitive, spline::PrimitiveMetadata, [[f32; 3]; 2])]) -> Result<bool, String> {
+        let Some(&(_, asset)) = self.piece_assets.iter().find(|(p, _)| *p == piece) else { return Ok(false) };
+        let indices = self.assets[asset].indices.clone();
+        if indices.len() != segments.len() {
+            return Ok(false);
+        }
+        for (&i, (primitive, metadata, _)) in indices.iter().zip(segments) {
+            self.primitives[i] = *primitive;
+            self.metadata[i] = *metadata;
+        }
+        let bounds: Vec<Bounds> = segments.iter().map(|(_, _, [min, max])| Bounds { min: *min, max: *max }).collect();
+        let whole = bounds.iter().copied().reduce(Bounds::union).ok_or("Empty park piece rails")?.padded();
+        self.assets[asset].bounds = whole;
+        self.assets[asset].tree = Octree::new(whole, bounds)?;
+        Ok(true)
     }
 
     pub fn primitives(&self) -> &[Primitive] { &self.primitives }

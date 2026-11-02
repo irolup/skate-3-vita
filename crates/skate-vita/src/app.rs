@@ -219,6 +219,9 @@ pub fn run() -> ! {
         }
         s.difficulty = settings.difficulty;
         s.solver_iterations = settings.solver_iterations();
+        s.dropper_all = settings.dropper_all;
+        s.dropper_free_camera = settings.dropper_free_camera;
+        s.dropper_measure = settings.debug_hud;
         s.living = settings.living();
         s.settings = settings.controls;
         s.paused = !AUTOPLAY;
@@ -324,6 +327,30 @@ pub fn run() -> ! {
     let mut prop_instances: Vec<vita_render::scene::PropInstance> = Vec::new();
     let mut prop_templates: std::collections::HashMap<(u32, u32), u16> = std::collections::HashMap::new();
     let mut props_logged = true;
+    // The Object Dropper: the park's pieces' spans (by piece id), the catalogue renders loaded, this frame's items
+    // and hidden spans, the last frame from the sim thread.
+    let mut piece_spans: std::collections::HashMap<u32, Vec<[u32; 3]>> = std::collections::HashMap::new();
+    let mut catalog_draws = crate::dropper::CatalogDraws::default();
+    let mut marker_instances: Vec<vita_render::scene::MarkerInstance> = Vec::new();
+    // The play camera the placed teleporters' markers fade from.
+    let mut marker_camera = Mat4::IDENTITY;
+    // Save Park: the name typed last (retail keeps the park's name, `+0x3A`: the keyboard opens with it).
+    let mut park_name = String::new();
+    // ... and its picture (`parks::picture` of the frame the pause menu froze).
+    let mut park_picture: Option<Vec<u8>> = None;
+    // My Parks: the saved parks the browser shows (its indices) and the one waiting for the load question's Yes.
+    let mut my_parks: Vec<crate::parks::Entry> = Vec::new();
+    let mut park_to_load: Option<usize> = None;
+    // New Park: Park Setup's lots, and the template waiting for the dirty question's Yes.
+    let mut park_lots: Vec<crate::parks::Lot> = Vec::new();
+    let mut template_to_load: Option<crate::parks::Template> = None;
+    // My Parks: the park waiting for the delete question's Yes. The save wheel: park writes running, and the wheel kept
+    // up at least until then (a write that fast would only flash it).
+    let mut park_to_delete: Option<usize> = None;
+    let park_writes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut save_tag_until: Option<Instant> = None;
+    let (mut catalog_instances, mut hidden_spans) = (Vec::new(), Vec::new());
+    let mut dropper_frame: Option<skate_sim::object_dropper::world::DropperFrame> = None;
     // The traffic cars of the shown tick and what the scene draws.
     let mut car_poses: Vec<skate_sim::CarPose> = Vec::new();
     let mut car_instances: Vec<vita_render::scene::CarInstance> = Vec::new();
@@ -406,6 +433,7 @@ pub fn run() -> ! {
         let mut view: Option<f32> = None;
         let mut photo_request = false;
         let marker_view;
+        let in_skate_park;
         let manual_view;
         let score_view;
         let boot_note;
@@ -435,6 +463,10 @@ pub fn run() -> ! {
             pending_hand_props = s.hand_props_render.take();
             prop_poses.clear();
             prop_poses.extend_from_slice(&s.props);
+            if let Some(pieces) = s.park_pieces.take() {
+                piece_spans = pieces.into_iter().map(|p| (p.id, p.spans)).collect();
+            }
+            dropper_frame.clone_from(&s.dropper);
             // The UI loaders run one after another, and only once the first park has loaded:
             // they allocate heavily and slow each other and the park load many times over
             // when they overlap (device log: the park load took 45 s instead of 8 s). The
@@ -512,6 +544,7 @@ pub fn run() -> ! {
             // While the R2 front end is open it takes the pad (below); Triangle alone in the pause menu opens it.
             let fe_screen = |screen: Screen| matches!(screen, Screen::Main | Screen::Pause);
             let fe_shown = fe_screen(screen) && fe_menus.shown();
+            s.dropper_screen_loaded = fe_menus.object_dropper_loaded();
             let mut changed = if fe_shown { false } else { handle_input(&mut screen, &mut menus, &mut settings, &mut s, pad.buttons, pressed, &mut quit, boot) };
             // Entering the pause screen (from playing, the controls page, the replay...) opens the front end, which
             // waits with a note while it loads; the plain menus style keeps the plain pause menu.
@@ -523,7 +556,7 @@ pub fn run() -> ! {
             fe_waiting &= fe_screen(screen) && (fe_menus.loading() || fe_menus.ready());
             if fe_waiting && fe_menus.ready() {
                 fe_waiting = false;
-                fe_menus.open(&settings, &crate::session_replay::choices(), screen == Screen::Main);
+                fe_menus.open(&settings, &crate::session_replay::choices(), screen == Screen::Main, s.in_skate_park);
             }
             if fe_screen(screen) && fe_menus.shown() && !settings.retail_menus {
                 fe_menus.close_now();
@@ -574,6 +607,39 @@ pub fn run() -> ! {
                             fe_menus.close_now();
                             menus.replay_request = Some(k);
                         }
+                        // Save Park: the keyboard for the name, over the menu (retail flow message 0x78).
+                        Choice::SavePark => {
+                            fe_menus.ask_park_name(&park_name);
+                            left = false;
+                        }
+                        // My Parks: retail's browser with the saved parks and their pictures.
+                        Choice::MyParks => {
+                            my_parks = crate::parks::list();
+                            let items = park_items(&mut apt, &my_parks);
+                            println!("my parks: {} saved", my_parks.len());
+                            if !fe_menus.open_parks(items) {
+                                println!("my parks: no browser movie in this install");
+                            }
+                            left = false;
+                        }
+                        // Park Setup comes with step S5.
+                        // New Park: retail's Park Setup (lot and template); the Vita's lots are all open.
+                        Choice::NewPark => {
+                            park_lots = crate::parks::lots();
+                            let lots = park_lots
+                                .iter()
+                                .map(|l| skate_ui::fe::park_setup_host::ParkSetupLot {
+                                    name: l.name.clone(),
+                                    unlocked: true,
+                                    templates: l.templates.iter().map(|t| (t.name.clone(), t.thumb.clone())).collect(),
+                                })
+                                .collect();
+                            println!("new park: {} lots", park_lots.len());
+                            if !fe_menus.open_park_setup(lots) {
+                                println!("new park: no Park Setup movie in this install");
+                            }
+                            left = false;
+                        }
                         Choice::TrickAnalyzer | Choice::ManualMeter => {
                             if choice == Choice::TrickAnalyzer {
                                 settings.trick_analyzer = !settings.trick_analyzer;
@@ -586,13 +652,91 @@ pub fn run() -> ! {
                         }
                     }
                 }
-                // A Challenge Map location: here, or once its world has loaded (the sim thread waits for the load).
+                // Save Park's name typed: a taken one asks to overwrite (Yes saves over it, No types again), a new one saves.
+                for (callback, text) in update.texts {
+                    if callback == crate::fe_menus::PARK_NAME {
+                        if crate::parks::exists(&text) {
+                            fe_menus.ask_park_overwrite();
+                        } else {
+                            s.park_save = Some(text.clone());
+                        }
+                        park_name = text;
+                    }
+                }
+                // My Parks: a park selected loads (asking first over unsaved edits, retail 8262A570); one deleted goes.
+                for event in update.browser {
+                    use skate_ui::fe::browser_host::BrowserEvent;
+                    match event {
+                        BrowserEvent::Select(i) if s.park_unsaved && s.in_skate_park => {
+                            park_to_load = Some(i);
+                            fe_menus.ask_park_load();
+                        }
+                        BrowserEvent::Select(i) => {
+                            if let Some(e) = my_parks.get(i).cloned() {
+                                left |= load_park(&e, &mut s, &mut menus, &mut screen, &mut settings, &mut fe_menus, &mut changed);
+                            }
+                        }
+                        // Retail asks first (82523BC0).
+                        BrowserEvent::Delete(i) => {
+                            park_to_delete = Some(i);
+                            fe_menus.ask_park_delete();
+                        }
+                    }
+                }
+                // New Park: a template taken lays it on its lot (asking first over unsaved edits, retail 825D2588).
+                for c in update.park_setup {
+                    let Some(t) = park_lots.get(c.lot).and_then(|l| l.templates.get(c.template)).cloned() else { continue };
+                    if s.park_unsaved && s.in_skate_park {
+                        template_to_load = Some(t);
+                        fe_menus.ask_park_dirty();
+                    } else {
+                        left |= load_template(&t, &mut s, &mut menus, &mut screen, &mut settings, &mut fe_menus, &mut changed);
+                    }
+                }
+                for (callback, choice) in update.answers {
+                    if callback == crate::fe_menus::PARK_DELETE {
+                        if let Some(e) = park_to_delete.take().filter(|_| choice == 1).and_then(|i| my_parks.get(i).cloned()) {
+                            match crate::parks::delete(&e.name) {
+                                Ok(()) => println!("park deleted: {}", e.name),
+                                Err(err) => println!("park delete: {err}"),
+                            }
+                            save_tag_until = Some(Instant::now() + SAVE_TAG_AT_LEAST);
+                            my_parks = crate::parks::list();
+                            let items = park_items(&mut apt, &my_parks);
+                            fe_menus.set_parks(items);
+                        }
+                    }
+                    if callback == crate::fe_menus::PARK_DIRTY {
+                        if let Some(t) = template_to_load.take().filter(|_| choice == 1) {
+                            left |= load_template(&t, &mut s, &mut menus, &mut screen, &mut settings, &mut fe_menus, &mut changed);
+                        }
+                    }
+                    if callback == crate::fe_menus::PARK_LOAD {
+                        if let Some(e) = park_to_load.take().filter(|_| choice == 0).and_then(|i| my_parks.get(i).cloned()) {
+                            left |= load_park(&e, &mut s, &mut menus, &mut screen, &mut settings, &mut fe_menus, &mut changed);
+                        }
+                    }
+                    if callback == crate::fe_menus::PARK_OVERWRITE {
+                        if choice == 0 {
+                            s.park_save = Some(park_name.clone());
+                        } else {
+                            fe_menus.ask_park_name(&park_name);
+                        }
+                    }
+                }
+                // A Challenge Map location: here, or once its world has loaded (the sim thread waits for the load). A
+                // skate.park's location starts the skater at the park's spawner instead (its locator is the empty park's
+                // ground, inside the layout's pieces; owner's retail check).
                 for (map, matrix) in update.teleports {
                     left = true;
                     fe_menus.close();
                     match WORLDS.iter().position(|w| *w == map) {
                         Some(w) => {
-                            s.teleport = Some(matrix);
+                            if SKATE_PARKS.contains(&map.as_str()) {
+                                s.respawn = w == s.world_loaded;
+                            } else {
+                                s.teleport = Some(matrix);
+                            }
                             menus.world = w;
                             changed |= start_playing(&mut screen, &menus, &mut settings, &mut s);
                         }
@@ -605,6 +749,33 @@ pub fn run() -> ! {
                 }
                 fe_prev_screen = screen;
             }
+            // Save Park: the park's bytes from the simulation, written off this thread (a card write would stall the
+            // frame), whether the menu is still open or not.
+            if let Some((name, bytes)) = s.park_saved.take() {
+                let map = WORLDS[s.world_loaded].to_owned();
+                match bytes {
+                    Some(bytes) => {
+                        let picture = park_picture.clone();
+                        let writes = std::sync::Arc::clone(&park_writes);
+                        writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        save_tag_until = Some(Instant::now() + SAVE_TAG_AT_LEAST);
+                        std::thread::spawn(move || {
+                            match crate::parks::save(&name, &bytes, &map, picture.as_deref()) {
+                                Ok(e) => println!("park saved: {} as {} ({} bytes, {map})", e.name, e.file, bytes.len()),
+                                Err(e) => println!("park save failed: {e}"),
+                            }
+                            writes.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                        });
+                    }
+                    None => println!("park save: not in a skate.park"),
+                }
+            }
+            // The save wheel while a park is written or deleted (owner, on retail: it shows until done).
+            let writing = park_writes.load(std::sync::atomic::Ordering::SeqCst) > 0;
+            if save_tag_until.is_some_and(|t| Instant::now() >= t) {
+                save_tag_until = None;
+            }
+            fe_menus.set_saving(writing || save_tag_until.is_some());
             // Retail teleporters (teleporters.rs): inside a volume the action overlay prompts, D-pad Up (not with LB, the
             // session marker's) asks to confirm, Yes moves the skater (here, or once its world has loaded).
             if !teleporters_loaded && crate::packs::UI.load(std::sync::atomic::Ordering::Relaxed) {
@@ -633,6 +804,7 @@ pub fn run() -> ! {
                 let playing = screen == Screen::Playing && !AUTOPLAY;
                 let world = (playing && !s.loading && !s.reload).then(|| WORLDS[s.world_loaded]);
                 icon_world = (!s.loading && !s.reload).then_some(s.world_loaded);
+                teleporters.set_park(WORLDS[s.world_loaded], &s.park_teleporters);
                 if let Some(e) = s.frames.back() {
                     teleporters.track(world, e.current.root.translation.to_array());
                 }
@@ -654,6 +826,16 @@ pub fn run() -> ! {
                         }
                     }
                 }
+                // The Object Dropper's retail screen while the editor is open, and the open world's reset question
+                // (Yes is option 0).
+                let posts = std::mem::take(&mut s.dropper_posts);
+                let quick_posts = std::mem::take(&mut s.dropper_quick_posts);
+                let ask = std::mem::take(&mut s.dropper_ask_reset);
+                let feed = s.dropper_screen.clone().filter(|_| playing);
+                if let Some(choice) = fe_menus.object_dropper(feed, &posts, &quick_posts, ask, frame_dt, &values) {
+                    s.dropper_reset = Some(choice == 0);
+                }
+                s.dropper_list.extend(fe_menus.take_dropper_list());
             }
             // The pause menu's Replay Editor: the instant replay, or a saved replay (its park loads first).
             if let Some(choice) = menus.replay_request.take() {
@@ -717,6 +899,9 @@ pub fn run() -> ! {
                 s.settings = settings.controls;
                 s.difficulty = settings.difficulty;
                 s.solver_iterations = settings.solver_iterations();
+                s.dropper_all = settings.dropper_all;
+                s.dropper_free_camera = settings.dropper_free_camera;
+                s.dropper_measure = settings.debug_hud;
                 let living = settings.living();
                 if living != s.living {
                     s.living = living;
@@ -770,6 +955,7 @@ pub fn run() -> ! {
             was_loading = loading_view;
             hud_note = hud_wait;
             marker_view = s.marker;
+            in_skate_park = s.in_skate_park;
             manual_view = s.manual;
             score_view = s.score.clone();
 
@@ -1023,6 +1209,7 @@ pub fn run() -> ! {
                 Some(render) => scene.load_park(render),
                 None => scene.unload_park(),
             }
+            catalog_draws.clear(&mut scene);
             println!("world {}: buffers ready in {:.0} ms, textures upload over the next frames", WORLDS[w], started.elapsed().as_secs_f32() * 1000.0);
             uploading = Some((w, Instant::now(), started.elapsed()));
         }
@@ -1093,7 +1280,7 @@ pub fn run() -> ! {
                 binding.palette(&v.snapshot, &v.snapshot, 1.0, &mut demo_palette);
                 let view_proj = math::projection_far(v.fov.unwrap_or(1.0), 100.0) * math::view(v.camera);
                 let eye = v.camera.w_axis.truncate();
-                scene.draw_demo(&Frame { view_proj, eye, palette: &demo_palette, props: &[], cars: &[], npcs: &[], peds: &[], hand_props: &[], icons: &[], trails: &[] });
+                scene.draw_demo(&Frame { view_proj, eye, palette: &demo_palette, props: &[], cars: &[], npcs: &[], peds: &[], hand_props: &[], icons: &[], trails: &[], catalog: &[], markers: &[], hidden: &[] });
             } else if frozen {
                 apt.draw_screen(FROZEN_WORLD);
             } else {
@@ -1107,6 +1294,7 @@ pub fn run() -> ! {
                 let (camera, fov) = skin::camera(&a, &b, alpha);
                 let camera = bench_camera.unwrap_or(camera);
                 eye = camera.w_axis.truncate();
+                marker_camera = camera;
                 // The teleporter icons of the loaded world, from the player and this camera.
                 if let (Some(i), Some(w)) = (teleporter_icons.as_ref(), icon_world) {
                     let world = WORLDS[w];
@@ -1125,6 +1313,12 @@ pub fn run() -> ! {
                 // A district draws to 250 m; its tiles stream in around the camera.
                 let far = if streamer.active() { 260.0 } else { math::FAR };
                 view_proj = math::projection_far(fov, far) * math::view(camera);
+                // The Object Dropper's camera while it is open. NOT RETAIL YET: a 60 degree field of view.
+                if let Some(v) = dropper_frame.as_ref().and_then(|d| d.view) {
+                    let camera = crate::dropper::camera(v);
+                    eye = camera.w_axis.truncate();
+                    view_proj = math::projection_far(60f32.to_radians(), far) * math::view(camera);
+                }
                 if let Some(binding) = &mut binding {
                     binding.palette(&a, &b, alpha, &mut palette);
                 }
@@ -1228,7 +1422,21 @@ pub fn run() -> ! {
             };
             scene.set_grade(grade.unwrap_or(vita_render::scene::Grade::IDENTITY));
             let draw_started = Instant::now();
-            scene.draw(&Frame { view_proj, eye, palette: if skinned { &palette } else { &[] }, props: &prop_instances, cars: &car_instances, npcs: &npcs, peds: &peds, hand_props: &hand_instances, icons: &icon_instances, trails: &trail_instances });
+            match &dropper_frame {
+                Some(d) => {
+                    catalog_draws.instances(&mut scene, d, &mut catalog_instances);
+                    catalog_draws.markers(&mut scene, d, &marker_camera, &mut marker_instances);
+                    crate::dropper::hidden_spans(&piece_spans, &d.hidden, &mut hidden_spans);
+                }
+                None => {
+                    catalog_instances.clear();
+                    marker_instances.clear();
+                    hidden_spans.clear();
+                }
+            }
+            // The park editor hides the player skater while it is open.
+            let skater_shown = skinned && !dropper_frame.as_ref().is_some_and(|d| d.hide_skater);
+            scene.draw(&Frame { view_proj, eye, palette: if skater_shown { &palette } else { &[] }, props: &prop_instances, cars: &car_instances, npcs: &npcs, peds: &peds, hand_props: &hand_instances, icons: &icon_instances, trails: &trail_instances, catalog: &catalog_instances, markers: &marker_instances, hidden: &hidden_spans });
             draw_at = Some((draw_started, Instant::now()));
             if scene_log.elapsed() >= Duration::from_secs(10) {
                 scene_log = Instant::now();
@@ -1241,7 +1449,10 @@ pub fn run() -> ! {
             }
             if freeze && paused_frames >= FREEZE_AFTER_FRAMES {
                 let started = Instant::now();
-                apt.add_texture(FROZEN_WORLD, math::WIDTH as u32, math::HEIGHT as u32, &vita_render::read_rgba());
+                let screen = vita_render::read_rgba();
+                // Save Park's picture: the park as the pause menu froze it.
+                park_picture = Some(crate::parks::picture(&screen, math::WIDTH as usize, math::HEIGHT as usize));
+                apt.add_texture(FROZEN_WORLD, math::WIDTH as u32, math::HEIGHT as u32, &screen);
                 println!("pause: world captured in {:.1} ms", started.elapsed().as_secs_f32() * 1000.0);
             }
             }
@@ -1286,7 +1497,9 @@ pub fn run() -> ! {
                 help_turns = 0;
                 finish_popup = false;
             }
-            if screen == Screen::Playing && !fe_menus.loading_screen() {
+            // The gameplay HUD (score, trick line, meter, minimap) is not drawn while the Object Dropper is open.
+            let dropper_open = dropper_frame.as_ref().is_some_and(|d| d.view.is_some());
+            if screen == Screen::Playing && !fe_menus.loading_screen() && !dropper_open {
                 if let Some(m) = &mut marker {
                     m.draw_dissolve(&marker_view);
                 }
@@ -1320,6 +1533,20 @@ pub fn run() -> ! {
                 if let Some(m) = &marker {
                     m.draw_panel(&mut apt, &marker_view);
                 }
+                // The phone's dropper rows (retail `hudphonelist`: B Object Dropper / Edit Park, Y Reset All Props in a
+                // park). NOT RETAIL YET: plain text under the marker panel until the phone movie runs on the Vita.
+                if marker_view.visible && crate::retail_hud::screen_present(skate_sim::object_dropper::world::CATALOG) {
+                    let rows = if in_skate_park { "B  Edit Park     Y  Reset All Props" } else { "B  Object Dropper" };
+                    gfx.text(12.0, 470.0, 1.0, WHITE, rows);
+                }
+            }
+            // The Object Dropper's status line when its retail screen is not in this install.
+            if let Some(d) = dropper_frame.as_ref().filter(|d| d.view.is_some() && !fe_menus.object_dropper_open()) {
+                let m = d.meter;
+                gfx.text(12.0, 500.0, 1.0, if m.warning { YELLOW } else { WHITE }, &format!(
+                    "OBJECT DROPPER {:?}  terrain {:.0}%+{:.0}%  props {:.0}%+{:.0}%",
+                    d.mode, m.terrain[0] * 100.0, m.terrain[1] * 100.0, m.props[0] * 100.0, m.props[1] * 100.0
+                ));
             }
             let damaged = crate::packs::DAMAGED.lock().unwrap().clone();
             if let Some(problem) = damaged.or_else(|| pack_error.clone()).or_else(|| binding_error.clone()).or_else(|| retail.failure().map(|e| format!("retail HUD off: {e}")))
@@ -1365,6 +1592,9 @@ fn volume(settings: &Settings) -> f32 {
     f32::from(settings.volume) / 10.0
 }
 
+/// Start pressed in a park editor: the pause menu opens once the editor and its screen are gone.
+static PAUSE_AFTER_DROPPER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// One frame's buttons on the current screen. Returns whether the settings changed.
 fn handle_input(
     screen: &mut Screen,
@@ -1399,12 +1629,30 @@ fn handle_input(
                 SELECT.store(if used || state == 2 { 2 } else { 1 }, Ordering::Relaxed);
             } else {
                 SELECT.store(0, Ordering::Relaxed);
-                if state == 1 && !AUTOPLAY && crate::session_replay::RECORDER.lock().unwrap().len() > 1 {
+                // In the Object Dropper, Select is the editor's (Properties): no instant replay.
+                if state == 1 && !AUTOPLAY && s.dropper_screen.is_none() && crate::session_replay::RECORDER.lock().unwrap().len() > 1 {
                     *screen = Screen::Replay;
                     return false;
                 }
             }
-            if pressed & sce::START != 0 {
+            // The open world's Object Dropper (FE 0x37) keeps Start: no pause menu while it is open (owner, checked in
+            // retail); in a park Start closes the editor first, then the pause menu opens (`825CB440`).
+            let world_dropper = s.dropper_screen.as_ref().is_some_and(|f| f.world);
+            // In a park editor Start first closes the editor; the pause menu opens once its screen is gone.
+            if pressed & sce::START != 0 && !world_dropper && s.dropper_screen.is_some() && held & sce::SELECT == 0 && !AUTOPLAY {
+                s.dropper_close = true;
+                PAUSE_AFTER_DROPPER.store(true, Ordering::Relaxed);
+                return false;
+            }
+            if PAUSE_AFTER_DROPPER.load(Ordering::Relaxed) && s.dropper_screen.is_none() && !s.dropper_screen_loaded {
+                PAUSE_AFTER_DROPPER.store(false, Ordering::Relaxed);
+                *screen = Screen::Pause;
+                crate::session_replay::refresh_list();
+                menus.cursors[1] = 0;
+                menus.world = s.world_loaded;
+                return false;
+            }
+            if pressed & sce::START != 0 && !world_dropper {
                 if held & sce::SELECT != 0 {
                     settings.debug_hud = !settings.debug_hud;
                     return true;
@@ -1586,6 +1834,81 @@ fn menu_worlds() -> crate::vita_menus::Worlds {
         training: list(&[("SkateSchool", "Skate School"), ("Course", "Course")]),
     }
 }
+
+/// The browser's items for the saved parks, their pictures given to the menus' renderer as `memcard/10/<index>`
+/// (what `Game.ImageRenderer_MemcardLoad(10, index, slot)` draws).
+fn park_items(apt: &mut vita_render::apt::Apt, parks: &[crate::parks::Entry]) -> Vec<skate_ui::fe::browser_host::BrowserItem> {
+    let kind = skate_ui::fe::browser_host::PARK_PICTURE;
+    parks
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let key = format!("{}{kind}/{i}", skate_ui::fe::image_renderer_host::MEMCARD_TEXTURE_PREFIX);
+            apt.remove_texture(&key);
+            let picture = crate::parks::read_picture(e).map(|(w, h, rgba)| apt.add_texture(&key, w, h, &rgba)).map(|_| i as u32);
+            skate_ui::fe::browser_host::BrowserItem { name: e.name.clone(), date: crate::parks::date_text(e.saved), picture }
+        })
+        .collect()
+}
+
+/// Loads a saved park (My Parks): its world first when another is loaded, then the park laid over it (the simulation
+/// waits for the load); the menus close. True when the menus are left.
+fn load_park(
+    entry: &crate::parks::Entry,
+    s: &mut Shared,
+    menus: &mut Menus,
+    screen: &mut Screen,
+    settings: &mut Settings,
+    fe_menus: &mut crate::fe_menus::FeMenus,
+    changed: &mut bool,
+) -> bool {
+    let bytes = match crate::parks::read(entry) {
+        Ok(b) => b,
+        Err(e) => {
+            println!("park load: {e}");
+            return false;
+        }
+    };
+    let Some(w) = WORLDS.iter().position(|w| w.eq_ignore_ascii_case(&entry.map)) else {
+        println!("park load: no world {} on the Vita", entry.map);
+        return false;
+    };
+    println!("park load: {} on {}", entry.name, entry.map);
+    s.park_load = Some(bytes);
+    menus.world = w;
+    fe_menus.close();
+    *changed |= start_playing(screen, menus, settings, s);
+    true
+}
+
+/// New Park: lays a Park Setup template on its lot (its world loads first, then the sim lays it; retail 825D26C8 resets
+/// the park and loads the template world, flow message 0x76). The skater starts on the board, no editor (owner, on retail).
+fn load_template(
+    template: &crate::parks::Template,
+    s: &mut Shared,
+    menus: &mut Menus,
+    screen: &mut Screen,
+    settings: &mut Settings,
+    fe_menus: &mut crate::fe_menus::FeMenus,
+    changed: &mut bool,
+) -> bool {
+    let Some(w) = WORLDS.iter().position(|w| w.eq_ignore_ascii_case(&template.map)) else {
+        println!("new park: no world {} on the Vita", template.map);
+        return false;
+    };
+    println!("new park: {} on {}", template.world, template.map);
+    s.park_template = Some(template.world.clone());
+    menus.world = w;
+    fe_menus.close();
+    *changed |= start_playing(screen, menus, settings, s);
+    true
+}
+
+/// The save wheel stays up at least this long (NOT RETAIL: ours; the Vita's writes take a fraction of retail's).
+const SAVE_TAG_AT_LEAST: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// The parks with a skate.Park layout (Phase 2's Fullparks): they start the skater at their spawner.
+const SKATE_PARKS: [&str; 4] = ["StartPark", "MegaPark", "IndustrialSkatePark", "DownTownSkatePark"];
 
 fn start_playing(screen: &mut Screen, menus: &Menus, settings: &mut Settings, s: &mut Shared) -> bool {
     *screen = Screen::Playing;

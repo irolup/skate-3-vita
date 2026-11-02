@@ -122,6 +122,8 @@ pub(crate) fn load_package(assets: &Path, map: &SkateMap) -> Option<(SkateMap, V
 pub(crate) struct Pieces {
     pub collision: Vec<skate_data::skate_map::Collision>,
     pub ranges: Vec<std::ops::Range<usize>>,
+    /// skate_vita: per range, its piece's MOBJ id (the Object Dropper finds a piece's rows by it).
+    pub ids: Vec<u32>,
     pub materials: Vec<skate_data::skate_map::Material>,
     pub rails: Vec<PieceRails>,
     pub fuse: FuseRules,
@@ -294,7 +296,8 @@ pub(crate) fn load_pieces(assets: &Path, map: &SkateMap) -> Option<Pieces> {
     let fuse = fuse_rules(&sidecar);
     let ignore = ignore_fuser_ids(&sidecar);
     let unfused = instances.iter().map(|(id, _)| ignore.contains(id)).collect();
-    Some(Pieces { collision, ranges: instances.into_iter().map(|(_, range)| range).collect(), materials: package.materials, rails, fuse, unfused, tags })
+    let ids = instances.iter().map(|(id, _)| *id).collect();
+    Some(Pieces { collision, ranges: instances.into_iter().map(|(_, range)| range).collect(), ids, materials: package.materials, rails, fuse, unfused, tags })
 }
 
 /// A piece's template rails through its row-vector affine (v @ basis + translation): chord endpoints and the

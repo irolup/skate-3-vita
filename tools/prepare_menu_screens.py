@@ -3,7 +3,8 @@
 
 The export is the reference checkout's `tools/prepare_menu_movies.py` (`prepare` and `install`),
 run with its menu roots plus the screens the Vita's own hosts need: the manual meter, the trick
-analyzer, the replay editor and its help. It follows every cross-movie import, as retail's load
+analyzer, the replay editor and its help, the Object Dropper and its Quick Menu, the shared browser (My Parks) and Park
+Setup. It follows every cross-movie import, as retail's load
 queue does, and installs the verified set as `<assets>/private/menu-movies/` (the format the
 engine's APT player reads; `vita-bake ui` packs it). The reference's scripts and its vendored UI
 extractor are imported from the checkout, read-only (no bytecode is written there). The output is
@@ -24,7 +25,14 @@ VITA_ROOTS = (
     'source/screens/hud2/trickanalyser',
     'source/screens/replay2/replay_editor2',
     'source/screens/replay2/replay_help',
+    'source/screens/objectdropper/objectdropper',
+    'source/screens/objectdropper/objectquickmenu',
+    'source/screens/browser/browser',
+    'source/screens/skatepark/parksetup',
 )
+
+# Runtime images the Vita's own screens load by name, beyond the reference's.
+VITA_IMAGE_PREFIXES = ('data/fe/source/images/skatepark/',)
 
 
 def main():
@@ -38,10 +46,19 @@ def main():
     args = parser.parse_args()
     sys.path.insert(0, str(args.reference.resolve() / 'tools'))
     import prepare_menu_movies as menus  # noqa: E402  (the reference's export)
+    # Park Setup's thumbnails, loaded by name (`fe\source\images\skatepark\<thumb>`, retail 825B4638): in fedynamic.big
+    # with the map pictures.
+    menus.IMAGE_PREFIXES_DYNAMIC = tuple(dict.fromkeys(menus.IMAGE_PREFIXES_DYNAMIC + VITA_IMAGE_PREFIXES))
 
     assets = args.assets.resolve()
     collections = assets / 'private/stock/skater-collections.json'
-    roots = tuple(menus.MENU_ROOTS) + tuple(r for r in VITA_ROOTS if r not in menus.MENU_ROOTS)
+    # The screens already installed stay (a newer reference checkout may list fewer roots): an export only adds.
+    installed = assets / 'private/menu-movies/manifest.json'
+    kept = []
+    if installed.is_file():
+        import json
+        kept = [k for k in json.loads(installed.read_text()).get('movies', {}) if k.startswith('source/screens/')]
+    roots = tuple(dict.fromkeys(list(menus.MENU_ROOTS) + kept + list(VITA_ROOTS)))
     manifest = menus.prepare(args.game.resolve(), args.work.resolve(), collections, roots=roots)
     missing = [r for r in VITA_ROOTS if menus.library_key(r) not in manifest['movies']]
     if missing:

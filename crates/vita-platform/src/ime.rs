@@ -26,11 +26,19 @@ impl Keyboard {
     /// Opens the keyboard titled `title`, taking at most `max_len` characters (capped at 128). False when the system
     /// refused it (another dialog runs).
     pub fn open(&mut self, title: &str, max_len: usize) -> bool {
+        self.open_with(title, "", max_len)
+    }
+
+    /// [`Self::open`] with `text` already typed (a name to change).
+    pub fn open_with(&mut self, title: &str, text: &str, max_len: usize) -> bool {
         if self.buffers.is_some() {
             return false;
         }
         let mut b = Box::new(Buffers { title: [0; 64], input: [0; MAX_LEN + 1], param: unsafe { core::mem::zeroed() } });
         for (dst, src) in b.title.iter_mut().zip(title.encode_utf16().take(63)) {
+            *dst = src;
+        }
+        for (dst, src) in b.input.iter_mut().zip(text.encode_utf16().take(max_len.clamp(1, MAX_LEN))) {
             *dst = src;
         }
         let input = b.input.as_mut_ptr();

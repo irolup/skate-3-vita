@@ -124,6 +124,11 @@ pub struct Icons {
     trail: Option<Style>,
 }
 
+/// A PNG as (width, height, RGBA8).
+pub fn decode_png(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
+    png(bytes)
+}
+
 fn png(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
     let mut decoder = png::Decoder::new(bytes);
     decoder.set_transformations(png::Transformations::EXPAND);
@@ -179,6 +184,27 @@ fn strips(points: &[(Vec3, f32)], style: &Style) -> (Vec<[f32; 5]>, Vec<u16>) {
         }
     }
     (vertices, indices)
+}
+
+/// An Object Dropper marker's ribbon from the catalogue's marker row (`catalog.json` `markers`: the spline as the
+/// visual indicators export writes it, the row's style): the mesh in the marker's frame and the style's pass
+/// intensities (front, background) and fade window, moved by `offset` (the bake's: the shape's middle on the footprint's). None when
+/// either does not read.
+pub fn marker_mesh(spline: &serde_json::Value, style: &serde_json::Value, offset: [f32; 3]) -> Option<(Vec<[f32; 5]>, Vec<u16>, [f32; 2], [f32; 4])> {
+    let spline: Spline = serde_json::from_value(spline.clone()).ok()?;
+    let style: Style = serde_json::from_value(style.clone()).ok()?;
+    let (mut vertices, indices) = ribbon(&spline, &style);
+    for v in &mut vertices {
+        for k in 0..3 {
+            v[k] += offset[k];
+        }
+    }
+    Some((vertices, indices, style.intensity, style.fade))
+}
+
+/// The opacity at view depth `distance` of a style's fade window (see [`Style::alpha`]).
+pub fn fade_alpha(fade: [f32; 4], distance: f32) -> f32 {
+    Style { width: [0.0; 2], samples: 1, three_strips: false, fade, intensity: [1.0; 2] }.alpha(distance)
 }
 
 impl Icons {

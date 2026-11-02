@@ -1,0 +1,10 @@
+// skate vita Object Dropper selection outline: flat colour, the alpha-tested materials' holes kept.
+uniform sampler2D albedo;
+uniform float4 colour;
+uniform float cutoff;
+
+float4 main(float2 vUv : TEXCOORD0) : COLOR {
+	if (tex2D(albedo, vUv).a < cutoff)
+		discard;
+	return colour;
+}

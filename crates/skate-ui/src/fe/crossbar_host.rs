@@ -210,6 +210,11 @@ pub struct FrontEnd<'a> {
     pub challenge_map: crate::fe::challenge_map_host::ChallengeMapHost,
     /// The instant replay screen FE 12 (replay_menu_host).
     pub replay_menu: crate::fe::replay_menu_host::ReplayMenuHost,
+    pub object_dropper: crate::fe::object_dropper_host::ObjectDropperHost,
+    /// The shared browser on parks, FE 0x3B (browser_host).
+    pub browser: crate::fe::browser_host::BrowserHost,
+    /// Park Setup, FE 0x3A (park_setup_host).
+    pub park_setup: crate::fe::park_setup_host::ParkSetupHost,
     /// The action overlay's teleporter title (`SignUpPoster.GetTeleportTitle`, 825C1020).
     pub signup_title: Option<String>,
     /// The image slots (`Game.ImageRenderer_*`, one global manager across screens).
@@ -251,6 +256,9 @@ impl<'a> FrontEnd<'a> {
             trick_guide: Default::default(),
             challenge_map: Default::default(),
             replay_menu: Default::default(),
+            object_dropper: Default::default(),
+            browser: Default::default(),
+            park_setup: Default::default(),
             signup_title: None,
             image_slots: Default::default(),
             popup: Default::default(),
@@ -266,7 +274,7 @@ impl<'a> FrontEnd<'a> {
 
 impl crate::fe::apt_stage::StageNatives for FrontEnd<'_> {
     fn objects(&self) -> Vec<String> {
-        ["Game", "CoreMenu", "Audio", "FELanguage", "FETrickTutorial", "FEChallengeMap", "FEReplayMenu", "HUDComponents", "Popup", "Progression", "Stats", "SignUpPoster", "tos", "SkaterSpawner", "FreeSkateOption", "TipsLoader"]
+        ["Game", "CoreMenu", "Audio", "FELanguage", "FETrickTutorial", "FEChallengeMap", "FEReplayMenu", "HUDComponents", "Popup", "Progression", "Stats", "SignUpPoster", "tos", "SkaterSpawner", "FreeSkateOption", "TipsLoader", "SkatePark", "CommonBrowser"]
             .map(String::from)
             .to_vec()
     }
@@ -295,6 +303,15 @@ impl crate::fe::apt_stage::StageNatives for FrontEnd<'_> {
             return Ok(value);
         }
         if let Some(value) = self.replay_menu.call(vm, self.language, object, method) {
+            return Ok(value);
+        }
+        if let Some(value) = self.object_dropper.call(vm, self.language, object, method, &args)? {
+            return Ok(value);
+        }
+        if let Some(value) = self.park_setup.call(vm, object, method, &args)? {
+            return Ok(value);
+        }
+        if let Some(value) = self.browser.call(vm, object, method, &args)? {
             return Ok(value);
         }
         if let Some(value) = self.offline_profile.call(vm, object, method)? {

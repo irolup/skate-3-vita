@@ -38,6 +38,12 @@ const CAR_FRAG: &CStr = cstr(concat!(include_str!("../../../shaders/car.frag.cg"
 const ICON_VERT: &CStr = cstr(concat!(include_str!("../../../shaders/icon.vert.cg"), "\0"));
 const ICON_FRAG: &CStr = cstr(concat!(include_str!("../../../shaders/icon.frag.cg"), "\0"));
 const CAR_GLASS_FRAG: &CStr = cstr(concat!(include_str!("../../../shaders/car_glass.frag.cg"), "\0"));
+const OUTLINE_VERT: &CStr = cstr(concat!(include_str!("../../../shaders/outline.vert.cg"), "\0"));
+const OUTLINE_FRAG: &CStr = cstr(concat!(include_str!("../../../shaders/outline.frag.cg"), "\0"));
+/// The Object Dropper's selection outline: its width in pixels and colour (the owner's retail description: white).
+/// NOT RETAIL YET: retail's edge pass (`postfx_edgedetectstencilPS`) width and colour are not read.
+const OUTLINE_PIXELS: f32 = 2.0;
+const OUTLINE_COLOUR: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
 /// Retail `kd` without a normal map (retail_world.wgsl).
 const KD: f32 = 0.93429;
 /// Park fog range (m); the far plane is `math::FAR`.
@@ -202,8 +208,13 @@ pub struct Scene {
     pass_frames: u32,
     /// The world's movable props (template meshes) and their programs.
     props: Option<PropsGpu>,
+    /// Object Dropper catalogue items loaded so far (by the app's key), and the catalogue's shared textures
+    /// (part, index) uploaded for them.
+    catalog: std::collections::HashMap<u32, CatalogItemGpu>,
+    catalog_textures: std::collections::HashMap<(bool, u16), GLuint>,
     prop: ParkProgram,
     prop_mask: ParkProgram,
+    outline: OutlineProgram,
     /// The traffic car models (by `Session::car_models` index) and their programs.
     cars: Vec<Option<CarGpu>>,
     car: SkinProgram,
@@ -224,6 +235,30 @@ pub struct Scene {
     grade_dirty: bool,
     /// The teleporter icons' mesh and textures (`load_icons`).
     icons: Option<IconsGpu>,
+    /// The Object Dropper's markers (`load_markers`).
+    markers: Option<MarkersGpu>,
+}
+
+/// The Object Dropper's markers (the park spawner, the teleporters): ribbon meshes (the icons' layout) and colours (front,
+/// background textures), with the icons' program.
+struct MarkersGpu {
+    program: Program,
+    viewproj: GLint,
+    model: GLint,
+    scale: GLint,
+    meshes: Vec<(GLuint, GLuint, GLsizei)>,
+    colours: Vec<(GLuint, GLuint)>,
+}
+
+/// One Object Dropper marker to draw: its mesh and colour (`Scene::load_markers` order), model matrix and pass factors
+/// as [`IconInstance`]'s.
+#[derive(Clone, Copy, Debug)]
+pub struct MarkerInstance {
+    pub mesh: usize,
+    pub colour: usize,
+    pub model: Mat4,
+    pub front: f32,
+    pub background: [f32; 2],
 }
 
 /// The teleporter icon's ribbon mesh (position, uv; `IconsGpu::STRIDE`) and its two pass textures, with its program.
@@ -352,6 +387,55 @@ struct CarGpu {
     max: Vec3,
 }
 
+/// One Object Dropper catalogue item to draw: its key (`Scene::load_catalog_item`) and pose.
+#[derive(Clone, Copy, Debug)]
+pub struct CatalogInstance {
+    pub key: u32,
+    pub model: Mat4,
+    /// The Object Dropper colour, multiplied on its draws' tint (white: none).
+    pub tint: [f32; 3],
+    /// Drawn with the selection outline (the item in hand).
+    pub outline: bool,
+}
+
+/// The selection outline's program: the item flat-coloured, moved on screen by `offset`.
+struct OutlineProgram {
+    program: Program,
+    viewproj: GLint,
+    model: GLint,
+    offset: GLint,
+    colour: GLint,
+    cutoff: GLint,
+}
+
+impl OutlineProgram {
+    fn new() -> Self {
+        let program = Program::new("outline", OUTLINE_VERT, OUTLINE_FRAG, &[c"aPosition", c"aUv"]);
+        let o = Self {
+            viewproj: program.uniform(c"viewproj"),
+            model: program.uniform(c"model"),
+            offset: program.uniform(c"offset"),
+            colour: program.uniform(c"colour"),
+            cutoff: program.uniform(c"cutoff"),
+            program,
+        };
+        unsafe {
+            glUseProgram(o.program.id);
+            glUniform1i(o.program.uniform(c"albedo"), 0);
+        }
+        o
+    }
+}
+
+/// A catalogue item on the GPU: its buffers, its draws with their textures, and its template-space bounds.
+struct CatalogItemGpu {
+    vbo: GLuint,
+    ibo: GLuint,
+    draws: Vec<(ParkDraw, GLuint, GLuint)>,
+    lo: Vec3,
+    hi: Vec3,
+}
+
 /// One movable prop to draw this frame: its template (index in the props render) and pose.
 #[derive(Clone, Copy, Debug)]
 pub struct PropInstance {
@@ -392,6 +476,13 @@ pub struct Frame<'a> {
     pub icons: &'a [IconInstance],
     /// The called skaters' trails in view (drawn with the icons).
     pub trails: &'a [TrailInstance],
+    /// Object Dropper items (catalogue renders at their poses).
+    pub catalog: &'a [CatalogInstance],
+    /// Object Dropper markers (drawn with the icons).
+    pub markers: &'a [MarkerInstance],
+    /// Park index ranges left out (`[draw, first index, index count]`, the pieces the editor moved or deleted;
+    /// sorted by draw and first index).
+    pub hidden: &'a [[u32; 3]],
 }
 
 impl Scene {
@@ -445,8 +536,11 @@ impl Scene {
                 pass_draws: [0; 5],
                 pass_frames: 0,
                 props: None,
+                catalog: Default::default(),
+                catalog_textures: Default::default(),
                 prop,
                 prop_mask,
+                outline: OutlineProgram::new(),
                 cars: Vec::new(),
                 car,
                 car_glass,
@@ -460,6 +554,7 @@ impl Scene {
                 grade: Grade::IDENTITY,
                 grade_dirty: true,
                 icons: None,
+                markers: None,
             }
         }
     }
@@ -755,6 +850,58 @@ impl Scene {
         }
     }
 
+    pub fn has_catalog_item(&self, key: u32) -> bool {
+        self.catalog.contains_key(&key)
+    }
+
+    /// Loads one catalogue item under `key`; `texture(n)` gives its part's shared texture `n` the first time an item
+    /// uses it (`props`: which part's table).
+    pub fn load_catalog_item(&mut self, key: u32, props: bool, item: &vita_pack::catalog::ItemRender, texture: &mut dyn FnMut(u16) -> Option<Texture>) {
+        if self.catalog.contains_key(&key) {
+            return;
+        }
+        let white = self.white;
+        let mut gl_texture = |n: Option<u16>, cache: &mut std::collections::HashMap<(bool, u16), GLuint>| -> GLuint {
+            let Some(n) = n else { return white };
+            if let Some(&t) = cache.get(&(props, n)) {
+                return t;
+            }
+            let t = texture(n).map_or(white, |t| upload_texture(&t));
+            cache.insert((props, n), t);
+            t
+        };
+        unsafe {
+            let vbo = buffer(GL_ARRAY_BUFFER, &item.vertex_data);
+            let index_bytes: Vec<u8> = item.indices.iter().flat_map(|i| i.to_le_bytes()).collect();
+            let ibo = buffer(GL_ELEMENT_ARRAY_BUFFER, &index_bytes);
+            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+            let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+            let draws = item
+                .draws
+                .iter()
+                .map(|d| {
+                    let draw = park_draw(d);
+                    lo = lo.min(draw.min);
+                    hi = hi.max(draw.max);
+                    (draw, gl_texture(d.albedo, &mut self.catalog_textures), gl_texture(d.lightmap, &mut self.catalog_textures))
+                })
+                .collect();
+            self.catalog.insert(key, CatalogItemGpu { vbo, ibo, draws, lo, hi });
+        }
+    }
+
+    /// Frees every catalogue item and their textures.
+    pub fn unload_catalog(&mut self) {
+        unsafe {
+            for (_, item) in self.catalog.drain() {
+                glDeleteBuffers(1, &item.vbo);
+                glDeleteBuffers(1, &item.ibo);
+            }
+            let textures: Vec<GLuint> = self.catalog_textures.drain().map(|(_, t)| t).filter(|&t| t != self.white).collect();
+            glDeleteTextures(textures.len() as GLsizei, textures.as_ptr());
+        }
+    }
+
     /// Frees the movable props.
     pub fn unload_props(&mut self) {
         if let Some(p) = self.props.take() {
@@ -867,6 +1014,81 @@ impl Scene {
         }
     }
 
+    /// The Object Dropper's marker meshes (x, y, z, u, v; indices) and colours (front, background RGBA8), replacing any
+    /// loaded ones; [`MarkerInstance`] names them by index.
+    pub fn load_markers(&mut self, meshes: &[(Vec<[f32; 5]>, Vec<u16>)], colours: &[(Texture, Texture)]) {
+        self.unload_markers();
+        let program = Program::new("icon", ICON_VERT, ICON_FRAG, &[c"aPosition", c"aUv"]);
+        unsafe {
+            glUseProgram(program.id);
+            glUniform1i(program.uniform(c"tex"), 0);
+            let meshes = meshes
+                .iter()
+                .map(|(vertices, indices)| {
+                    let bytes: Vec<u8> = vertices.iter().flatten().flat_map(|f| f.to_le_bytes()).collect();
+                    let index_bytes: Vec<u8> = indices.iter().flat_map(|i| i.to_le_bytes()).collect();
+                    (buffer(GL_ARRAY_BUFFER, &bytes), buffer(GL_ELEMENT_ARRAY_BUFFER, &index_bytes), indices.len() as GLsizei)
+                })
+                .collect();
+            let colours = colours.iter().map(|(front, background)| (upload_texture(front), upload_texture(background))).collect();
+            self.markers = Some(MarkersGpu {
+                viewproj: program.uniform(c"viewproj"),
+                model: program.uniform(c"model"),
+                scale: program.uniform(c"scale"),
+                program,
+                meshes,
+                colours,
+            });
+        }
+    }
+
+    pub fn unload_markers(&mut self) {
+        if let Some(m) = self.markers.take() {
+            unsafe {
+                for (vbo, ibo, _) in &m.meshes {
+                    glDeleteBuffers(1, vbo);
+                    glDeleteBuffers(1, ibo);
+                }
+                for (front, background) in &m.colours {
+                    glDeleteTextures(1, front);
+                    glDeleteTextures(1, background);
+                }
+            }
+        }
+    }
+
+    /// The markers as the icons: background alpha blended, then front added; depth tested, no depth write, both faces.
+    fn draw_markers(&self, markers: &[MarkerInstance], vp: &[f32; 16]) {
+        let Some(gpu) = self.markers.as_ref().filter(|_| !markers.is_empty()) else { return };
+        unsafe {
+            glUseProgram(gpu.program.id);
+            glUniformMatrix4fv(gpu.viewproj, 1, GL_FALSE, vp.as_ptr());
+            glDisable(GL_CULL_FACE);
+            glDepthMask(GL_FALSE);
+            glEnable(GL_BLEND);
+            glActiveTexture(GL_TEXTURE0);
+            for m in markers {
+                let (Some(&(vbo, ibo, count)), Some(&(front, background))) = (gpu.meshes.get(m.mesh), gpu.colours.get(m.colour)) else { continue };
+                glBindBuffer(GL_ARRAY_BUFFER, vbo);
+                glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo);
+                attributes(&[(3, GL_FLOAT, GL_FALSE, 0), (2, GL_FLOAT, GL_FALSE, 12)], IconsGpu::STRIDE);
+                glUniformMatrix4fv(gpu.model, 1, GL_FALSE, m.model.to_cols_array().as_ptr());
+                let [b, a] = m.background;
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                glBindTexture(GL_TEXTURE_2D, background);
+                glUniform4f(gpu.scale, b, b, b, a);
+                glDrawElements(GL_TRIANGLES, count, GL_UNSIGNED_SHORT, std::ptr::null());
+                glBlendFunc(GL_ONE, GL_ONE);
+                glBindTexture(GL_TEXTURE_2D, front);
+                glUniform4f(gpu.scale, m.front, m.front, m.front, 1.0);
+                glDrawElements(GL_TRIANGLES, count, GL_UNSIGNED_SHORT, std::ptr::null());
+            }
+            glDisable(GL_BLEND);
+            glDepthMask(GL_TRUE);
+            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+        }
+    }
+
     /// Retail's two passes per icon (b535 `827AFC80`, b536 `82CE9080`): the background alpha blended, then the front
     /// added; depth tested, no depth write, both faces.
     fn draw_icons(&self, icons: &[IconInstance], trails: &[TrailInstance], vp: &[f32; 16]) {
@@ -959,7 +1181,8 @@ impl Scene {
         unsafe {
             glClearColor(sky[0], sky[1], sky[2], 1.0);
             glClearDepthf(1.0);
-            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+            glClearStencil(0);
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
             glEnable(GL_DEPTH_TEST);
             glDepthFunc(GL_LEQUAL);
             glDepthMask(GL_TRUE);
@@ -1017,6 +1240,24 @@ impl Scene {
                     draws[1] += submitted;
                 }
             }
+            // The Object Dropper's items, lit as the world around them.
+            if !frame.catalog.is_empty() {
+                let (horizon, scale) = self
+                    .district
+                    .as_ref()
+                    .map(|d| (d.horizon(), d.scale()))
+                    .or(self.park_gpu.as_ref().map(|p| (p.horizon, p.scale)))
+                    .unwrap_or((SKY, KD));
+                let (submitted, culled) = draw_catalog(&self.catalog, frame.catalog, &self.prop, &self.prop_mask, frame, &vp, horizon, scale);
+                self.last_draws.0 += submitted;
+                self.last_draws.1 += culled;
+                draws[1] += submitted;
+                if frame.catalog.iter().any(|i| i.outline) {
+                    let outlined = draw_outlines(&self.catalog, frame.catalog, &self.outline, &vp);
+                    self.last_draws.0 += outlined;
+                    draws[1] += outlined;
+                }
+            }
             mark(1, &mut at, &mut us, &mut draws, 0);
 
             // The cars' bodies (opaque), then the glass after the skater.
@@ -1049,8 +1290,9 @@ impl Scene {
                 }
             }
             self.draw_cars(frame, &vp, true);
-            // The teleporter icons, blended over everything.
+            // The teleporter icons and the Object Dropper's markers, blended over everything.
             self.draw_icons(frame.icons, frame.trails, &vp);
+            self.draw_markers(frame.markers, &vp);
             mark(4, &mut at, &mut us, &mut draws, 1 + frame.npcs.len() as u32);
             for i in 0..5 {
                 self.pass_us[i] += us[i];
@@ -1369,15 +1611,134 @@ fn draw_props(props: &PropsGpu, instances: &[PropInstance], white: GLuint, opaqu
     (submitted, culled)
 }
 
+/// The Object Dropper's items: each item's draws at the instance's pose (frustum-culled by its box moved by the
+/// pose), with the props' programs.
+#[allow(clippy::too_many_arguments)]
+fn draw_catalog(items: &std::collections::HashMap<u32, CatalogItemGpu>, instances: &[CatalogInstance], opaque: &ParkProgram, masked: &ParkProgram, frame: &Frame, vp: &[f32; 16], horizon: [f32; 3], scale: f32) -> (u32, u32) {
+    let planes = frustum(&frame.view_proj);
+    let (mut submitted, mut culled) = (0, 0);
+    unsafe {
+        glDisable(GL_CULL_FACE);
+        let mut current: Option<bool> = None;
+        for instance in instances {
+            let Some(item) = items.get(&instance.key) else { continue };
+            let (mut min, mut max) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+            for corner in 0..8 {
+                let p = Vec3::new(if corner & 1 == 0 { item.lo.x } else { item.hi.x }, if corner & 2 == 0 { item.lo.y } else { item.hi.y }, if corner & 4 == 0 { item.lo.z } else { item.hi.z });
+                let w = instance.model.transform_point3(p);
+                min = min.min(w);
+                max = max.max(w);
+            }
+            if !visible(&planes, min, max) {
+                culled += 1;
+                continue;
+            }
+            glBindBuffer(GL_ARRAY_BUFFER, item.vbo);
+            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, item.ibo);
+            let model = instance.model.to_cols_array();
+            for (d, albedo, lightmap) in &item.draws {
+                let is_masked = d.cutoff.is_some();
+                let p = if is_masked { masked } else { opaque };
+                if current != Some(is_masked) {
+                    glUseProgram(p.program.id);
+                    glUniformMatrix4fv(p.viewproj, 1, GL_FALSE, vp.as_ptr());
+                    glUniform3f(p.eye, frame.eye.x, frame.eye.y, frame.eye.z);
+                    glUniform2f(p.fog, PARK_FOG[0], PARK_FOG[1]);
+                    glUniform3f(p.horizon, horizon[0], horizon[1], horizon[2]);
+                    glUniform1f(p.scale, scale);
+                    current = Some(is_masked);
+                }
+                if let Some(location) = p.model {
+                    glUniformMatrix4fv(location, 1, GL_FALSE, model.as_ptr());
+                }
+                if let (Some(location), Some(cutoff)) = (p.cutoff, d.cutoff) {
+                    glUniform1f(location, cutoff);
+                }
+                let t = instance.tint;
+                glUniform4f(p.tint, d.tint[0] * t[0], d.tint[1] * t[1], d.tint[2] * t[2], d.tint[3]);
+                glActiveTexture(GL_TEXTURE0);
+                glBindTexture(GL_TEXTURE_2D, *albedo);
+                glActiveTexture(GL_TEXTURE1);
+                glBindTexture(GL_TEXTURE_2D, *lightmap);
+                attributes(&[
+                    (3, GL_FLOAT, GL_FALSE, d.vertex_offset + park_pack::POSITION),
+                    (2, GL_FLOAT, GL_FALSE, d.vertex_offset + park_pack::UV),
+                    (2, GL_FLOAT, GL_FALSE, d.vertex_offset + park_pack::LIGHTMAP_UV),
+                ], park_pack::STRIDE);
+                glDrawElements(GL_TRIANGLES, d.index_count as GLsizei, GL_UNSIGNED_SHORT, (d.first_index as usize * 2) as *const c_void);
+                submitted += 1;
+            }
+        }
+        glActiveTexture(GL_TEXTURE0);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    }
+    (submitted, culled)
+}
+
+/// The selection outline around the outlined catalogue items, as retail's (the selection marked in the stencil, its
+/// edge drawn over everything): their visible pixels marked, then the items drawn flat white, moved a few pixels each
+/// way, where nothing is marked, without the depth test. Returns the draws submitted.
+fn draw_outlines(items: &std::collections::HashMap<u32, CatalogItemGpu>, instances: &[CatalogInstance], program: &OutlineProgram, vp: &[f32; 16]) -> u32 {
+    let (dx, dy) = (2.0 * OUTLINE_PIXELS / crate::math::WIDTH as f32, 2.0 * OUTLINE_PIXELS / crate::math::HEIGHT as f32);
+    let d = std::f32::consts::FRAC_1_SQRT_2;
+    let offsets = [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0), (d, d), (-d, d), (d, -d), (-d, -d)];
+    let mut submitted = 0;
+    unsafe {
+        glUseProgram(program.program.id);
+        glUniformMatrix4fv(program.viewproj, 1, GL_FALSE, vp.as_ptr());
+        glUniform4f(program.colour, OUTLINE_COLOUR[0], OUTLINE_COLOUR[1], OUTLINE_COLOUR[2], OUTLINE_COLOUR[3]);
+        glEnable(GL_STENCIL_TEST);
+        glStencilMask(0xFF);
+        glDepthMask(GL_FALSE);
+        glActiveTexture(GL_TEXTURE0);
+        // Pass 0 marks (depth-tested, no colour), pass 1 draws the edge.
+        for pass in 0..2 {
+            if pass == 0 {
+                glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+                glStencilFunc(GL_ALWAYS, 1, 0xFF);
+                glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+            } else {
+                glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+                glStencilFunc(GL_NOTEQUAL, 1, 0xFF);
+                glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
+                glDisable(GL_DEPTH_TEST);
+            }
+            for instance in instances.iter().filter(|i| i.outline) {
+                let Some(item) = items.get(&instance.key) else { continue };
+                glBindBuffer(GL_ARRAY_BUFFER, item.vbo);
+                glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, item.ibo);
+                glUniformMatrix4fv(program.model, 1, GL_FALSE, instance.model.to_cols_array().as_ptr());
+                for (d, albedo, _) in &item.draws {
+                    glUniform1f(program.cutoff, d.cutoff.unwrap_or(-1.0));
+                    glBindTexture(GL_TEXTURE_2D, *albedo);
+                    attributes(&[(3, GL_FLOAT, GL_FALSE, d.vertex_offset + park_pack::POSITION), (2, GL_FLOAT, GL_FALSE, d.vertex_offset + park_pack::UV)], park_pack::STRIDE);
+                    let moves: &[(f32, f32)] = if pass == 0 { &[(0.0, 0.0)] } else { &offsets };
+                    for (x, y) in moves {
+                        glUniform2f(program.offset, x * dx, y * dy);
+                        glDrawElements(GL_TRIANGLES, d.index_count as GLsizei, GL_UNSIGNED_SHORT, (d.first_index as usize * 2) as *const c_void);
+                        submitted += 1;
+                    }
+                }
+            }
+        }
+        glEnable(GL_DEPTH_TEST);
+        glDepthMask(GL_TRUE);
+        glDisable(GL_STENCIL_TEST);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    }
+    submitted
+}
+
 fn draw_park(park: &ParkGpu, white: GLuint, opaque: &ParkProgram, masked: &ParkProgram, frame: &Frame, vp: &[f32; 16]) -> (u32, u32) {
     let planes = frustum(&frame.view_proj);
     let (mut submitted, mut culled) = (0, 0);
+    let mut runs = Vec::new();
     unsafe {
         glDisable(GL_CULL_FACE);
         glBindBuffer(GL_ARRAY_BUFFER, park.vbo);
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, park.ibo);
         let mut current: Option<bool> = None;
-        for d in &park.draws {
+        for (index, d) in park.draws.iter().enumerate() {
             if !visible(&planes, d.min, d.max) {
                 culled += 1;
                 continue;
@@ -1406,8 +1767,17 @@ fn draw_park(park: &ParkGpu, white: GLuint, opaque: &ParkProgram, masked: &ParkP
                 (2, GL_FLOAT, GL_FALSE, d.vertex_offset + park_pack::UV),
                 (2, GL_FLOAT, GL_FALSE, d.vertex_offset + park_pack::LIGHTMAP_UV),
             ], park_pack::STRIDE);
-            glDrawElements(GL_TRIANGLES, d.index_count as GLsizei, GL_UNSIGNED_SHORT, (d.first_index as usize * 2) as *const c_void);
-            submitted += 1;
+            if frame.hidden.is_empty() {
+                glDrawElements(GL_TRIANGLES, d.index_count as GLsizei, GL_UNSIGNED_SHORT, (d.first_index as usize * 2) as *const c_void);
+                submitted += 1;
+            } else {
+                // The Object Dropper's moved or deleted pieces left out: the runs around them.
+                crate::spans::visible_runs(index as u32, d.first_index, d.index_count, frame.hidden, &mut runs);
+                for &(first, count) in &runs {
+                    glDrawElements(GL_TRIANGLES, count as GLsizei, GL_UNSIGNED_SHORT, (first as usize * 2) as *const c_void);
+                    submitted += 1;
+                }
+            }
         }
         glActiveTexture(GL_TEXTURE0);
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
@@ -1489,3 +1859,4 @@ fn delete_park(p: ParkGpu) {
         glDeleteTextures(uploaded.len() as GLsizei, uploaded.as_ptr());
     }
 }
+

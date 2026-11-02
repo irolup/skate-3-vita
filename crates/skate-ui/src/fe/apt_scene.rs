@@ -169,6 +169,11 @@ fn visit(
             "ImageRenderComponent" => last_digits(&vm.get(id, "_name").text())
                 .filter(|slot| *slot < crate::fe::image_renderer_host::SLOTS)
                 .map(|slot| format!("{}{slot}", crate::fe::image_renderer_host::SLOT_TEXTURE_PREFIX)),
+            // SwatchRenderComponent (swatch_renderer, the Object Dropper's colour grid): the slot is the clip's name, as
+            // the image renderer's; the stage fills it with the slot's colour (`Game.SwatchRenderer_SetColour`).
+            "SwatchRenderComponent" => last_digits(&vm.get(id, "_name").text())
+                .filter(|slot| *slot < crate::fe::object_dropper_host::SWATCH_SLOTS)
+                .map(|slot| format!("{}{slot}", crate::fe::object_dropper_host::SWATCH_TEXTURE_PREFIX)),
             _ => None,
         };
         // MapRenderComponent (b262 / b263, retail 825E2618 -> 8268D898): the host draws the map markers in the clip's
@@ -180,6 +185,14 @@ fn visit(
         if kind == "CustomTimeline" {
             let point = |x: f32, y: f32| transform(matrix, &Vertex { position: [x, y], uv: [0., 0.] });
             out.push(Draw { texture: REPLAY_TIMELINE.to_owned(), fill: Fill::TextureClamped, vertices: vec![point(0., 0.), point(1., 0.), point(0., 1.)], multiply, add });
+        }
+        // FungShui / FungShuiDynamic (the Object Dropper's meter, retail dispatcher 825D4828 -> 825119C8): the host
+        // draws the terrain / props bar over the placeholder's bounds; the draw carries their corners.
+        if kind == "FungShui" || kind == "FungShuiDynamic" {
+            let b = movie.character_bounds(instance.character, 0).unwrap_or([0.0, 0.0, 1.0, 1.0]);
+            let point = |x: f32, y: f32| transform(matrix, &Vertex { position: [x, y], uv: [0., 0.] });
+            let texture = if kind == "FungShui" { FENG_SHUI_TERRAIN } else { FENG_SHUI_PROPS };
+            out.push(Draw { texture: texture.to_owned(), fill: Fill::Solid, vertices: vec![point(b[0], b[1]), point(b[2], b[1]), point(b[0], b[3])], multiply, add });
         }
         if kind == "MapRenderComponent" {
             let point = |x: f32, y: f32| transform(matrix, &Vertex { position: [x, y], uv: [0., 0.] });
@@ -269,7 +282,13 @@ fn visit(
             };
             let mut vertices = Vec::new();
             for (row, value) in lines.iter().enumerate() {
-            let width = font.width(value, height);
+            let parts = inline_buttons(value);
+            // An inline button (`<B:name>`) is a square of the font height (NOT RETAIL YET: retail's size and spacing
+            // for the image are not decoded).
+            let width: f32 = parts.iter().map(|p| match p {
+                Inline::Text(t) => font.width(t, height),
+                Inline::Button(_) => height,
+            }).sum();
             // 82CA23B4: 1 right, 2 and 3 centred (factor 0.5 at 0x8209975C), else left.
             let mut x = bounds[0]
                 + advance_x
@@ -280,7 +299,22 @@ fn visit(
                     _ => 0.,
                 };
             let y = bounds[1] + font.offset[1] * sy + row as f32 * font.line_advance(height);
-            for c in value.chars() {
+            for part in &parts {
+            let text = match part {
+                Inline::Text(t) => t,
+                Inline::Button(name) => {
+                    // Drawn once, by the shadow-less pass: a `prompt/<name>` quad, as a CustomButton clip.
+                    if !shadow && crate::fe::prompt_glyphs::known(name) {
+                        let top = bounds[1] + row as f32 * font.line_advance(height);
+                        let corner = |x: f32, y: f32, u: f32, v: f32| transform(matrix, &Vertex { position: [x, y], uv: [u, v] });
+                        let (a, b, c, d) = (corner(x, top, 0., 0.), corner(x + height, top, 1., 0.), corner(x + height, top + height, 1., 1.), corner(x, top + height, 0., 1.));
+                        out.push(Draw { texture: format!("prompt/{name}"), fill: Fill::TextureClamped, vertices: vec![a.clone(), b, c.clone(), a, c, d], multiply, add });
+                    }
+                    x += height;
+                    continue;
+                }
+            };
+            for c in text.chars() {
                 if let Some(g) = font.glyph(c) {
                     let x0 = x + g.x_offset * sx;
                     let y0 = y + (font.ascent - g.y_offset) * sy;
@@ -303,6 +337,7 @@ fn visit(
                     }
                     x = g.x_advance.mul_add(sx, x);
                 }
+            }
             }
             }
             let argb = u32::from_str_radix(
@@ -357,7 +392,44 @@ fn last_digits(name: &str) -> Option<usize> {
     name[start..end].parse().ok()
 }
 
+/// A text value's parts: text, and the inline buttons of the language strings (`<B:A_hud> Place`).
+#[derive(Debug, PartialEq)]
+enum Inline<'a> {
+    Text(&'a str),
+    Button(&'a str),
+}
+
+fn inline_buttons(value: &str) -> Vec<Inline<'_>> {
+    let mut out = Vec::new();
+    let mut rest = value;
+    while let Some(start) = rest.find("<B:") {
+        let Some(len) = rest[start..].find('>') else { break };
+        if start > 0 {
+            out.push(Inline::Text(&rest[..start]));
+        }
+        out.push(Inline::Button(&rest[start + 3..start + len]));
+        rest = &rest[start + len + 1..];
+    }
+    if !rest.is_empty() {
+        out.push(Inline::Text(rest));
+    }
+    out
+}
+
+#[cfg(test)]
+#[test]
+fn inline_buttons_split_the_language_tokens() {
+    assert_eq!(
+        inline_buttons("<B:X_hud> New object <B:Y_hud> Delete"),
+        vec![Inline::Button("X_hud"), Inline::Text(" New object "), Inline::Button("Y_hud"), Inline::Text(" Delete")]
+    );
+    assert_eq!(inline_buttons("Back"), vec![Inline::Text("Back")]);
+}
+
 /// Texture key of the MapRenderComponent placeholder draw (three transformed points, expanded by the host).
 pub(crate) const MAP_MARKERS: &str = "map-markers/";
+/// The Object Dropper's Feng Shui bars (`FungShui` terrain, `FungShuiDynamic` props), expanded by the stage.
+pub(crate) const FENG_SHUI_TERRAIN: &str = "feng-shui-terrain/";
+pub(crate) const FENG_SHUI_PROPS: &str = "feng-shui-props/";
 /// The replay editor timeline placeholder (`CustomTimeline`), expanded by the stage from the replay screen's feed.
 pub(crate) const REPLAY_TIMELINE: &str = "replay-timeline/";

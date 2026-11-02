@@ -27,7 +27,9 @@ pub fn fullpark(assets: &Path, map: &str) -> Option<String> {
 
 /// The layout's pieces as one render-only map in world space: each piece's triangles posed by its placement, its
 /// tint in the material colour, the projected lightmap in the lightmap channel. `sun`: the park's sun direction.
-pub fn posed(assets: &Path, layout: &str, sun: [f32; 3]) -> Result<SkateMap, String> {
+/// Also each piece's first vertex and MOBJ id, in vertex order (a piece's vertices are one run), so the render
+/// builder can tell a triangle's piece (Object Dropper step D2c).
+pub fn posed(assets: &Path, layout: &str, sun: [f32; 3]) -> Result<(SkateMap, Vec<(u32, u32)>), String> {
     let directory = assets.join("private/park-layouts");
     let data = std::fs::read(directory.join(format!("{layout}.skate"))).map_err(|e| format!("{layout}.skate: {e}"))?;
     let mut package = if skate_data::prop_package::is_package(&data) { skate_data::prop_package::decode(&data)? } else { SkateMap::parse_render_only(&data)? };
@@ -63,7 +65,9 @@ pub fn posed(assets: &Path, layout: &str, sun: [f32; 3]) -> Result<SkateMap, Str
     let mut variants: std::collections::HashMap<(u32, [u32; 3]), u32> = std::collections::HashMap::new();
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
+    let mut starts = Vec::with_capacity(objects.len());
     for object in &objects {
+        starts.push((vertices.len() as u32, object.id));
         let t = &object.transform;
         let pose = |p: [f32; 3]| [
             p[0] * t[0] + p[1] * t[3] + p[2] * t[6] + t[9],
@@ -101,7 +105,7 @@ pub fn posed(assets: &Path, layout: &str, sun: [f32; 3]) -> Result<SkateMap, Str
     package.materials = materials;
     package.geometry = skate_data::skate_map::Geometry { vertices, indices, collision: Vec::new() };
     package.extensions.clear();
-    Ok(package)
+    Ok((package, starts))
 }
 
 /// The cell of a triangle (its first vertex) on the [`CELL`] grid.

@@ -820,3 +820,370 @@ Ours, measured with the new streaming benchmark (`skate-vita` feature `stream-be
 | skate-vita `lab.rs` | the replay recordings are cleared before the next world loads (a district's 7.4 MB index found no free piece with the last world's replay keys still spread through the heap) |
 | skate-data `io_gate.rs`, `vfs.rs`, skate-audio `stream.rs` | diagnostics: card reads counted by source (`CARD` log line every 10 s with the district stream line) |
 | skate-core `replay_buffer.rs` | edit to the copied file: a key is allocated at its exact size (the moved translations and scales were not counted, so most skeleton keys doubled), and a key's overhead is counted as 64 bytes. The Vita's instant replay held about twice its 24 MB budget; DownTown ran out of heap in the benchmark |
+
+## Object Dropper, step D2a: the catalogue export (2026-10-28)
+
+Survey: `docs/object-dropper-survey.md` (retail read in Ghidra on the owner's TU3 executable, locally; only addresses, constants and behaviour are written down).
+
+| Source | Ours | Kind |
+|---|---|---|
+| `skate-3-rust-engine/tools/asset_pipeline/park_layout.py` (`Sources`, `piece_template`, `instance_id`, `teleporter_roles`), `dynamic_props.py` (`write_placements`), `environment.py` (`Collections`) at PR #52 `8df32c51` | `tools/prepare_object_catalog.py` | imported from the reference checkout, read-only, not copied: every item of the two skate.Park recipes of `parkassets.big` converted as setup converts the Fullpark pieces, one placement per item; plus our `catalog.json` (the `fe_park_categories` tree, items with sub category and caps, the editor's tuning records) |
+
+Data: `private/object-catalog/` in the b110 install (`terrain` 533 templates / 314 textures, `props` 119 templates / 253 textures with types and collision; 661 items, 9 without a model: the 8 teleporters and the spawner). The user's private data, never committed.
+
+## Object Dropper, step D2b: `catalog.pak` (2026-10-28)
+
+| Files | Change | Kind |
+|---|---|---|
+| vita-pack `catalog.rs` (new), `lib.rs` | pack kinds 6 / 7: a catalogue item's render (its draws over its own vertices and indices, textures by index in its part's shared table) and one texture of that table | ours |
+| vita-bake `catalog.rs` (new), `main.rs` | `vita-bake catalog INSTALL OUT_DIR`: each part (`terrain`, `props`) baked into one render with the props render builder, then cut per template (render, collision package, binary shape, sidecar slice), the textures written once; `catalog.json` with each item's cost (triangles, draws, vertex bytes, textures, bounds) | ours |
+| skate-sim `catalog_shapes.rs` (new) | the sidecar's collision shapes in binary, read back into the same `PropShape` | ours |
+| skate-sim `skate_world.rs` | edit to the copied file: `load_collision_shapes` split into the file read and `collision_shapes` (the parse of a sidecar value), so the bake encodes the same shapes the loader reads | edit |
+
+Data: `catalog.pak` 41.6 MB, 2,818 files (terrain 533 templates, 109k triangles, 112 textures 4.9 MB; props 119 templates, 27k triangles, 97 textures 3.7 MB; shapes 18.3 MB, which were 61 MB as JSON). An item is 132 triangles and 1-2 draws at the median. Checks: vita-pack item and texture round trip; skate-sim shapes binary vs JSON round trip; each item's render and package read back in the bake. `embedded_static_rwcm_hits_distinct_actor_query_ids` fails before and after this step (not looked at).
+
+## Object Dropper, step D2c: the park pieces stay findable (2026-10-28)
+
+| Files | Change | Kind |
+|---|---|---|
+| skate-sim `skate_world.rs` | ours: `fuse_rows` split into `fuse_rows_all` (one range per piece, empty ones kept) and the same filter as before; `fused_piece_rows` also returns the ids of the pieces whose rows survive | ours (behaviour of `fuse_rows` unchanged) |
+| skate-sim `park_layout.rs` | `Pieces::ids`: each collision range's MOBJ id | edit |
+| skate-sim `park_bake.rs` | `PKFU` schema 2: each row range's piece id after the ranges (schema 1 still reads, without ids); the data test checks one distinct id per range, all pieces of the layout | ours |
+| vita-pack `map.rs` | map pack v2: `Map::pieces` ([`PieceDraws`]: a piece's spans `[draw, first index, index count]` in the park render); v1 packs still read | ours |
+| vita-bake `park_layout.rs`, `map.rs`, `main.rs` | `posed` gives each piece's first vertex and id; a park draw's triangles are sorted by piece (same draws), each piece's runs recorded, then given their draw after the opaque / alpha sort; `vita-bake map-stats PACK…` | ours |
+
+Checks: the four parks rebaked (scratch, not installed): draws, triangles and vertices equal to the installed v1 packs (DownTown 281 / 80,638 / 118,093, Industrial 153 / 70,948, MegaPark 279 / 59,496, StartPark 76 / 31,348); spans cover every layout triangle (238 / 328 / 450 / 256 pieces, 423 / 878 / 1,074 / 603 spans); `a_baked_layout_builds_the_fused_world` (Downtown, MegaPark): the fused world bit for bit as before, ids checked; skate-sim lib as before (the one failure noted in D2b). The Vita build must be updated with the v2 packs (an older eboot rejects map v2 and PKFU schema 2).
+
+## Object Dropper, step D3 part 1: free camera and cursor (2026-10-28)
+
+| Files | Change | Kind |
+|---|---|---|
+| skate-sim `object_dropper/{mod, tuning, camera}.rs` (new) | the editor's modes, tuning (the vault records of `catalog.json`, resolved through their parents), orbit camera (yaw / pitch rates, pitch limits, zoom target eased at the record's smoothing, 5-40 m) and cursor (stick moves scaled by the mode's curve over the zoom, d-pad elevation with retail's ramp 0.3 + 0.15 up to 3, axis locks, ground following within the cursor record's 7 m step); input = retail `input.cfg` GodHand actions over the native pad slots. Decoded in Ghidra (8288C310, 8288CE40, 82886CC8, 828863A0, 828883D8, 82481E10; layouts from upstream's `vault_layout.py`); what is not decoded yet is marked NOT RETAIL YET | ours |
+
+Checks: 5 unit tests (move relative to the camera, cubed stick, ground following and step limit, elevation ramp, turns / invert / pitch clamp / zoom limit and easing, the mode curves, catalogue freeze, axis locks) and the data test against the disc's records (`free_cam` and `object_spawner` override the speed curve flat; `manipulate` inherits `default`).
+
+## Object Dropper, step D3 part 2: the held item (2026-10-28)
+
+| Files | Change | Kind |
+|---|---|---|
+| skate-sim `object_dropper/manipulate.rs` (new), `camera.rs`, `mod.rs` | the held item at the cursor and retail's shifts (825CA178 / 8288B4E0: mode 1 move, 2 RT rotate, 3 RB locked axis); rotation in 90 degree steps on `.repeat` or smooth with LT at the mode's rotate rate, the axis the stick pushes further; locked-axis steps of 0.75 m, 2.25 m after two in a row, one axis at a time (8288C310); `Controls`: the editor polls `skate_core::input::pad::Pad` (82966F30) for retail's `.held` and `.repeat` (24 polls, then 12); action numbers 184-210 = the `input.cfg` GodHand order, checked against 8288C310's `0xD2` advanced-modifier test | ours |
+
+Checks: 7 unit tests (quarter turns and their repeat timing, the LT turn of 0.04 an update, RT release, locked-axis steps and their lengthening along the item's turned axis, the step count reset) and the data test.
+
+## Object Dropper, step D3 part 3: place, duplicate, delete, reset, budgets (2026-10-28)
+
+| Files | Change | Kind |
+|---|---|---|
+| skate-sim `object_dropper/{catalog, budget, scene}.rs` (new), `mod.rs`, `camera.rs`, `manipulate.rs` | the baked catalogue's tree, items and costs; retail's placement rule (8288F1B8, 8288EF58 with 8288E430 / 8288EA18 / 8288EBE8: memory, props 47 dropped / 48 live, terrain cost and 748 pieces; each `used + added <= 1`, a fraction the larger of its parts; the meter warns above 0.75) in Vita units (baked bytes, triangles), the cost and memory limits placeholders until D6; the scene of authored layout pieces and dropped items with retail's reset (82C4B780: back on the layout pose, or removed); the screen's buttons (A take / place, LB + A place a copy, Y delete, L3 reset, X catalogue, B put back / leave) and events for the world | ours |
+
+Checks: 12 tests (the budgets and meter; place, take, put back, delete, leave; copies until the props budget refuses, the catalogue refusing too; reset of an authored piece and of a dropped item) and the data test (661 items, the tree in retail's order). The meter's bars in the survey corrected: `+0x173C / +0x1740` are terrain, `+0x1744 / +0x1748` props.
+
+## Object Dropper, step D4a: a park's own pieces move in the running world (2026-10-28)
+
+| Files | Change | Kind |
+|---|---|---|
+| skate-sim `physics/park_edit.rs` (new), `physics.rs` | `GamePhysics::park` (a baked park's pieces: their rows in the static world, their template rails and placements) and `pose_park_piece` (moved: the layout's rows posed again in place, edge flags and cosines kept; hidden: at `HELD_PARK`; authored: the layout's rows bit for bit), the rails posed again with the piece; NPC workers get none | ours |
+| skate-sim `park_bake.rs` | `Baked::placements` / `templates`: the railed pieces' placements and their templates' rails, kept from the extension | ours |
+| skate-sim `grind_world/provider.rs` | edit to the copied file: `StaticProvider::piece_assets` (each park piece's asset, filled by `with_pieces`) and `repose_piece` (its segments replaced, the asset's bounds and octree rebuilt) | edit |
+
+NOT RETAIL: retail runs its fuser again when a layout changes; ours keeps the fused rows (a moved piece keeps its old seam edges). Checks: `a_park_piece_moves_hides_and_comes_back` (DownTown Fullpark loaded as the Vita loads it: a railed piece moved 10 m with its rails, hidden below the world, put back bit for bit, rails too); `compose` test; skate-sim lib as before.
+
+## Object Dropper, step D4b: catalogue items dropped into the running world (2026-10-28)
+
+| Files | Change | Kind |
+|---|---|---|
+| skate-sim `physics/dropped.rs` (new), `physics.rs` | `load_item` (a catalogue item's binary shape or geometry package, rails and type data from `catalog.pak` through `vfs`); `drop_item` / `move_dropped` / `remove_dropped`: a terrain piece as a fixed instance of the prop collision layer with its rails among the fixed (piece-tagged) rails, a prop as a runtime prop body (`spawn_runtime_prop`) with its type data and rails; `set_car_rails` keeps the dropped terrain's rails after the cars' | ours |
+| skate-sim `physics/prop_dynamics.rs` | `PropDynamics::add_grind_rails` (one template's rails, a dropped prop's) | ours |
+
+Checks: `catalogue_items_drop_move_and_leave_the_world` (DownTown park as the Vita loads it, catalog.pak mounted: a medium quarter pipe prop with its type data and a quarter pipe preset terrain piece dropped, the piece's collision and rails where it was dropped and following a move, both removed); skate-sim lib as before.
+
+## Object Dropper, step D4c: the editor in the session (2026-10-28)
+
+| Files | Change | Kind |
+|---|---|---|
+| skate-sim `object_dropper/world.rs` (new) | `Dropper`: the catalogue and tuning from the baked `catalog.json`, the scene of the park's own pieces (kept after the editor closes), the editor's events applied to the world (a piece in hand is hidden or lifted out; placed: posed or dropped; deleted: hidden or removed; reset: the layout's rows), a cursor ground query, and `DropperFrame` for the renderer (camera, cursor, held item, the park pieces left out of the layout draws, the items drawn from the catalogue, dropped props at their bodies' poses) | ours |
+| skate-sim `physics/live.rs` | `Session::open_editor` / `close_editor` / `editor_open` / `editor_choose` / `dropper_catalog` / `dropper_frame`; while open, `step` gives the editor the pad and the skater a neutral one; `StepReport::editor` | ours |
+| skate-sim `object_dropper/scene.rs` | a placed item's scale (a mirrored layout piece), `affine` / `split` | ours |
+| skate-sim `park_bake.rs`, `physics/park_edit.rs`, `physics/dropped.rs` | the baked extension lists every piece (id, template, placement) for the editor's scene; `GamePhysics::park_layout`, `ground_below` | ours |
+
+Checks: `the_editor_edits_a_park_in_a_session` (DownTown park as the Vita loads it, catalog.pak mounted: the editor opens at the skater, X opens the catalogue, a ramp is chosen and placed as a body, a park piece taken, moved and placed is left out of the layout draws and drawn from the catalogue, B closes with the edits kept); skate-sim lib as before; parity 20/20 (mul_add vs reference, no-fma vs baseline). Data: the park packs must be rebaked for the piece list.
+
+## Object Dropper, step D4d: the editor on the Vita (2026-10-28)
+
+| Files | Change | Kind |
+|---|---|---|
+| skate-vita `dropper.rs` (new), `lab.rs`, `app.rs`, `packs.rs`, `main.rs`, `autoplay.rs` | `catalog.pak` mounted (optional); LB held + B pressed (the phone's dropper row, retail FE input 0x40) opens the session's editor; the dropper frame published each tick; the main thread uses the editor camera while it is open (NOT RETAIL YET: 60 degree field of view), leaves the moved and deleted park pieces out (the map pack's piece spans) and draws the catalogue items (renders and shared textures read on first use); a stand-in catalogue list (d-pad up / down item, left / right sub category, A take) and a status line with the meter until the retail screens (D5) | ours |
+| vita-render `scene.rs`, `spans.rs` (new), `lib.rs` | catalogue items on the GPU (`load_catalog_item`, `unload_catalog`, `CatalogInstance` drawn with the props' programs); `Frame::hidden`: the park draw draws the runs around hidden spans (`spans::visible_runs`, host-tested) | ours |
+
+Checks: the Vita eboot builds (fe-profile); `spans` test; packs rebaked into `target/dropper-packs` (the four parks with the piece list, catalog.pak). Device check pending.
+
+## Object Dropper, step D4e: each world's edits saved (2026-10-29)
+
+| Files | Change | Kind |
+|---|---|---|
+| skate-sim `object_dropper/save.rs` (new), `world.rs`, `mod.rs`, `physics/live.rs` | `Saved`: what differs from the world's own layout (park pieces moved or deleted, items dropped), replayed through the editor's event paths; `Session::take_dropper_save` (when the world changed), `restore_dropper`, `reset_dropper` (every edit undone: the way back to the Fullpark layout; its phone row comes with D5) | ours |
+| skate-vita `lab.rs`, `app.rs`, `dropper.rs` | `ux0:data/SKATEVITA/dropper/<world>.json`: replayed after the world loads, written by the main thread outside the shared lock when the editor closes | ours |
+
+NOT RETAIL: retail saves skate.Parks to slots and keeps open-world drops for the session; ours keeps one file per world (owner: one saved layout per park). Checks: `a_save_holds_the_edits_and_replays_them`; `the_editor_edits_a_park_in_a_session` extended (saved, reloaded into a fresh DownTown park: the same hidden pieces and drawn items, the prop's body again; reset all: the layout, no drops, an empty save); the Vita eboot builds.
+
+## Object Dropper, step D5a / D5b: the retail screen (2026-10-29)
+
+| Files | Change | Kind |
+|---|---|---|
+| skate-sim `object_dropper/catalog.rs`, `physics/live.rs`, `physics/park_edit.rs` | `Catalog::listing`: a park lists every item, the open world the props of the DMO banks it loads (Global and the map's district, from the name tag: `bank`), the "All objects" setting everything; terrain one entry per family; `next_size` (the Size key); `Session::dropper_listing`, `set_dropper_all` | ours |
+| skate-sim `object_dropper/browse.rs` (new), `mod.rs`, `camera.rs`, `world.rs` | The catalogue cursor and the retail screen's keys (park `825CAC18` / `825CBB18` / `825CA178`, open world `825C6C68` / `825C70E0` / `825C66D8`): RT / LT super category, Up / Down, A into the items then the previewed item in hand, B back, X size; Y deletes in the free camera; Back: Properties (park) or the reset question (open world); the open world has no locked axis or fine tune; the screen modes posted (`screen`, `take_posts`); `Variant` (FE 0x35 / 0x37); reset all keeps the editor open | ours |
+| skate-ui `fe/object_dropper_host.rs` (new), `menu_stage.rs`, `apt_scene.rs`, `crossbar_host.rs` | The `SkatePark` natives, the screen modes registered as `FEObjectDropperScreenMode_*` (table `0x8302C440`), the screen opened / fed / closed with the editor, the Feng Shui bars over the `FungShui` / `FungShuiDynamic` placeholders; the movie in `PAUSE_ROOTS` | ours |
+| skate-vita `dropper.rs`, `lab.rs`, `app.rs`, `fe_menus.rs` | The feed from the editor, the posts, the reset question (Yes / No popup, the editor waits); the stand-in list removed; the Vita-only parts of `dropper.rs` gated (the host tests build again) | ours |
+| `tools/prepare_menu_screens.py` | The two dropper movies in the export (51 movies; the others unchanged) | ours |
+
+NOT RETAIL YET: unlocks (all unlocked), the colour swatch and Properties (D6), the spawner, group select (A held), Y held repeat, the size text's distance format, the bar colours past 0.75 / 0.9 (yellow / red inferred). Checks: skate-sim `the_catalogue_walks_previews_and_takes_as_the_screen_does`, `keys_walk_the_tree_as_retail`, `listing_follows_the_world_and_groups_variants`; skate-ui `the_object_dropper_screen_opens_takes_the_editor_modes_and_draws_the_bars` (both variants: every SkatePark native answered, the open world hides the terrain bar), skate-ui 58 / skate-vita 46 host tests; the Vita eboot builds; ui.pak rebaked (46.6 MB, +1.2 MB).
+
+## Object Dropper, step D5c: the phone rows (2026-10-29)
+
+| Files | Change | Kind |
+|---|---|---|
+| skate-sim `physics/live.rs` | `Session::in_skate_park` | ours |
+| skate-vita `lab.rs`, `app.rs`, `dropper.rs` | The phone (LB held, retail `826682B0` and its movie `hudphonelist`): B opens the editor (Edit Park in a skate.Park, Object Dropper in the open world), Y in a skate.Park resets all props (FE input 0x100, gate `826691D0`: every edit undone, the moved props back, saved); the rows shown as text under the marker panel | ours |
+
+NOT RETAIL YET: the rows are plain text (the retail `hudphonelist` movie does not run on the Vita). Checks: the Vita eboot and the host tests build.
+
+## Object Dropper: the "All objects" setting (2026-10-29)
+
+| Files | Change | Kind |
+|---|---|---|
+| skate-vita `settings.rs`, `vita_menus.rs`, `app.rs`, `lab.rs` | World > "Object Dropper: all objects" (settings version 12, off by default): the catalogue lists every item anywhere, beyond retail's list for the world (`Session::set_dropper_all`, taken when the editor next opens) | ours (owner, 29 Oct) |
+
+NOT RETAIL: retail has no such setting. Checks: `settings_round_trip_and_reject_damage` (version 11 files load with it off); skate-vita host tests; the Vita eboot builds.
+
+## Object Dropper D5: device fixes (2026-10-29)
+
+| Files | Change | Kind |
+|---|---|---|
+| skate-ui `fe/apt_scene.rs` | The language strings' inline buttons (`<B:A_hud> Place`) drawn as prompt quads in the line (NOT RETAIL YET: a square of the font height) | ours |
+| skate-ui `fe/object_dropper_host.rs`, `menu_stage.rs`; skate-vita `fe_menus.rs` | The item picker's `Game.OnMenuGetItemEnabled` answered true (the dropper states' vt+72, `8281DD70`): rows highlight; the stage keeps running after a close until the screen unloads, and a reopen waits for it (the old screen stayed drawn under the pause menu and hid the new one); `Back_hud` / `A_hud` glyph names | ours |
+| skate-sim `object_dropper/catalog.rs`, `world.rs`; skate-vita `lab.rs` | Item lookups by index (they were linear, for every park piece in the meter each tick), the frame in one pass over the scene (was quadratic), built outside the shared lock; Start in the editor closes it for the pause menu (retail `825CB440`) | ours |
+
+Checks: skate-ui `the_object_dropper_screen_opens_takes_the_editor_modes_and_draws_the_bars` (unloads after its outro; closed and reopened at once: one screen, shown), `inline_buttons_split_the_language_tokens`; skate-sim dropper tests with the DownTown park session; skate-vita host tests; the Vita eboot builds. Device (owner): item highlight, Back icon, the HUD under the pause menu, park lag and the park catalogue reported in the first D5 run.
+
+## Object Dropper D5: device run 2 fixes (2026-10-29)
+
+| Files | Change | Kind |
+|---|---|---|
+| skate-ui `fe/apt_movie.rs` | A removed clip leaves the `script_moved` roots: the dropper's picker rows, rebuilt on every list refresh, kept ~800 script objects alive each time until the VM's 16,384-object budget stopped the retail menus (device: opening the park catalogue) | ours (fix) |
+| skate-ui `fe/menu_stage.rs` | A collection before a dropper state post when half the budget is in use (a catalogue state builds about 3,000 objects) | ours |
+| skate-vita `app.rs` | Select no longer opens the instant replay while the editor is open (it is the editor's Properties; owner) | ours |
+
+Checks: skate-ui `the_object_dropper_screen_opens_takes_the_editor_modes_and_draws_the_bars` (19 catalogue states in one update stay in budget), a probe (removed) showed the live objects flat at 3,835 across catalogue states after the fix (was +800 per state); skate-ui 59 / skate-vita 46 host tests; the Vita eboot builds.
+
+## Object Dropper D6a / D6b: snap sockets and snapping (2026-10-29)
+
+| Files | Change | Kind |
+|---|---|---|
+| `tools/prepare_object_catalog.py`, `tools/vita-bake/src/catalog.rs` | Each park piece's snap sockets from its model (the part's EB001E points of type 8, frame and group; retail `82865230`) into `catalog.json` (9,177 sockets, every piece has some; catalog.pak 43.2 MB) | ours |
+| skate-sim `object_dropper/snap.rs` (new), `catalog.rs`, `mod.rs`, `manipulate.rs` | Snapping as retail (docs/object-dropper-survey.md "Snapping"): points and faces, the facing test (45 deg), score weight 0.025 / 1, 1.5 m, corner and grid (0.75 m) modes by the advanced modifier and `AdvanceSnap`, the snapped pose (onto the target, its nearest quarter), the ground fallback; solved on the updates the held piece moves, drawn and placed snapped, committed on Rotate / Lock Axis / LT; a held item turns and moves about its footprint's middle (owner) | ours |
+
+NOT RETAIL YET: the world probe is vertical only (retail casts along any socket normal and refines sideways), the solve runs in the move's update (retail one later), no placement check on the snapped pose, no snap sound. Checks: skate-sim snap tests (a pad locks flush corner to corner, grid mode keeps the 0.75 step, an AdvanceSnap piece with LT does not snap, a piece just above the ground settles on it), `a_held_item_turns_and_moves_about_its_middle`, data `real_pads_snap_flush` (two real street pads flush; every piece has sockets; 180 AdvanceSnap); the DownTown park session; the Vita eboot builds.
+
+Device check (owner, 2026-10-29, log `target/device-logs/dropper-d6.log`): the D5 screen fixes, the held item's centre and snapping "seem to work"; the park saves.
+
+## Object Dropper: no automatic save (2026-10-30)
+
+| Files | Change | Kind |
+|---|---|---|
+| skate-vita `lab.rs`, `app.rs`, `dropper.rs`; skate-sim `object_dropper/save.rs` (doc) | The per-world save file (`ux0:data/SKATEVITA/dropper/<world>.json`, D4e) is gone: no restore at load, no write on exit, pause or reset. Edits live in the session: kept while the world stays loaded (a teleport inside it moves the skater in the same session), gone with a world change or at quit (owner, 29 Oct). Parks are to be saved later through the Create menu; `object_dropper::save::Saved` stays for it | ours |
+
+Checks: the Vita eboot and the host tests build. Files written by earlier builds stay on the card, unread.
+
+## Object Dropper D6c1: the Quick Menu (Properties) (2026-10-30)
+
+| Files | Change | Kind |
+|---|---|---|
+| skate-sim `object_dropper/quick.rs` (new), `mod.rs`, `camera.rs`, `world.rs`, `physics/live.rs` | Back in the park editor (free camera, held item, catalogue items) opens the Quick Menu with or without a selection (`825C9F88`); its main list (`825CF360`: rows enabled by `825D02C0`, Up / Down skip the disabled ones), the Options page (`825CE7E0`: Snapping, Invert Y, Invert X, Cursor speed 0.5-1.5 in 0.1 steps, Collision; retail's row order), Copy (the held or highlighted item), Paste (a copy in hand within the budgets), Undo / Redo (six scene snapshots, pushed before a pick-up, a delete, a new item, a paste and a reset; `82516F10`), B back to the mode it came from; its screen modes | ours |
+| skate-ui `fe/object_dropper_host.rs`, `menu_stage.rs` | The `ObjectQuickMenu` movie over the dropper screen while the editor's Quick Menu is open; its natives (options, rows, brands, styles, colour grid) and its 26 screen modes (`0x8302C4B8`); the movie in `PAUSE_ROOTS` | ours |
+| skate-vita `dropper.rs`, `lab.rs`, `app.rs`, `fe_menus.rs` | The Quick Menu's feed and posts | ours |
+
+NOT RETAIL YET: the Color, Branding and Style pages open and close but change nothing (D6c2 / D6c3: the style swap, per-piece colour and the park brand; the vault's 64 colours are not exported, the grid shows white), Collision is kept but not used by placement. Checks: skate-sim `the_quick_menu_sets_options_copies_pastes_and_undoes`, quick tests (rows skip, six-step history); skate-ui stage test (the Quick Menu opens over the park screen, shows, answers its natives, closes); skate-ui 59 / skate-vita 46 / skate-sim dropper 26 with data; the Vita eboot builds.
+
+Device check D6c1 (owner, 2026-10-30, log `target/device-logs/dropper-d6c.log`): the Quick Menu opens and closes, Copy / Paste / Undo / Redo work; Color / Branding / Style do nothing (expected, D6c2 / D6c3); the Options page's values did not change: the owner's "D-pad left / right as LB / RB" setting turned Left / Right into bumpers. Fix: in the dropper's catalogue and Quick Menu the d-pad stays a d-pad (skate-vita `lab.rs`).
+
+## Object Dropper D6c2: the Quick Menu's Style page (2026-10-30)
+
+| Files | Change | Kind |
+|---|---|---|
+| skate-sim `object_dropper/catalog.rs`, `quick.rs`, `mod.rs`, `world.rs`, `physics/live.rs` | `style_of`, `Catalog::style_variant` (same family, size and sub category); the Style page: a snapshot on entry when nothing is held, the movie's highlight swaps the held or highlighted piece for its Downtown / Industrial / University variant live (`825D0288` -> `825D0A98`; a placed piece is replaced at its pose), Select keeps it when the selection has a style (`825D0120` / `825D0BA8`), B reverts (`825CFE88`); Branding's Select returns to the list | ours |
+| skate-ui `fe/object_dropper_host.rs`, `menu_stage.rs`; skate-vita `fe_menus.rs`, `app.rs`, `lab.rs`, `dropper.rs` | On the Style and Branding pages the movie's list takes the pad (`mbAllowMenuPickerInput`); its `Game.OnMenuHilight` / `OnMenuSelect` go to the editor; `GetCurrentVisualTypeIndex`, `IsStyleChangeAllowed` from it | ours |
+
+NOT RETAIL YET: X (apply the style to the rest of the park) and the park brand. Checks: skate-sim `the_style_page_swaps_the_selection_live_and_b_reverts`, the catalogue test (style variants); skate-ui / skate-vita host tests; the Vita eboot builds.
+
+## Object Dropper D6c3: the Quick Menu's Colour page (2026-10-30)
+
+| Files | Change | Kind |
+|---|---|---|
+| skate-sim `object_dropper/tuning.rs`, `scene.rs`, `manipulate.rs`, `quick.rs`, `mod.rs`, `world.rs` | The tint table (`skatepark_presentation` / `tint` / `TintColours`, 64 colours, white first; read from the catalogue's tuning as the export already carries it); a colour per placed and held item (`piece+0xD0`, white by default); the Colour page (`825CEAF8`): Left / Right a swatch, Up / Down a row of eight, previewed live on the held or highlighted piece (`825CF1A0`), A keeps it on a colourisable selection (terrain, not `ao_DRPepperCanBalloon`: `terrain_no_tint_models`, `828689F0`; props never), X colours every colourisable piece, B reverts; a coloured park piece leaves the fused park draws and is drawn from the catalogue | ours |
+| vita-render `scene.rs`; skate-vita `dropper.rs`; skate-ui `fe/object_dropper_host.rs` | `CatalogInstance::tint` multiplied on the draws' tint (retail binds it as `i_tint_colour` on the park materials; multiply inferred); the swatch grid (`ColourPicker_GetColours`), the swatch index, `GetColour` (x 255 truncated, `825B62B8`), `IsColorChangeApplyAllowed` | ours |
+
+NOT RETAIL YET: Apply All asks no Yes / No (retail's `ID_SKATEPARK_APPLY_ALL_COLOUR` popup), the tint applies to every draw of the piece (retail: the four park material types), Branding still changes nothing (the crew logo and its material are not traced), the colour is not in `object_dropper::save::Saved`. Research: `~/tools/re-out/notes/od-colour-branding.md`. Checks: skate-sim `the_colour_page_previews_keeps_reverts_and_colours_all`, data (64 swatches white first); skate-ui / skate-vita host tests; the Vita eboot builds.
+
+## Object Dropper D6c: device fixes (2026-10-30)
+
+| Files | Change | Kind |
+|---|---|---|
+| skate-ui `fe/object_dropper_host.rs`, `apt_scene.rs`, `menu_stage.rs` | The swatch renderer (`Game.SwatchRenderer_ReserveIndex` / `SetColour` / `FreeIndex`): slots with their colours, the `SwatchRenderComponent` clips (named by their slot, as the image renderer's) drawn as solid quads of the slot's colour (the colour grid's swatches were empty); on the Quick Menu's Style and Branding pages the keys go to the movie's `UpdateInput` (the engine-opened screen is not on the FE stack, so the list never moved) | ours |
+| skate-sim `object_dropper/mod.rs` | The first row is highlighted as the Quick Menu opens (`EnableColor` posted; inferred: the highlight showed only after Up / Down) | ours |
+
+Checks: skate-ui stage test (Down on the Style page highlights the next style; the grid draws 64 swatches in the table's colours); skate-sim, skate-ui, skate-vita host tests; the Vita eboot builds. Device (owner, 30 Oct, log `dropper-d6c3.log`): Colour applies; the swatches showed no colour, no highlight on open, the Style list did not move (fixed here).
+
+Device check (owner, 2026-10-30, log `dropper-d6c4.log`): the colour swatches, the first-row highlight and the Style list work. Owner, checked in retail: in the open world the dropper keeps Start (no pause menu while it is open); in a park Start closes the editor and then the pause menu opens. skate-vita `app.rs`: Start is ignored while the open-world dropper is open.
+
+## Object Dropper D6d: measuring the budgets (2026-10-30)
+
+| Files | Change | Kind |
+|---|---|---|
+| skate-sim `object_dropper/budget.rs`, `world.rs`, `physics/live.rs`; skate-vita `lab.rs`, `app.rs` | `DROPPER usage` log line every ten seconds while the editor is open (memory, terrain pieces and triangles, props, catalogue-drawn items, the meter); `Limits::measure` (four times the memory and terrain placeholders) while the Vita's debug overlay is on, so a device run can go past them | ours (measuring only) |
+
+Checks: skate-sim dropper tests; the Vita eboot builds.
+
+Device (owner, 2026-10-30, log `dropper-measure.log`): in a park, Start left the dropper screen drawn under the pause menu (the editor itself closed). skate-vita `fe_menus.rs`: opening the pause menu closes the dropper screen (its outro runs with the menu's updates). Measurement (StartPark, debug overlay): with no props the sim tick is about 11 ms; with 46 placed props about 51 ms (dropped ticks); the props did not settle in 30 s.
+
+Device (owner, 2026-10-30, log `dropper-pause.log`): the dropper screen still showed under the park's pause menu: the pause menu captures the current frame as its background, and that frame still held the editor's screen. skate-vita `app.rs`, `lab.rs`, `fe_menus.rs`: Start in a park editor asks the editor to close first (`Shared::dropper_close`), and the pause menu opens once the editor and its screen are gone (as retail `825CB440`, the editor closed, then the pause).
+
+## Object Dropper D6d: placed props rest asleep (2026-10-30)
+
+| Files | Change | Kind |
+|---|---|---|
+| skate-sim `physics/dropped.rs`, `physics/prop_dynamics.rs`, `physics/live.rs`, `object_dropper/world.rs` | A prop placed with the static ground within 0.1 m of its base rests asleep where it was put (as the map's own props load, `initially_awake` off) until touched; one placed in the air stays awake and falls; the usage line counts the awake placed props (`awake_runtime`) | ours (NOT RETAIL YET: retail's placed DMO wake state is not read) |
+
+Checks: data `props_placed_on_the_ground_rest_asleep` (40 spread over DownTown's park: 31 start asleep, 1 still awake after five seconds; 1.25 ms/step against 1.02 bare and 1.48 without the rest, host release build); skate-sim dropper tests; the Vita eboot builds. Owner: the device run's 46 props were spread out (not overlapping).
+
+## Object Dropper D6d: group select (2026-10-31)
+
+| Files | Change | Kind |
+|---|---|---|
+| skate-sim `object_dropper/mod.rs`, `manipulate.rs`, `camera.rs`, `world.rs`; skate-vita `dropper.rs` | Group select as retail (`825CBB18` / `825C84A8` / `825C9818`, park editor): in the free camera A takes on release, and held 200 ms starts group select with the item under the cursor; there A held adds what the cursor passes over, Y held removes, X takes the group (`8288D418`; LB + X a copy within the budgets, `8288EF58`), B leaves, Back opens Properties; a held group (`Held::others`, each item in the first one's frame, the cursor on the group's middle) moves, turns, places, deletes, resets and goes back as one; the frame draws its other items and the selection tinted | ours |
+
+NOT RETAIL YET: a held group does not snap (retail snaps the union of its sockets), the selection's highlight colour (retail `piece+0xE4`), group select's screen texts beyond the mode post. Checks: skate-sim `group_select_picks_several_and_moves_them_as_one`; dropper tests with data; the Vita eboot builds.
+
+Device (owner, 2026-10-31, log `dropper-group.log`): Colour and Style changed one item of a group. skate-sim `object_dropper/mod.rs`: they act on the whole selection (a held group's every item, or every item group select picked when Properties is opened from there; the Style page's B restores the pick); B on the main list returns to group select. Check: the group test colours both picked items.
+
+Device check (owner, 2026-10-31, log `dropper-group2.log`): group select and the group's Colour / Style work.
+
+## Object Dropper D7: owner's device bugs, part 1 (2026-10-31)
+
+| Files | Change | Kind |
+|---|---|---|
+| skate-sim `physics/live.rs`; skate-vita `lab.rs` | The phone's row asks for the editor (`Session::request_editor`); it opens once the skater has stopped (retail flow `8270A5F0`: input locked, waits while the skater moves, at most 4 s); meanwhile the skater holds the brake (B) | ours (NOT RETAIL YET: retail's lock message `0x7949dac1` not decoded) |
+| skate-sim `object_dropper/camera.rs` | Down takes the cursor below the surface it follows to the next one under it (a piece snapped onto a higher one could not be lowered) | ours |
+| skate-sim `object_dropper/snap.rs` | A held socket more than 5 cm behind a target face does not snap to it (a piece under another's top was pulled up onto it) | ours (NOT RETAIL: retail compares abs(z), `8286EA48`) |
+| skate-sim `object_dropper/manipulate.rs` | RT turns and tilts about the held item's own axis nearest the vertical / the camera's right (retail `82887FA8` via `8288BF28`, tilt axis kept at +0x1500); the camera's right itself left 90 degree steps skewed | ours (NOT RETAIL YET: the vertical turn's axis is lost in the decompile) |
+| skate-sim `object_dropper/world.rs`; skate-vita `app.rs` | The park editor hides the player skater (and board) while it is open; the open world's dropper keeps it | ours (owner's retail check; the retail code not traced) |
+| tools `prepare_object_catalog.py`, vita-bake `catalog.rs` | The pieces without a model (park spawner, 8 teleporters) carry their footprint (model locator bounds) and their marker row (vault class `0xD01B99210BA7323C` field `0x4D9046773E165576`, retail `82866AD8`); catalog.pak gets the marker splines and styles (visual indicators export), the blue / green / red marker textures and each stock park's player start (`.park` editor tail) | ours (data from the owner's disc) |
+| skate-sim `object_dropper/{catalog,mod,scene,world}.rs`, `physics/park_edit.rs`, `physics.rs` | Park spawner: placed at the layout's start (footprint middle on the start, turned as it: NOT RETAIL YET, relation not traced), moved and turned like a piece, never deleted, copied, grouped or coloured (owner's retail check; `8288DCC8` refuses its colour); Teleports listed (each start / end), held and placed as markers; markers have no collision or body; the frame lists the markers, green under the cursor or in hand (`82866AD8` state 1), else blue | ours |
+| vita-render `scene.rs`; skate-vita `dropper.rs`, `teleporter_icons.rs`, `app.rs` | Marker ribbons (the icons' strips and passes) drawn at full intensity (NOT RETAIL YET: retail's style override for the editor not traced) | ours |
+| vita-bake `catalog.rs`; skate-sim `object_dropper/world.rs`, `physics/live.rs` | Park starts also by park map name (the Vita's baked park map does not name its layout); each marker's shape moved so its middle is the footprint's (the doors stood on the footprint's corner; NOT RETAIL YET: retail's indicator point, piece +0xB0, not traced) | ours |
+| skate-vita `app.rs`, `lab.rs` | While the Object Dropper is open the gameplay HUD (score, trick line, meter, minimap) is not drawn; while the park editor is open the game is muted as under the pause menu (the hidden skater's sounds; NOT RETAIL YET: the park's ambience goes too) | ours (owner's device report) |
+| tools `prepare_object_catalog.py`, vita-bake `catalog.rs` | Catalogue items in the recipes' `<mod>` order (was id order; the Teleports page is Start 1, End 1, Start 2, ... as retail); teleporters' role and channel (vault class `0xD01B99210BA7323C`) | ours (owner's retail check) |
+| skate-sim `object_dropper/{overlap,world,mod,catalog}.rs` | The Collision option (owner: on, items cannot go through each other; off, they may merge): with it on, a held item that goes into a world item is drawn red and A does not place it (retail draws this state red, `82866AD8` state 5; its check `82889940` passes the option on). NOT RETAIL YET: our check (boxes, then the collision triangles where they meet: crossings deeper than 2 cm, or the middle inside the other's shape; flush and touching pieces are clear), pieces with the recipe cap `AllowCollision` never collide (our reading of the cap; the stock layouts sink their feet into pads and stairs), the red tint for models | ours |
+| vita-bake `catalog.rs`; skate-sim `object_dropper/{budget,catalog,scene,mod}.rs` | D6d budgets from the device run (31 Oct: 110 stacked Mega ramps took 35 MiB of heap and a 56 MiB growth failed): terrain cost counts collision triangles (a Mega ramp: 880, drawn 66; limit 300k, MegaPark's Fullpark 198k), memory also counts each placed terrain piece's collision at 360 bytes a triangle (limit 20 MiB: about 57 Mega ramps); retail's prop and piece counts kept | ours (NOT RETAIL: Vita units and limits) |
+| skate-sim `object_dropper/world.rs`, `physics/live.rs` | Closing the park editor puts the skater at the park's spawner (retail `825CB440`: the spawner piece, `+0x3B58` set by `828662B8` for the spawner template, its axes orthonormal `825C5710`, to the skater `8286DC78`); a respawn in a park goes there too once the editor has placed it. Ours stands the skater on the spawner's footprint middle (the layout's start by default; NOT RETAIL YET: retail uses the piece's own origin, its relation to the start not traced) | ours |
+| vita-bake `map.rs` | A park map's spawn is its Fullpark layout's player start (the `.park` editor tail's first matrix, where the spawner stands; owner: as retail); the start may roll the skater away (MegaPark's is on top of the big ramp), so only an error or a respawn rejects it. StartPark (-115.7, 3.2, 10.5), MegaPark (241.2, 37.1, -91.0), Industrial (-88.2, 6.1, -40.2), DownTown (-3.4, 0.1, -60.7) | ours (retail data) |
+| skate-vita `app.rs` | A Challenge Map location in a skate.park starts the skater at the park's spawner, not at its locator (StartPark's "PCU training" locator is the empty park's ground, inside the layout's pieces; owner's retail check) | ours |
+| skate-sim `object_dropper/{catalog,world}.rs`, `physics/live.rs`; skate-vita `teleporters.rs`, `lab.rs`, `app.rs`, `dropper.rs` | Placed park teleporters work in play: per channel the first start and end (`8287B918`, as upstream's `layout_teleporters`), entry box of half extents 2 about the start's footprint middle, exit at the end's; armed as the disc's teleporters (prompt `ID_COMMON_TELEPORT`, D-pad Up, Yes / No popup, same-map move); in play only the starts are drawn, faded on view depth with their row's style (hidden up close; far end x10 on a park map) | ours (owner's retail check) |
+
+Checks: skate-sim `down_takes_the_cursor_under_a_higher_surface_to_the_next`, `a_piece_below_another_top_is_not_pulled_up_onto_it`, `rotation_steps_stay_square_whatever_the_camera_angle`, `the_spawner_moves_but_is_never_deleted_copied_or_grouped`, skate-vita `a_placed_park_teleporter_asks_and_takes_its_end`, `a_blocked_item_is_not_placed_unless_collision_is_off`, overlap tests, `the_stock_park_barely_overlaps` (DownTown 0 of 126 pieces, MegaPark 1 of 325, 0.01 ms a piece; the four parks' collision totals), `the_budgets_stop_stacked_mega_ramps` (59 placed, 19.6 of 20 MiB), `closing_the_park_editor_puts_the_skater_at_the_spawner`, dropper tests with data; the Vita eboot builds.
+
+## skate.Park S2: park files and layouts (2026-10-31)
+
+| Files | Change | Kind |
+|---|---|---|
+| skate-sim `park_file.rs` | Retail's `.park` read and written (big-endian: version, four block lengths, the origin template world's hash; static pieces 36 / 48 bytes with a tint, props 40 bytes, the distinct static and prop recipe ids in first-use order, the editor tail with the player start first); retail's buffer slack after the records is not read or written; the tail after the start kept as read (NOT RETAIL YET: its meaning not traced) | ours (format from the disc's layouts, upstream `park_layout.parse`) |
+| skate-sim `object_dropper/world.rs` | A layout file laid over a baked park (`Dropper::apply_park`): the map's pieces the layout has stay (exact pose first, then the nearest of their kind, moved), the rest go, the layout's other pieces and props are dropped while the budgets allow, the spawner goes to its start, the world follows the difference; the park written back as a layout (`Dropper::to_park`: pieces with their tint's colour, dropped props, the spawner as the start, the origin and the lot's stock tail) | ours |
+| tools `prepare_object_catalog.py`, vita-bake `catalog.rs`; skate-sim `object_dropper/world.rs`, `physics/live.rs` | Park Setup's lots and templates exported (`park_lots`: the `world` rows under `default_skateparks`, their selectable children, flag `0xFC96AC5110FA08F6`: name, thumbnail, stock layout, origin, map) with the templates' stock layouts in catalog.pak (`parks/`); the dropper keeps the park's template (the map's Fullpark, or the last laid layout's origin) and `Session::park_file` gives the park as `.park` bytes in that template's frame | ours (retail data) |
+
+Checks: skate-sim `a_layout_reads_back_as_written`, `the_stock_layouts_read_and_write_back` (all 12 stock layouts; their id-list blocks are the ones written), `park_files_lay_over_the_baked_park_and_come_back` (DownTown: Fullpark keeps 238, Empty leaves the spawner, an edit saved and loaded comes back), `a_stock_layout_lays_over_another_parks_fullpark` (StartPark progression: 77 kept, 174 dropped, 41 ms on the desktop). Known failing before this work: `embedded_static_rwcm_hits_distinct_actor_query_ids`.
+
+## skate.Park S3: Save Park (2026-10-31)
+
+| Files | Change | Kind |
+|---|---|---|
+| skate-vita `vita_menus.rs`, `fe_menus.rs`, `app.rs`, `lab.rs`, `parks.rs`; skate-ui `fe/menu_stage.rs`; vita-platform `ime.rs` | In a skate.park the pause menu is retail's FreePlayPark mode, Save Park first in Create; Save Park opens the keyboard over the menu (FE 46, retail flow message `0x78` `8270A278`: title `ID_SKATEPARK_NAME_PARK`, the park's name typed, 16 characters); a taken name asks `ID_COMMON_WARNING_TITLE` / `ID_SKATEPARK_ALREADY_EXISTS` (Yes overwrites, No back to the keyboard, `8270A398`); the simulation gives the park's `.park` bytes and a thread writes them under `ux0:data/SKATEVITA/parks/` with `index.json` (name, file, map, origin, time) | ours (retail flow; NOT RETAIL: files instead of retail's save-data records, names compared without case) |
+| skate-vita `vita_menus.rs`, `app.rs` | Save Park selectable: the `park_saveable` fact (retail IsItemEnabled `8261FB18`) set when the menu opens in a park (device: it was greyed); skate.Park (`EnterSkatePark`, sub option kind 0: New Park, My Parks, Community Parks, the tutorial row hidden as retail `8261DB48`) in Create, districts: Replay Editor, skate.Park; parks: Save Park, skate.Park, Replay Editor (owner's retail description); New Park and My Parks log until S5 / S4, Community Parks (online) nothing | ours |
+| skate-vita `fe_menus.rs`; skate-ui `fe/menu_stage.rs` | Save Park's keyboard opens over the pause menu from the menus' own keyboard (device: the stage's FE 46 closed the pause menu and its answer came after a world change); `MenuStage::text` for its title (NOT RETAIL YET: retail pushes FE 0x2E) | ours |
+
+## skate.Park S4: My Parks, part 1 (2026-11-01)
+
+| Files | Change | Kind |
+|---|---|---|
+| skate-vita `parks.rs`, `app.rs` | Each saved park has a picture (retail's browser shows one per park): the frame the pause menu froze, averaged down to 192 x 108, a PNG beside the park file; the parks can be read, their pictures loaded and deleted | ours (NOT RETAIL: retail's picture size and storage) |
+| skate-sim `object_dropper/world.rs`, `physics/live.rs` | `Session::load_park`: a saved park laid over the park being skated (`Dropper::load_park`: the map's Fullpark props not dropped again), the skater to its spawner | ours |
+
+Checks: skate-sim `park_files_lay_over_the_baked_park_and_come_back` (a saved edit loaded through the session comes back).
+
+
+## skate.Park S4: My Parks, parts 2 and 3 (2026-11-01)
+
+| Files | Change | Kind |
+|---|---|---|
+| skate-ui `fe/browser_host.rs` (new), `fe/menu_stage.rs`, `fe/crossbar_host.rs` | The shared browser (FE `0x3B`, movie `browser/browser`, object `CommonBrowser`) on parks: its C++ keys (`82621778`: the d-pad, Up / Down four, RB / LB the top tabs, RT / LT the bottom ones, B back; A / Y / X to the movie), the park provider's natives (`825B75C0` registrar, `0x823041B0`: title, tabs My Parks / Downloaded / Community and Saved Parks / Shared Parks from table `0x83027AB0`, 21-field thumb data, select and delete), its screen modes (set up tabs, parks ready, space, thumb); shown after its intro, then ready for keys | ours (retail natives and keys; NOT RETAIL: the name shown on the creator line, the key sounds not traced) |
+| skate-ui `fe/image_renderer_host.rs` | `Game.ImageRenderer_MemcardLoad(kind, index, slot)` draws the game's texture `memcard/<kind>/<index>` (a saved park's picture, kind 10) | ours (NOT RETAIL: the Vita keeps the pictures as files) |
+| skate-ui `fe/apt_movie.rs` | attachMovie looks a linkage name up in the library that defined the calling clip first (the Flash rule): the browser exports an older "Tab" of its own and the tabs control attached it (no `mSelected`, a NaN tab background stopped the stage); each library's exports are copied even when the screen has the same name | ours (NOT RETAIL YET: retail's attachMovie lookup not decoded) |
+| skate-ui `fe/menu_stage.rs` | The browser and Park Setup movies in the pause set (`PAUSE_ROOTS`) | ours |
+| skate-vita `app.rs`, `fe_menus.rs`, `lab.rs`, `parks.rs`; skate-sim `object_dropper/world.rs`, `physics/live.rs` | skate.Park > My Parks opens the browser over the pause menu with the saved parks (newest first, date, picture); A loads the park (its world first when it was saved on another), asking `ID_SKATEPARK_LOAD_PARK_CONFIRM` (Yes / No) when the park has unsaved edits (retail `8262A570`, the dirty flag `82511168`: cleared by Save Park and by a park laid); Y deletes it (file, picture, index) and the browser shows the rest | ours (NOT RETAIL YET: whether retail asks before a delete) |
+| `tools/prepare_menu_screens.py` | The browser and Park Setup screens exported; screens already installed stay (a newer reference lists fewer) | ours |
+
+Checks: skate-ui `the_park_browser_opens_moves_selects_and_closes` (data-gated: opened over the pause menu, every
+`CommonBrowser` native answered, d-pad and tab shoulders, A selects, a delete refills, B back), `browser_host` tests;
+skate-vita tests; the eboot builds.
+
+## Object Dropper: selection outline, free camera (2026-11-01)
+
+| Files | Change | Kind |
+|---|---|---|
+| vita-render `scene.rs`, `vgl.rs`; `shaders/outline.*.cg`; skate-vita `dropper.rs` | The item in hand (and a held group) drawn with a white outline (owner's retail description: once taken, not while the cursor passes over): its visible pixels marked in the stencil, then the item drawn flat white moved 2 pixels each way where nothing is marked, over everything (retail marks the selection in the stencil and draws its edge with a post effect, `postfx_edgedetectstencilPS` and the `_highlight` shaders) | ours (NOT RETAIL YET: retail's edge width and colour not read) |
+| skate-sim `object_dropper/camera.rs`, `object_dropper/mod.rs` | The editor's camera is the record's free camera (owner: it looks around, it does not turn about the cursor): pitch within the free limits (-80 to 60 degrees), starting 20 degrees down; right turns right; a turn moves the cursor along the ground to where the camera now looks (the screen's reticle), the eye stays | ours (NOT RETAIL YET: retail's eye placement not decoded; ours stands above the cursor by the zoomed distance at the start pitch's angle, the cursor at most 1.5 farthest zooms ahead) |
+| skate-vita `parks.rs` | Park pictures the right way up (the screen readback is bottom row first) | ours |
+
+Checks: skate-sim `camera_turns_zooms_and_clamps_as_the_records_say` (turns where it stands, the cursor at the screen's
+middle, up to 60 degrees), the dropper's data tests; device-checked by the owner.
+
+## Object Dropper: the open world's camera stands still (2026-11-01)
+
+| Files | Change | Kind |
+|---|---|---|
+| skate-sim `object_dropper/mod.rs`, `object_dropper/camera.rs`, `object_dropper/world.rs`, `physics/live.rs` | In the open world (the phone's Object Dropper) the camera stands where it opens and only looks around (owner, on retail): the left stick and the zoom move nothing, the d-pad still lifts; the cursor goes where the camera looks (the ground under the screen's middle). The park editor's camera still follows the cursor | ours (NOT RETAIL YET: retail's open path, `825CDF30` / `825CC4F8`, resets the camera's angles and sets flags; where it stands the camera is not decoded, ours where it opens) |
+| skate-vita `settings.rs`, `vita_menus.rs`, `lab.rs`, `app.rs` | World > "Object Dropper: free camera" (off by default, settings version 13): the open world's camera follows the cursor as the park editor's does | ours |
+
+Checks: skate-sim `the_open_worlds_camera_stands_still_and_looks_around`; skate-vita settings round trip (a version 12
+file loads with it off); device-checked by the owner.
+
+## skate.Park S5: New Park (2026-11-02)
+
+| Files | Change | Kind |
+|---|---|---|
+| skate-ui `fe/park_setup_host.rs` (new), `fe/menu_stage.rs`, `fe/crossbar_host.rs` | Park Setup (FE `0x3A`, movie `skatepark/parksetup`, screen record 58): the C++ keys (`825D28C0`: Up / Down the row, Left / Right its choice, a lot change resets the template, wrapping; A an unlocked lot's template; B back), the refresh state, the `SkatePark` natives `ParkSetup_GetSelectedName` / `GetSelectedThumbnail` (`fe\source\images\skatepark\<thumb>`) / `GetSelectedBar` / `IsSelectedParkUnlocked`; shown after its intro, then ready for keys | ours (retail keys and natives; NOT RETAIL YET: the key sounds, the locked lots' dialogs) |
+| skate-ui `fe/menu_stage.rs` | The browser and Park Setup take only the pad's direction codes (`0xC` - `0xF`, as retail's handlers): a d-pad press also sends its AptD* twin, which moved them two steps (device: Down came straight back, two lots never showed) | ours |
+| `tools/prepare_menu_screens.py` | Park Setup's thumbnails exported (`data/fe/source/images/skatepark/`, fedynamic.big) | ours |
+| `tools/prepare_object_catalog.py` | The lots in retail's order (`world` field `E69A80EE0520102D`, smallest first, `825D1AD0`) | ours |
+| skate-sim `object_dropper/world.rs`, `physics/live.rs` | `Session::load_template`: a template's stock layout laid as a saved park; a bare lot (an Empty without a file) as no pieces with its lot's Full start; `Session::park_lots` | ours |
+| skate-vita `app.rs`, `fe_menus.rs`, `lab.rs`, `parks.rs` | skate.Park > New Park opens Park Setup with the catalogue's lots (all open on the Vita); a template taken loads its lot and lays it, asking `ID_SKATEPARK_DIRTY_TITLE` / `ID_SKATEPARK_DIRTY_DESC` (No / Yes) over unsaved edits (retail `825D2588`) | ours (NOT RETAIL YET: whether retail opens the editor after, flow `0x76`) |
+
+Checks: skate-ui `park_setup_opens_moves_takes_a_template_and_closes` (data-gated, both key codes a press), the browser
+test with both codes, `park_setup_host` test; skate-sim `park_setup_templates_lay_the_bare_lot_and_the_fullpark`;
+device-checked by the owner.
+
+## skate.Park: delete question, save wheel (2026-11-02)
+
+| Files | Change | Kind |
+|---|---|---|
+| skate-vita `app.rs`, `fe_menus.rs` | My Parks' delete asks first (retail `82523BC0`: `ID_COMMON_WARNING_TITLE` / `ID_MEMCARD_PROMPT_DELETE_SKATEPARK`, No / Yes; Yes deletes) | ours (retail strings and order) |
+| skate-ui `fe/menu_stage.rs`; skate-vita `app.rs`, `fe_menus.rs` | The autosave layer's save wheel (`Save_EnableTag` / `Save_HideTag`) while a park is written or deleted, over the menus or the game (owner, on retail), up at least 1.5 s | ours (NOT RETAIL YET: the style retail passes; NOT RETAIL: the minimum time) |
+| skate-vita `app.rs` | New Park: the skater starts on the board, no editor (owner, on retail) | ours |
+
+Checks: the browser stage test turns the wheel on and off; device-checked by the owner.
+
+## vita-bake sim: the collections check without the hint pairs (2026-11-02)
+
+| Files | Change | Kind |
+|---|---|---|
+| `tools/vita-bake/src/sim.rs` | The bake's check that sim.pak's collections load as the JSON compares without the loading screen's hint pairs (`FieldArray::text_pairs`, from the 36018e19 resync), which sim.pak's form leaves out on purpose (the ui bake reads them from the JSON). Every bake since that resync stopped there with "binary collections differ from the JSON" and wrote no sim.pak or anim.pak (a user's report). A mismatch now names the first differing entry | ours |
+
+Checks: `vita-bake sim` on the prepared install verifies 6849 collections and writes sim.pak and anim.pak.

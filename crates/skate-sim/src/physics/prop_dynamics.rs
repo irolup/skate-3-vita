@@ -1531,6 +1531,14 @@ impl PropDynamics {
 
     /// The grind rails per template id (`native-props/<map>.json` `grind_splines`). Returns the props that got
     /// rails.
+    /// skate_vita (Object Dropper): one template's rails added (a catalogue prop dropped into the world).
+    pub(crate) fn add_grind_rails(&mut self, template: &str, rails: Vec<crate::grind_world::props::PropRail>) {
+        if !rails.is_empty() && !self.grind_rails.contains_key(template) {
+            self.grind_rails.insert(template.to_owned(), rails.into());
+            self.reorder();
+        }
+    }
+
     pub(crate) fn set_grind_rails(&mut self, rails: std::collections::BTreeMap<String, Vec<crate::grind_world::props::PropRail>>) -> usize {
         self.grind_rails = rails.into_iter().filter(|(_, r)| !r.is_empty()).map(|(k, r)| (k, r.into())).collect();
         self.reorder();
@@ -2338,6 +2346,11 @@ impl PropDynamics {
                 a.iter().zip(s.iter()).any(|(x, y)| (x - y).abs() > SPAWN_POSE_EPSILON)
             })
     }
+    /// skate_vita (Object Dropper measurements): runtime bodies (placed or spawned props) that are awake.
+    pub(crate) fn awake_runtime(&self) -> usize {
+        self.bodies.iter().filter(|b| b.runtime && !b.asleep).count()
+    }
+
 
     /// Ids of bodies whose pose differs from the authored spawn pose, in id order.
     /// Retail offers the per-object reset (cMsgResetDMO) only for a moved object

@@ -5,6 +5,9 @@
 //! kept triangles with their edge features, one range per piece) and, for the rails, each piece's id, template and
 //! placement with the templates' splines. At load the sim builds the same triangles (`skate_world::parts_from_rows`)
 //! and poses the rails (`park_layout::pose_rails`), so the world is the one upstream's fuser builds.
+//!
+//! Schema 2 (Object Dropper step D2c) adds each range's piece id (its MOBJ id), so the editor can take a piece's rows
+//! out; schema 1 extensions still read, without ids.
 use skate_data::binary::{Reader, Writer};
 use skate_data::skate_map::{Extension, SkateMap};
 use std::path::Path;
@@ -18,7 +21,15 @@ const KIND: &[u8; 4] = b"PKF1";
 pub(crate) struct Baked<'a> {
     rows: &'a [u8],
     pub ranges: Vec<std::ops::Range<usize>>,
+    /// Per range, its piece's MOBJ id; empty for a schema 1 extension.
+    pub ids: Vec<u32>,
     pub rails: Vec<crate::park_layout::PieceRails>,
+    /// The railed pieces' templates and placements (id, template, row-vector affine), and each template's rails,
+    /// so the Object Dropper can pose a moved piece's rails again.
+    pub placements: Vec<(u32, String, [f32; 12])>,
+    pub templates: std::collections::BTreeMap<String, Vec<crate::grind_world::props::PropRail>>,
+    /// Every piece's id, template (its catalogue item) and placement; empty for an extension baked before it.
+    pub layout: Vec<(u32, String, [f32; 12])>,
 }
 
 /// A stored row: nine coordinates, surface, packed surface, flags, three cosines (u32 each).
@@ -74,7 +85,7 @@ pub struct BakeStats {
 pub fn bake(assets: &Path, layout: &str) -> Result<(Extension, BakeStats), String> {
     let map = marked(layout);
     let pieces = crate::park_layout::load_pieces(assets, &map).ok_or_else(|| format!("{layout}: no pieces"))?;
-    let (rows, ranges) = crate::skate_world::fused_piece_rows(&pieces)?;
+    let (rows, ranges, ids) = crate::skate_world::fused_piece_rows(&pieces)?;
     let (_, objects) = crate::park_layout::load_package(assets, &map).ok_or_else(|| format!("{layout}: no package"))?;
     // The rails' sources: each piece's placement and the splines of the templates that have rails.
     let sidecar = crate::park_layout::directory(assets).join(format!("{layout}.json"));
@@ -83,20 +94,26 @@ pub fn bake(assets: &Path, layout: &str) -> Result<(Extension, BakeStats), Strin
     let splines = value.get("grind_splines").and_then(|v| v.as_object()).cloned().unwrap_or_default();
     let mut used = serde_json::Map::new();
     let mut placed = Vec::new();
+    let mut layout = Vec::new();
     for object in &objects {
         let template = object.name.split('/').next().unwrap_or_default();
         if let Some(list) = splines.get(template) {
             used.insert(template.to_owned(), list.clone());
             placed.push(serde_json::json!({ "id": object.id, "template": template, "transform": object.transform }));
         }
+        // Every piece (Object Dropper: the editor's scene of the park's own pieces).
+        layout.push(serde_json::json!({ "id": object.id, "template": template, "transform": object.transform }));
     }
-    let rails = serde_json::to_string(&serde_json::json!({ "grind_splines": used, "pieces": placed })).map_err(|e| e.to_string())?;
+    let rails = serde_json::to_string(&serde_json::json!({ "grind_splines": used, "pieces": placed, "layout": layout })).map_err(|e| e.to_string())?;
     let mut w = Writer::new(KIND);
     w.str(&rails);
     w.u32(ranges.len() as u32);
     for r in &ranges {
         w.u32(r.start as u32);
         w.u32(r.end as u32);
+    }
+    for &id in &ids {
+        w.u32(id);
     }
     w.u32(rows.len() as u32);
     for row in &rows {
@@ -111,19 +128,20 @@ pub fn bake(assets: &Path, layout: &str) -> Result<(Extension, BakeStats), Strin
         }
     }
     let stats = BakeStats { triangles: rows.len(), pieces: ranges.len(), railed: placed.len() };
-    Ok((Extension { tag: EXTENSION_TAG, schema: 1, payload: w.bytes }, stats))
+    Ok((Extension { tag: EXTENSION_TAG, schema: 2, payload: w.bytes }, stats))
 }
 
 /// The baked layout a loaded map carries, if any.
 pub(crate) fn decode(map: &SkateMap) -> Option<Result<Baked<'_>, String>> {
-    let extension = map.extensions.iter().find(|e| e.tag == EXTENSION_TAG && e.schema == 1)?;
-    Some(read(&extension.payload))
+    let extension = map.extensions.iter().find(|e| e.tag == EXTENSION_TAG && (e.schema == 1 || e.schema == 2))?;
+    Some(read(&extension.payload, extension.schema))
 }
 
-fn read(bytes: &[u8]) -> Result<Baked<'_>, String> {
+fn read(bytes: &[u8], schema: u32) -> Result<Baked<'_>, String> {
     let mut r = Reader::new(bytes, KIND)?;
     let rails: serde_json::Value = serde_json::from_str(&r.str()?).map_err(|e| format!("baked park rails: {e}"))?;
     let ranges = (0..r.u32()?).map(|_| Ok(r.u32()? as usize..r.u32()? as usize)).collect::<Result<Vec<_>, String>>()?;
+    let ids = if schema >= 2 { ranges.iter().map(|_| r.u32()).collect::<Result<Vec<_>, String>>()? } else { Vec::new() };
     let count = r.u32()? as usize;
     let rows = r.bytes(count.checked_mul(ROW).ok_or("baked park: row count")?)?;
     r.done()?;
@@ -135,13 +153,23 @@ fn read(bytes: &[u8]) -> Result<Baked<'_>, String> {
         templates.insert(key.clone(), crate::grind_world::props::parse_rails(list).map_err(|e| format!("baked park rails {key}: {e}"))?);
     }
     let mut posed = Vec::new();
+    let mut placements = Vec::new();
     for piece in rails["pieces"].as_array().into_iter().flatten() {
         let (Some(id), Some(template)) = (piece["id"].as_u64(), piece["template"].as_str()) else { continue };
         let values: Vec<f32> = piece["transform"].as_array().into_iter().flatten().filter_map(|v| v.as_f64().map(|v| v as f32)).collect();
         let (Ok(transform), Some(list)) = (<[f32; 12]>::try_from(values), templates.get(template)) else { continue };
         posed.push(crate::park_layout::PieceRails { piece: id as u32, segments: crate::park_layout::pose_rails(id as u32, &transform, list) });
+        placements.push((id as u32, template.to_owned(), transform));
     }
-    Ok(Baked { rows, ranges, rails: posed })
+    let mut layout = Vec::new();
+    for piece in rails["layout"].as_array().into_iter().flatten() {
+        let (Some(id), Some(template)) = (piece["id"].as_u64(), piece["template"].as_str()) else { continue };
+        let values: Vec<f32> = piece["transform"].as_array().into_iter().flatten().filter_map(|v| v.as_f64().map(|v| v as f32)).collect();
+        if let Ok(transform) = <[f32; 12]>::try_from(values) {
+            layout.push((id as u32, template.to_owned(), transform));
+        }
+    }
+    Ok(Baked { rows, ranges, ids, rails: posed, placements, templates, layout })
 }
 
 #[cfg(test)]
@@ -172,6 +200,11 @@ mod tests {
             assert_eq!(pieces.rails.len(), baked.rails.len(), "{layout}: railed pieces");
             let segments = |r: &[crate::park_layout::PieceRails]| r.iter().map(|p| p.segments.len()).sum::<usize>();
             assert_eq!(segments(&pieces.rails), segments(&baked.rails));
+            // Schema 2: each range names its piece, once, and every name is a piece of the layout.
+            assert_eq!(baked.ids.len(), baked.ranges.len(), "{layout}: one id per range");
+            let unique: std::collections::BTreeSet<u32> = baked.ids.iter().copied().collect();
+            assert_eq!(unique.len(), baked.ids.len(), "{layout}: ids differ");
+            assert!(baked.ids.iter().all(|id| pieces.ids.contains(id)), "{layout}: ids are pieces");
             println!("BAKED {layout}: {} triangles, {} pieces, {} railed, {} KiB", stats.triangles, stats.pieces, stats.railed, baked_map.extensions[0].payload.len() / 1024);
         }
     }

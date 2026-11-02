@@ -17,7 +17,8 @@ use skate_data::skate_map::{
 };
 
 /// v1: first map pack.
-pub const VERSION: u32 = 1;
+/// 2: the skate.Park pieces' spans ([`PieceDraws`]); version 1 packs still read (no pieces).
+pub const VERSION: u32 = 2;
 /// Map vertex: position (3 × f32), uv (2 × f32), lightmap uv (2 × f32).
 pub const STRIDE: usize = 28;
 pub const POSITION: usize = 0;
@@ -59,6 +60,18 @@ pub struct Map {
     pub authored_spawn: [f32; 3],
     pub authored_heading: f32,
     pub render: Render,
+    /// A park's layout pieces in `render` (Object Dropper step D2c); empty for other maps.
+    pub pieces: Vec<PieceDraws>,
+}
+
+/// One skate.Park piece's triangles in the park's merged render, so the Object Dropper can draw the park without a
+/// piece it moved or deleted: its spans, each `[draw, first index, index count]` (the index range inside that
+/// draw's, contiguous because the bake sorts a draw's triangles by piece).
+#[derive(Clone, Debug, PartialEq)]
+pub struct PieceDraws {
+    /// The piece's MOBJ id (as in the sim's baked layout).
+    pub id: u32,
+    pub spans: Vec<[u32; 3]>,
 }
 
 impl Map {
@@ -75,12 +88,18 @@ impl Map {
         }
         w.f32(self.authored_heading);
         write_render(&mut w, &self.render);
+        w.u32(self.pieces.len() as u32);
+        for piece in &self.pieces {
+            w.u32(piece.id);
+            w.u32(piece.spans.len() as u32);
+            piece.spans.iter().flatten().for_each(|&v| w.u32(v));
+        }
         crate::seal(Kind::Map, VERSION, &w.bytes)
     }
 
     pub fn from_pack(bytes: &[u8]) -> Result<Self, String> {
         let (kind, version, payload) = crate::open(bytes)?;
-        if kind != Kind::Map || version != VERSION {
+        if kind != Kind::Map || !(1..=VERSION).contains(&version) {
             return Err(format!("expected a map pack v{VERSION}, found {kind:?} v{version}"));
         }
         let mut r = Reader::new(payload);
@@ -88,8 +107,22 @@ impl Map {
         let authored_spawn = [r.f32()?, r.f32()?, r.f32()?];
         let authored_heading = r.f32()?;
         let render = read_render(&mut r)?;
+        let mut pieces = Vec::new();
+        if version >= 2 {
+            for _ in 0..r.u32()? {
+                let id = r.u32()?;
+                let spans = (0..r.u32()?).map(|_| Ok([r.u32()?, r.u32()?, r.u32()?])).collect::<Result<Vec<_>, String>>()?;
+                for &[draw, first, count] in &spans {
+                    let d = render.draws.get(draw as usize).ok_or("map piece span: no such draw")?;
+                    if first < d.first_index || first + count > d.first_index + d.index_count || count % 3 != 0 {
+                        return Err("map piece span outside its draw".into());
+                    }
+                }
+                pieces.push(PieceDraws { id, spans });
+            }
+        }
         r.done()?;
-        Ok(Self { sim, authored_spawn, authored_heading, render })
+        Ok(Self { sim, authored_spawn, authored_heading, render, pieces })
     }
 }
 

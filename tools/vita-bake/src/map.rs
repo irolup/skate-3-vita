@@ -52,7 +52,7 @@ pub fn bake(install: &Path, out: &Path, names: &[String]) -> Result<(), String> 
             Some(layout) => Some(crate::park_layout::posed(&assets, layout, sun(&assets, name))?),
             None => None,
         };
-        let render = build_render(&source, props.as_ref(), pieces.as_ref())?;
+        let (render, piece_draws) = build_render(&source, props.as_ref(), pieces.as_ref())?;
         let (authored_spawn, authored_heading) = (source.spawn, source.heading);
         let mut sim = map::strip_render(source);
         if let Some(layout) = &layout {
@@ -63,12 +63,24 @@ pub fn bake(install: &Path, out: &Path, names: &[String]) -> Result<(), String> 
             );
             sim.extensions.push(extension);
         }
-        let (spawn, heading, how) = choose_spawn(&assets, &sim)?;
+        // A park starts the skater at its layout's player start, where the park's spawner stands (retail: the
+        // `.park` editor tail's first matrix; the Object Dropper's `park_starts`).
+        let start = layout.as_deref().and_then(|l| park_start(&assets, l));
+        if let Some((position, heading)) = start {
+            (sim.spawn, sim.heading) = (position, heading);
+        }
+        let (spawn, heading, how) = choose_spawn(&assets, &sim, start.is_some())?;
         sim.spawn = spawn;
         sim.heading = heading;
-        let pack = Map { sim, authored_spawn, authored_heading, render }.to_pack();
+        let pieces_drawn = piece_draws.len();
+        if let Some((posed, _)) = &pieces {
+            let spans: usize = piece_draws.iter().map(|p| p.spans.len()).sum();
+            let triangles: u32 = piece_draws.iter().flat_map(|p| &p.spans).map(|s| s[2] / 3).sum();
+            println!("  piece spans: {pieces_drawn} pieces, {spans} spans, {triangles} triangles of the layout's {}", posed.geometry.indices.len() / 3);
+        }
+        let pack = Map { sim, authored_spawn, authored_heading, render, pieces: piece_draws }.to_pack();
         let check = Map::from_pack(&pack)?;
-        if check.sim.spawn != spawn || check.render.draws.is_empty() {
+        if check.sim.spawn != spawn || check.render.draws.is_empty() || check.pieces.len() != pieces_drawn {
             return Err(format!("{name}: map pack does not read back"));
         }
         let path = out.join(format!("map_{name}.pak"));
@@ -111,9 +123,9 @@ pub fn bake_trick_guide(install: &Path, out: &Path) -> Result<(), String> {
     let scene = install.join("assets/private/hud/scene");
     let read = |p: &Path| std::fs::read(p).map_err(|e| format!("{}: {e}", p.display()));
     let set = SkateMap::parse_render_only(&read(&scene.join("TrickGuide.skate"))?)?;
-    let render = build_render(&set, None, None)?;
+    let (render, _) = build_render(&set, None, None)?;
     let (spawn, heading) = (set.spawn, set.heading);
-    let set_pack = Map { sim: map::strip_render(set), authored_spawn: spawn, authored_heading: heading, render }.to_pack();
+    let set_pack = Map { sim: map::strip_render(set), authored_spawn: spawn, authored_heading: heading, render, pieces: Vec::new() }.to_pack();
     let root = "private/hud/scene";
     let mut files = vec![
         File { path: format!("{root}/TrickGuide.map"), bytes: set_pack },
@@ -168,7 +180,7 @@ pub fn bake_district_sim(install: &Path, out: &Path, names: &[String]) -> Result
         let horizon = [0, 1, 2].map(|i| source.environment.get(3 + i).copied().unwrap_or(0.4));
         let (authored_spawn, authored_heading) = (source.spawn, source.heading);
         let mut sim = map::strip_render(source);
-        let (spawn, heading, how) = choose_spawn(&assets, &sim)?;
+        let (spawn, heading, how) = choose_spawn(&assets, &sim, false)?;
         sim.spawn = spawn;
         sim.heading = heading;
         let render = Render { vertex_data: Vec::new(), indices: Vec::new(), draws: Vec::new(), textures: Vec::new(), horizon, exposure: EXPOSURE };
@@ -176,7 +188,7 @@ pub fn bake_district_sim(install: &Path, out: &Path, names: &[String]) -> Result
         let defs: usize = sim.materials.iter().filter_map(|m| m.retail_definition.as_ref()).map(Vec::len).sum();
         let ext: Vec<String> = sim.extensions.iter().map(|e| format!("{}={:.1}MiB", String::from_utf8_lossy(&e.tag), e.payload.len() as f64 / 1048576.0)).collect();
         println!("  {} materials ({:.1} MiB of retail definitions), {} rails, extensions {}", sim.materials.len(), defs as f64 / 1048576.0, sim.rails.len(), ext.join(" "));
-        let pack = Map { sim, authored_spawn, authored_heading, render }.to_pack();
+        let pack = Map { sim, authored_spawn, authored_heading, render, pieces: Vec::new() }.to_pack();
         let check = Map::from_pack(&pack)?;
         if check.sim.spawn != spawn {
             return Err(format!("{name}: map pack does not read back"));
@@ -228,7 +240,7 @@ pub fn bake_district(install: &Path, out: &Path, names: &[String]) -> Result<(),
         let (authored_spawn, authored_heading) = (source.spawn, source.heading);
         let mut sim = map::strip_render(source);
         slim_for_sim(&mut sim)?;
-        let (spawn, heading, how) = choose_spawn(&assets, &sim)?;
+        let (spawn, heading, how) = choose_spawn(&assets, &sim, false)?;
         sim.spawn = spawn;
         sim.heading = heading;
         spawns += &format!("{name} {:?},{:?},{:?},{:?}\n", spawn[0], spawn[1], spawn[2], heading);
@@ -276,7 +288,9 @@ fn copy(sim: &SkateMap) -> Result<SkateMap, String> {
 
 /// Whether the simulation keeps the skater standing at this spawn: 600 idle ticks with
 /// no teleport, ending on the ground no lower than 1 m under the spawn.
-fn spawn_holds(assets: &Path, sim: &SkateMap, spawn: [f32; 3], heading: f32) -> Result<bool, String> {
+/// Whether the skater spawned at `spawn` stays in play for [`SPAWN_TICKS`]: no error or respawn, and (unless it may
+/// `roll` away: a park's start on top of a ramp) still on the ground near the spawn's height.
+fn spawn_holds(assets: &Path, sim: &SkateMap, spawn: [f32; 3], heading: f32, roll: bool) -> Result<bool, String> {
     let mut map = copy(sim)?;
     map.spawn = spawn;
     map.heading = heading;
@@ -295,28 +309,38 @@ fn spawn_holds(assets: &Path, sim: &SkateMap, spawn: [f32; 3], heading: f32) -> 
         }
     }
     let (deck, _) = session.board();
-    let holds = session.state_name() == "PhysicsGround" && deck[1] > spawn[1] - 1.0;
+    let holds = roll || session.state_name() == "PhysicsGround" && deck[1] > spawn[1] - 1.0;
     if !holds {
         eprintln!("  spawn {spawn:?} rejected: state {} deck height {:.2}", session.state_name(), deck[1]);
     }
     Ok(holds)
 }
 
-fn choose_spawn(assets: &Path, sim: &SkateMap) -> Result<([f32; 3], f32, &'static str), String> {
-    if spawn_holds(assets, sim, sim.spawn, sim.heading)? {
-        return Ok((sim.spawn, sim.heading, "authored"));
+fn choose_spawn(assets: &Path, sim: &SkateMap, park_start: bool) -> Result<([f32; 3], f32, &'static str), String> {
+    if spawn_holds(assets, sim, sim.spawn, sim.heading, park_start)? {
+        return Ok((sim.spawn, sim.heading, if park_start { "park start" } else { "authored" }));
     }
     for (position, heading) in teleports(assets, &sim.name)? {
-        if spawn_holds(assets, sim, position, heading)? {
+        if spawn_holds(assets, sim, position, heading, false)? {
             return Ok((position, heading, "teleport destination"));
         }
     }
     for position in floor_candidates(sim)?.into_iter().take(96) {
-        if spawn_holds(assets, sim, position, sim.heading)? {
+        if spawn_holds(assets, sim, position, sim.heading, false)? {
             return Ok((position, sim.heading, "nearest validated floor"));
         }
     }
     Err(format!("{}: no spawn keeps the skater standing", sim.name))
+}
+
+/// A park layout's player start (`private/object-catalog/catalog.json` `park_starts`: rows right, up, forward,
+/// translation): its position and heading (yaw of its forward about +y; 0 looks down +z, as the spawn's).
+fn park_start(assets: &Path, layout: &str) -> Option<([f32; 3], f32)> {
+    let bytes = std::fs::read(assets.join("private/object-catalog/catalog.json")).ok()?;
+    let catalog: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let m = &catalog["park_starts"][layout];
+    let at = |r: usize, c: usize| m[r][c].as_f64().map(|v| v as f32);
+    Some(([at(3, 0)?, at(3, 1)?, at(3, 2)?], at(2, 0)?.atan2(at(2, 2)?)))
 }
 
 /// The park's authored teleport destinations (`private/teleports.json`).
@@ -425,11 +449,14 @@ fn sun(assets: &Path, name: &str) -> [f32; 3] {
         .unwrap_or([-0.4787, 0.736, 0.4787])
 }
 
-fn build_render(map: &SkateMap, props: Option<&SkateMap>, pieces: Option<&SkateMap>) -> Result<Render, String> {
-    let sources: Vec<&SkateMap> = std::iter::once(map).chain(props).chain(pieces).collect();
+/// The render of a map, its props and its park layout's pieces, with each piece's spans in the render
+/// ([`map::PieceDraws`], empty without pieces).
+fn build_render(map: &SkateMap, props: Option<&SkateMap>, pieces: Option<&(SkateMap, Vec<(u32, u32)>)>) -> Result<(Render, Vec<map::PieceDraws>), String> {
+    let sources: Vec<&SkateMap> = std::iter::once(map).chain(props).chain(pieces.map(|p| &p.0)).collect();
     let mut builder = RenderBuilder::default();
     // A layout's pieces draw per area as well as per material, so that they cull.
     builder.cells = pieces.map(|_| sources.len() - 1);
+    builder.pieces = pieces.map(|p| p.1.clone()).unwrap_or_default();
     let triangles: Vec<(usize, [u32; 3])> = sources
         .iter()
         .enumerate()
@@ -438,15 +465,24 @@ fn build_render(map: &SkateMap, props: Option<&SkateMap>, pieces: Option<&SkateM
     builder.add(&sources, &triangles)?;
     // Opaque first, alpha-tested last.
     builder.draws.sort_by_key(|d| d.alpha_cutoff.is_some());
+    // The spans by draw (after the sort): the draw whose index range holds each span.
+    let mut starts: Vec<(u32, usize)> = builder.draws.iter().enumerate().map(|(i, d)| (d.first_index, i)).collect();
+    starts.sort_unstable();
+    let mut by_piece: std::collections::BTreeMap<u32, Vec<[u32; 3]>> = std::collections::BTreeMap::new();
+    for &(id, first, count) in &builder.spans {
+        let (_, draw) = starts[starts.partition_point(|s| s.0 <= first) - 1];
+        by_piece.entry(id).or_default().push([draw as u32, first, count]);
+    }
+    let piece_draws = by_piece.into_iter().map(|(id, spans)| map::PieceDraws { id, spans }).collect();
     let e = &map.environment;
-    Ok(Render {
+    Ok((Render {
         vertex_data: builder.vertex_data,
         indices: builder.indices,
         draws: builder.draws,
         textures: builder.textures,
         horizon: [e.get(3).copied().unwrap_or(0.3), e.get(4).copied().unwrap_or(0.4), e.get(5).copied().unwrap_or(0.5)],
         exposure: EXPOSURE,
-    })
+    }, piece_draws))
 }
 
 /// The movable props' render: one run of draws per template range (`(first_index,
@@ -483,6 +519,11 @@ struct RenderBuilder {
     texture_keys: Vec<(usize, u32, bool)>,
     /// The source whose draws split on the layout grid (`park_layout::CELL`).
     cells: Option<usize>,
+    /// That source's pieces: (first vertex, MOBJ id) in vertex order (`park_layout::posed`). Its draws keep each
+    /// piece's triangles together, and [`Self::spans`] records them (Object Dropper step D2c).
+    pieces: Vec<(u32, u32)>,
+    /// Each run of one piece's triangles in the index buffer: (piece id, first index, index count).
+    spans: Vec<(u32, u32, u32)>,
 }
 
 impl RenderBuilder {
@@ -531,8 +572,16 @@ impl RenderBuilder {
         if skipped > 0 {
             println!("  {skipped} water triangles not rendered");
         }
+        // A piece's triangles together in each of its draws (the same draws, in another order), so that the editor
+        // can leave a piece out with one span per draw.
+        let pieces = std::mem::take(&mut self.pieces);
+        let piece_of = |v: u32| pieces.partition_point(|p| p.0 <= v).saturating_sub(1);
+        for g in groups.iter_mut().filter(|g| Some(g.source) == self.cells && !pieces.is_empty()) {
+            g.triangles.sort_by_key(|t| piece_of(t[0]));
+        }
         for g in &groups {
             let src = sources[g.source];
+            let piece_spans = Some(g.source) == self.cells && !pieces.is_empty();
             let albedo = self.texture(sources, g.source, g.albedo, g.cutoff.is_some())?;
             let lightmap = self.texture(sources, g.source, g.lightmap, false)?;
             // Re-index into chunks of at most 65,536 vertices.
@@ -548,6 +597,13 @@ impl RenderBuilder {
                     let new = tri.iter().filter(|v| !remap.contains_key(*v)).count();
                     if remap.len() + new > 65_536 {
                         break;
+                    }
+                    if piece_spans {
+                        let (id, at) = (pieces[piece_of(tri[0])].1, self.indices.len() as u32);
+                        match self.spans.last_mut() {
+                            Some(last) if last.0 == id && last.1 >= first_index && last.1 + last.2 == at => last.2 += 3,
+                            _ => self.spans.push((id, at, 3)),
+                        }
                     }
                     for v in tri {
                         let next = remap.len() as u16;
@@ -582,6 +638,7 @@ impl RenderBuilder {
                 chunk_start = end;
             }
         }
+        self.pieces = pieces;
         Ok(())
     }
 }

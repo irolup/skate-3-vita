@@ -3,6 +3,7 @@
 //! desktop; the GL parts are Vita-only.
 pub mod course;
 pub mod math;
+pub mod spans;
 #[cfg(target_os = "vita")]
 pub mod apt;
 #[cfg(target_os = "vita")]

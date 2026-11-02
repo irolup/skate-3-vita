@@ -159,6 +159,11 @@ pub struct Movie {
     /// name wins in `linkage`: registerClass binds the library's symbol, so every copy gets the class (the trick
     /// guide imports "Button Item" itself and again through panel > button_menu; its button help had no class).
     pub class_links: BTreeMap<i32, String>,
+    /// skate_vita: the library each copied character came from, and each library's linkage names -> their copies here.
+    /// attachMovie looks a name up in the library that defined the calling clip first (the Flash rule): the browser
+    /// exports a "Tab" of its own, and the tabs control's SetupTabs must attach the tabs library's "Tab".
+    pub defined_in: BTreeMap<i32, String>,
+    pub library_linkage: BTreeMap<String, BTreeMap<String, i32>>,
     /// Library movie keys this movie imports from, in record order.
     pub import_files: Vec<String>,
     /// Classes bound by registerClass: character -> class function object. A new clip of that
@@ -289,6 +294,8 @@ impl Movie {
                 .filter_map(|r| Some((r["name"].as_str()?.to_string(), r["character_id"].as_i64()? as i32)))
                 .collect(),
             class_links: BTreeMap::new(),
+            defined_in: BTreeMap::new(),
+            library_linkage: BTreeMap::new(),
             import_files: {
                 let mut files: Vec<String> = Vec::new();
                 for r in json["imports"].as_array().into_iter().flatten() {
@@ -621,6 +628,9 @@ impl Movie {
     fn remove(&mut self, vm: &mut Vm, id: usize) {
         self.attached.remove(&id);
         self.scaled.remove(&id);
+        // A removed clip is no longer a root (the Object Dropper's picker rows, moved by script and rebuilt on every
+        // list refresh, kept ~800 objects alive each time until the VM's budget ran out; device run 2026-10-29).
+        self.script_moved.remove(&id);
         if let Some(instance) = self.instances.remove(&id) {
             // Retail sub_82E55DA8 dispatches unload before tearing down the children.
             if let Some(p) = &instance.placement {
@@ -849,7 +859,12 @@ impl Movie {
         depth: i32,
         init: Option<usize>,
     ) -> Result<Option<usize>, String> {
-        let (Some(&character), true) = (self.linkage.get(linkage), self.instances.contains_key(&parent)) else {
+        let own = self
+            .instances
+            .get(&parent)
+            .and_then(|i| self.defined_in.get(&i.character))
+            .and_then(|lib| self.library_linkage.get(lib)?.get(linkage));
+        let (Some(&character), true) = (own.or(self.linkage.get(linkage)), self.instances.contains_key(&parent)) else {
             return Ok(None);
         };
         self.unsettle(parent);
@@ -1066,8 +1081,9 @@ impl Movie {
             let Some(library) = libraries.get(&lib_key) else {
                 continue;
             };
+            // Also the names the movie has itself (attachMovie from the library's clips finds the library's own).
             let missing: Vec<i32> =
-                library.linkage.iter().filter(|(name, _)| !self.linkage.contains_key(*name)).map(|(_, c)| *c).collect();
+                library.linkage.values().filter(|c| !memo.contains_key(&(lib_key.clone(), **c))).copied().collect();
             let mut link = Link {
                 resolution,
                 libraries,
@@ -1120,10 +1136,13 @@ impl Movie {
             let id =
                 self.copy_character(link, &b.source, next, b.source_character, as_id, depth + 1)?;
             link.memo.insert((lib_key.to_string(), source), id);
+            self.note_library_names(lib_key, lib, source, id);
             return Ok(id);
         };
         let id = as_id.unwrap_or_else(|| self.fresh_character());
         link.memo.entry((lib_key.to_string(), source)).or_insert(id);
+        self.defined_in.insert(id, lib_key.to_string());
+        self.note_library_names(lib_key, lib, source, id);
         // The library's linkage names travel with the copy, so a component's nested clips (highlight_option's
         // HighlightText) get the classes registered for them; the movie's own names win.
         for (name, character) in &lib.linkage {
@@ -1191,6 +1210,14 @@ impl Movie {
         self.unresolved = None;
         Arc::make_mut(&mut self.characters).insert(id, c);
         Ok(id)
+    }
+}
+impl Movie {
+    /// The library's linkage names of `source`, copied here as `id`.
+    fn note_library_names(&mut self, lib_key: &str, lib: &Movie, source: i32, id: i32) {
+        for (name, _) in lib.linkage.iter().filter(|(_, c)| **c == source) {
+            self.library_linkage.entry(lib_key.to_string()).or_default().entry(name.clone()).or_insert(id);
+        }
     }
 }
 struct Link<'a> {

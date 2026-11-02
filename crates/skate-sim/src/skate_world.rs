@@ -53,7 +53,7 @@ pub(crate) fn validate_runtime(map: &SkateMap) -> Result<(), String> {
             // The in-memory skate.Park layout mark (park_layout::attach), never in a package file.
             continue;
         }
-        if extension.tag == crate::park_bake::EXTENSION_TAG && extension.schema == 1 {
+        if extension.tag == crate::park_bake::EXTENSION_TAG && (extension.schema == 1 || extension.schema == 2) {
             // skate_vita: a park pack's baked layout (park_bake.rs), appended to the static world and the rails.
             continue;
         }
@@ -275,10 +275,14 @@ fn append_pieces(
     Ok(())
 }
 /// skate_vita: what [`append_pieces`] appends, as rows with one range per piece (for the bake, crate::park_bake).
-pub(crate) fn fused_piece_rows(pieces: &crate::park_layout::Pieces) -> Result<(Vec<FusedTriangle>, Vec<std::ops::Range<usize>>), String> {
+pub(crate) fn fused_piece_rows(pieces: &crate::park_layout::Pieces) -> Result<(Vec<FusedTriangle>, Vec<std::ops::Range<usize>>, Vec<u32>), String> {
     let (fused, _) = split_unfused(pieces);
-    let (rows, splits) = fuse_rows(&fused.0, &pieces.materials, Some(&fused.1), true, Some((&pieces.fuse, &fused.2)))?;
-    Ok((rows, splits.unwrap_or_default()))
+    let (rows, splits) = fuse_rows_all(&fused.0, &pieces.materials, Some(&fused.1), true, Some((&pieces.fuse, &fused.2)))?;
+    // The fused pieces' ids in split order (split_unfused keeps the order of `pieces.ranges`), for the Object Dropper
+    // to find a piece's rows; a piece whose triangles all fused away has no range, as `fuse_rows` drops it.
+    let ids = (0..pieces.ranges.len()).filter(|&i| !pieces.unfused.get(i).copied().unwrap_or(false)).map(|i| pieces.ids.get(i).copied().unwrap_or(0));
+    let (ranges, ids) = splits.unwrap_or_default().into_iter().zip(ids).filter(|(r, _)| !r.is_empty()).unzip();
+    Ok((rows, ranges, ids))
 }
 
 /// skate_vita: [`append_pieces`] from a baked layout's rows (no fuse at load).
@@ -1005,6 +1009,22 @@ pub(crate) fn fuse_rows(
     native_surfaces: bool,
     fuse: Option<(&crate::park_layout::FuseRules, &[FuseTag])>,
 ) -> Result<(Vec<FusedTriangle>, Option<Vec<std::ops::Range<usize>>>), String> {
+    let (rows, ranges) = fuse_rows_all(collision, materials, splits, native_surfaces, fuse)?;
+    let ranges = match splits {
+        Some(_) => ranges.map(|r| r.into_iter().filter(|r| !r.is_empty()).collect()),
+        None => ranges,
+    };
+    Ok((rows, ranges))
+}
+
+/// [`fuse_rows`] with one range per split, empty ones too (a piece whose triangles all fused away).
+fn fuse_rows_all(
+    collision: &[skate_data::skate_map::Collision],
+    materials: &[skate_data::skate_map::Material],
+    splits: Option<&[std::ops::Range<usize>]>,
+    native_surfaces: bool,
+    fuse: Option<(&crate::park_layout::FuseRules, &[FuseTag])>,
+) -> Result<(Vec<FusedTriangle>, Option<Vec<std::ops::Range<usize>>>), String> {
     let points: Vec<_> = collision.iter().map(|t| t.points).collect();
     let (positions, vertices, mut flags, mut cosines, kept) = if let Some((rules, tags)) = fuse {
         // The piece of each triangle: one split range per piece (append_pieces), else one piece.
@@ -1022,7 +1042,7 @@ pub(crate) fn fuse_rows(
     };
     let fused_splits: Option<Vec<std::ops::Range<usize>>> = (fuse.is_some()).then(|| {
         let before: Vec<usize> = std::iter::once(0).chain(kept.iter().scan(0, |n, &k| { *n += usize::from(k); Some(*n) })).collect();
-        splits.map_or_else(|| vec![0..before[kept.len()]], |s| s.iter().map(|r| before[r.start]..before[r.end]).filter(|r| !r.is_empty()).collect())
+        splits.map_or_else(|| vec![0..before[kept.len()]], |s| s.iter().map(|r| before[r.start]..before[r.end]).collect())
     });
     let mut rows = Vec::with_capacity(vertices.len());
     for (i, source) in collision.iter().enumerate() {
@@ -1533,6 +1553,12 @@ pub(crate) fn load_dmo_collision(asset_root: &std::path::Path, map_name: &str) -
 /// The `collision` map of one placement sidecar (`dynamic_props.write_placements`: district props, park layouts).
 pub(crate) fn load_collision_shapes(path: &std::path::Path) -> std::collections::BTreeMap<String, PropShape> {
     let Some(sidecar) = skate_data::vfs::read(path).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()) else { return Default::default() };
+    collision_shapes(&sidecar, &path.display().to_string())
+}
+
+/// skate_vita: the `collision` map of a parsed sidecar (`origin` names it in the warnings); the catalogue bake
+/// stores it in binary (`catalog_shapes`).
+pub(crate) fn collision_shapes(sidecar: &serde_json::Value, origin: &str) -> std::collections::BTreeMap<String, PropShape> {
     let Some(map) = sidecar.get("collision").and_then(|v| v.as_object()) else { return Default::default() };
     let mut out = std::collections::BTreeMap::new();
     for (key, v) in map {
@@ -1550,7 +1576,7 @@ pub(crate) fn load_collision_shapes(path: &std::path::Path) -> std::collections:
         }).collect()).unwrap_or_default();
         let surfaces: Vec<u32> = v["surfaces"].as_array().map(|ss| ss.iter().map(|x| x.as_u64().unwrap_or(0) as u32).collect()).unwrap_or_default();
         if edges.len() != triangles.len() || surfaces.len() != triangles.len() {
-            warn!("SKATE_PROP_COLLISION: {}: template {key}: triangle, edge and surface counts differ; render mesh kept", path.display());
+            warn!("SKATE_PROP_COLLISION: {origin}: template {key}: triangle, edge and surface counts differ; render mesh kept");
             continue;
         }
         let tag = |unit: &serde_json::Value, keys: &serde_json::Value| -> Option<FuseTag> {
@@ -2455,7 +2481,7 @@ mod fuser_tests {
             points, surface: 0, material: 1, native_edges: Some([0x60; 3]),
         }).collect();
         let pieces = |unfused: Vec<bool>| crate::park_layout::Pieces {
-            collision: collision.clone(), ranges: vec![0..2, 2..4], materials: vec![], rails: vec![],
+            collision: collision.clone(), ranges: vec![0..2, 2..4], ids: vec![1, 2], materials: vec![], rails: vec![],
             fuse: crate::park_layout::FuseRules::default(), unfused, tags: vec![],
         };
         let flagged = pieces(vec![false, true]);

@@ -17,6 +17,8 @@ use skate_core::triggers::{overlaps, OrientedBox, QueryShape};
 
 /// The teleporters' file in ui.pak (`vita-bake ui`).
 const PATH: &str = "private/teleporters.json";
+/// The placed park teleporters' ids (`set_park`).
+const PARK_PREFIX: &str = "park:";
 /// The confirm popup's callback.
 pub const CONFIRM: &str = "engine:teleporter";
 /// The recomp's head and hips heights above the feet (b423: 1.61-1.65 m, 0.97-1.00 m).
@@ -123,6 +125,33 @@ impl Teleporters {
         Self { list, ..Self::default() }
     }
 
+    /// The park teleporters the player placed on `world` (Object Dropper; retail arms a layout's teleporters as
+    /// teleport challenges, `8286D6E8`: title `ID_COMMON_TELEPORT`, one exit on the same map), replacing the last
+    /// ones; kept while the confirm popup is up.
+    pub fn set_park(&mut self, world: &str, park: &[skate_sim::object_dropper::world::ParkTeleporter]) {
+        if self.phase == Phase::Confirm {
+            return;
+        }
+        let list: Vec<Teleporter> = park
+            .iter()
+            .map(|t| Teleporter {
+                id: format!("{PARK_PREFIX}{}", t.channel),
+                map: world.to_owned(),
+                title: "ID_COMMON_TELEPORT".to_owned(),
+                volume: OrientedBox { center: t.centre, axes: t.axes, half_extents: t.half_extents, fatness: 0.0 },
+                exits: vec![Exit { map: world.to_owned(), locator: String::new(), matrix: t.exit }],
+                indicator: None,
+            })
+            .collect();
+        let old = self.list.iter().filter(|t| t.id.starts_with(PARK_PREFIX));
+        if old.clone().count() == list.len() && old.zip(&list).all(|(a, b)| a.map == b.map && a.volume == b.volume && a.exits[0].matrix == b.exits[0].matrix) {
+            return;
+        }
+        self.list.retain(|t| !t.id.starts_with(PARK_PREFIX));
+        self.list.extend(list);
+        self.inside = None;
+    }
+
     /// Whether the skater on `world` with its feet at `feet` is inside a teleporter (None while a world loads);
     /// leaving it, or another world, forgets it.
     pub fn track(&mut self, world: Option<&str>, feet: [f32; 3]) {
@@ -216,6 +245,24 @@ mod tests {
          "volume": {"id": "2", "name": "w", "shape": {"kind": "box", "center": [0, 0, 0], "half_extents": [1, 1, 1]}},
          "exits": [{"map": "DownTown", "locator": "l", "matrix": [[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]]}]}
     ]}"#;
+
+    #[test]
+    fn a_placed_park_teleporter_asks_and_takes_its_end() {
+        use skate_sim::object_dropper::world::ParkTeleporter;
+        let mut t = Teleporters::load(&read(FILE));
+        let exit = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [40.0, 1.5, 0.0, 1.0]];
+        let park = [ParkTeleporter { channel: 0, centre: [3.0, 1.5, -3.0], axes: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], half_extents: [2.0; 3], exit }];
+        t.set_park("StartPark", &park);
+        t.track(Some("StartPark"), [3.0, 0.0, -3.0]);
+        assert_eq!(t.prompt(), Some("ID_COMMON_TELEPORT"));
+        t.ask();
+        let to = t.choose(1).unwrap();
+        assert_eq!((to.map.as_str(), to.matrix[3]), ("StartPark", [40.0, 1.5, 0.0, 1.0]));
+        // Gone from the park: no prompt, the disc's teleporter kept.
+        t.set_park("StartPark", &[]);
+        t.track(Some("StartPark"), [3.0, 0.0, -3.0]);
+        assert_eq!((t.prompt(), t.list.len()), (None, 1));
+    }
 
     #[test]
     fn inside_asks_yes_takes_the_exit_and_no_asks_again() {

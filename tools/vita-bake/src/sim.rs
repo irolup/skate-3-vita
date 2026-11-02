@@ -87,8 +87,25 @@ fn verify(assets: &Path, sim: &[File]) -> Result<(), String> {
     }
     let json = Collections::load(assets)?;
     let binary = Collections::load(root)?;
-    if format!("{:?}", json.entries()) != format!("{:?}", binary.entries()) {
-        return Err("binary collections differ from the JSON".into());
+    // The loading screen's hint pairs are not in sim.pak's form (`collections::Raw::decode`; the ui bake reads them from
+    // the JSON): compared without them.
+    let without_pairs = |entries: &[skate_data::collections::Collection]| -> Vec<skate_data::collections::Collection> {
+        let mut entries = entries.to_vec();
+        for f in entries.iter_mut().flat_map(|c| c.fields.values_mut()) {
+            if let Some(a) = &mut f.array {
+                a.text_pairs.clear();
+            }
+        }
+        entries
+    };
+    let (a, b) = (without_pairs(json.entries()), binary.entries().to_vec());
+    if a.len() != b.len() {
+        return Err(format!("binary collections differ from the JSON: {} entries, {} in the JSON", b.len(), a.len()));
+    }
+    if let Some((x, y)) = a.iter().zip(b.iter()).map(|(x, y)| (format!("{x:?}"), format!("{y:?}"))).find(|(x, y)| x != y) {
+        let at = x.bytes().zip(y.bytes()).position(|(p, q)| p != q).unwrap_or(0);
+        let around = |s: &str| s.get(at.saturating_sub(80)..(at + 120).min(s.len())).unwrap_or_default().to_owned();
+        return Err(format!("binary collections differ from the JSON: JSON ...{}... binary ...{}...", around(&x), around(&y)));
     }
     // Every skeleton in the file, through the loader (which selects one by name).
     let names: Vec<String> = serde_names(&std::fs::read(assets.join(SKELETONS)).map_err(|e| e.to_string())?)?;

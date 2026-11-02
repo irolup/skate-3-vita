@@ -46,7 +46,25 @@ pub struct Update {
     pub teleports: Vec<(String, [[f32; 4]; 4])>,
     /// Call Skater (FE 62): a character key to call (true) or dismiss (false), in order.
     pub skater_calls: Vec<(String, bool)>,
+    /// Text the game asked for and the player typed: (callback, text) (Save Park's name).
+    pub texts: Vec<(String, String)>,
+    /// The game's own popups answered: (callback, option) (Save Park's overwrite question).
+    pub answers: Vec<(String, i32)>,
+    /// My Parks: the saved park the player selected or deleted (its index in the list given).
+    pub browser: Vec<skate_ui::fe::browser_host::BrowserEvent>,
+    /// New Park: the lot and template the player took in Park Setup.
+    pub park_setup: Vec<skate_ui::fe::park_setup_host::ParkSetupChoice>,
 }
+
+/// Save Park's text entry and popup callbacks.
+pub const PARK_NAME: &str = "park.name";
+pub const PARK_OVERWRITE: &str = "park.overwrite";
+/// My Parks' question before loading over unsaved edits.
+pub const PARK_LOAD: &str = "park.load";
+/// Park Setup's question before laying a template over unsaved edits.
+pub const PARK_DIRTY: &str = "park.dirty";
+/// My Parks' question before deleting a saved park.
+pub const PARK_DELETE: &str = "park.delete";
 
 pub enum FeMenus {
     /// Waiting for ui.pak.
@@ -77,11 +95,16 @@ pub struct Ready {
     /// The retail replay screen is open (`FeMenus::replay`), and the choices made in its popups since last taken.
     replay: bool,
     replay_choices: Vec<(String, i32)>,
+    /// The Object Dropper's retail screen is open (`FeMenus::object_dropper`), and its list callbacks for the editor.
+    dropper: bool,
+    dropper_list: Vec<(usize, bool)>,
     /// The stage runs over the game (the teleporter prompt or its confirm popup; `hud`).
     hud: bool,
     /// The system keyboard the text entry (Extras > Enter Cheat Code) opens.
     #[cfg(target_os = "vita")]
     keyboard: vita_platform::ime::Keyboard,
+    /// The keyboard is up for the game itself (its callback), not for the stage's text entry.
+    own_entry: Option<String>,
     stats: Stats,
 }
 
@@ -220,11 +243,14 @@ impl FeMenus {
                         closing: 0.0,
                         replay: false,
                         replay_choices: Vec::new(),
+                        dropper: false,
+                        dropper_list: Vec::new(),
                         hud: false,
                         loading_screen: false,
                         load_wanted: false,
                         #[cfg(target_os = "vita")]
                         keyboard: Default::default(),
+                        own_entry: None,
                         stats: Stats::default(),
                     }))
                 }
@@ -311,10 +337,17 @@ impl FeMenus {
     }
 
     /// Opens the pause menu (retail Start), or the main menu, with the game's current settings and saved replays.
-    pub fn open(&mut self, settings: &Settings, replays: &[String], main: bool) {
+    pub fn open(&mut self, settings: &Settings, replays: &[String], main: bool, park: bool) {
         if let FeMenus::Ready(r) = self {
             if !r.shown {
-                crate::vita_menus::set_main_menu(&mut r.stage.menus.context, main);
+                // The pause menu over a park editor: the editor closed first (825CB440); its screen goes now, its outro
+                // run by the menu's own updates (device: it stayed drawn under the menu).
+                if r.dropper {
+                    r.stage.set_object_dropper(None, &[], &[]);
+                    r.stage.remove_popups(crate::dropper::RESET_POPUP);
+                    r.dropper = false;
+                }
+                crate::vita_menus::set_main_menu(&mut r.stage.menus.context, main, park);
                 r.stage.closable = !main;
                 crate::vita_menus::write_settings(&mut r.stage.menus.registry, settings);
                 crate::vita_menus::set_facts(&mut r.stage.menus.context, settings);
@@ -373,6 +406,80 @@ impl FeMenus {
         r.replay
     }
 
+    /// The Object Dropper's retail screen (template ObjectDropper) on the menu stage: opened, fed and closed with the
+    /// editor (`feed` None: closed), the editor's screen modes posted; `ask_reset` raises the open world's reset
+    /// question (`ID_DMO_RESET_CONFIRMATION`, Yes / No, retail `825C6548`), which takes the pad until answered.
+    /// Returns the question's answer (0 Yes, 1 No; B: negative or 255).
+    pub fn object_dropper(
+        &mut self,
+        feed: Option<skate_ui::fe::object_dropper_host::ObjectDropperFeed>,
+        posts: &[u8],
+        quick_posts: &[u8],
+        ask_reset: bool,
+        seconds: f32,
+        pad: &[f32; 24],
+    ) -> Option<i32> {
+        let FeMenus::Ready(r) = self else { return None };
+        // After the editor closed, the stage keeps running until the screen's outro unloads it (else it stays drawn
+        // under the next menu).
+        let closing = feed.is_none() && !r.dropper && !r.shown && r.stage.object_dropper_loaded();
+        if !r.stage.has_object_dropper() || r.stage.failed || !r.pending.is_empty() || (feed.is_none() && !r.dropper && !closing) {
+            return None;
+        }
+        r.dropper = feed.is_some();
+        if !r.dropper {
+            r.stage.remove_popups(crate::dropper::RESET_POPUP);
+        }
+        // The Quick Menu's Style / Branding pages: the movie's list takes the pad (`mbAllowMenuPickerInput`).
+        use skate_ui::fe::object_dropper_host::{PAGE_BRANDING, PAGE_STYLE};
+        let list = feed.as_ref().and_then(|f| f.quick.as_ref()).is_some_and(|q| q.page == PAGE_STYLE || q.page == PAGE_BRANDING);
+        r.stage.set_object_dropper(feed, posts, quick_posts);
+        if ask_reset && r.dropper {
+            r.stage.push_popup(skate_core::fe_popup::PopupRequest {
+                title: "ID_COMMON_WARNING".into(),
+                description: "ID_DMO_RESET_CONFIRMATION".into(),
+                options: vec!["ID_COMMON_YES".into(), "ID_COMMON_NO".into()],
+                cancelable: true,
+                callback: crate::dropper::RESET_POPUP.into(),
+                ..Default::default()
+            });
+        }
+        let frame = if r.stage.popup_shown() || list {
+            r.stage.update(std::slice::from_ref(pad), seconds)
+        } else {
+            r.stage.track_pads(std::slice::from_ref(pad), seconds);
+            r.stage.update_keys(Vec::new(), seconds)
+        };
+        for line in &frame.log {
+            println!("FE_MENUS {line}");
+        }
+        if r.stage.failed {
+            let error = frame.log.last().cloned().unwrap_or_default();
+            self.fail(error);
+            return None;
+        }
+        r.dropper_list.extend(r.stage.take_object_dropper_list_calls());
+        frame.popup_choices.iter().filter(|(c, _)| c == crate::dropper::RESET_POPUP).map(|(_, choice)| *choice).last()
+    }
+
+    /// The Quick Menu's Style / Branding list callbacks since the last call: (row, selected).
+    pub fn take_dropper_list(&mut self) -> Vec<(usize, bool)> {
+        match self {
+            FeMenus::Ready(r) => std::mem::take(&mut r.dropper_list),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The Object Dropper's movie is still on the menu stage (open, or playing its outro).
+    pub fn object_dropper_loaded(&self) -> bool {
+        matches!(self, FeMenus::Ready(r) if r.dropper || r.stage.object_dropper_loaded())
+    }
+
+    /// The Object Dropper's retail screen is open.
+    pub fn object_dropper_open(&self) -> bool {
+        matches!(self, FeMenus::Ready(r) if r.dropper)
+    }
+
     /// Raises the replay's Finished menu (Upload Video, Save Replay, Exit; B closes it) as the stage's popup.
     pub fn replay_popup(&mut self, options: &[&str]) {
         if let FeMenus::Ready(r) = self {
@@ -383,6 +490,115 @@ impl FeMenus {
                 options: options.iter().map(|o| (*o).to_owned()).collect(),
                 cancelable: true,
                 callback: REPLAY_POPUP.into(),
+                ..Default::default()
+            });
+        }
+    }
+
+    /// Save Park's name (retail `8270A278`: the keyboard titled `ID_SKATEPARK_NAME_PARK`, the park's name typed, 16
+    /// characters at most) over the menu; the answer comes in [`Update::texts`] under [`PARK_NAME`]. NOT RETAIL YET:
+    /// the system keyboard opens over the pause menu itself (retail pushes FE 0x2E; the stage's FE 46 closed the menu).
+    pub fn ask_park_name(&mut self, name: &str) {
+        if let FeMenus::Ready(r) = self {
+            #[cfg(target_os = "vita")]
+            {
+                let title = r.stage.text("ID_SKATEPARK_NAME_PARK");
+                let opened = r.keyboard.open_with(&title, name, 16);
+                println!("FE_MENUS keyboard for {PARK_NAME} ({title:?}): {}", if opened { "open" } else { "refused" });
+                if opened {
+                    r.own_entry = Some(PARK_NAME.into());
+                }
+            }
+            #[cfg(not(target_os = "vita"))]
+            let _ = (r, name);
+        }
+    }
+
+    /// A taken name (retail `8270A398`): `ID_COMMON_WARNING_TITLE` / `ID_SKATEPARK_ALREADY_EXISTS`, Yes (0) overwrites, No
+    /// (1) goes back to the keyboard; the answer comes in [`Update::answers`] under [`PARK_OVERWRITE`].
+    pub fn ask_park_overwrite(&mut self) {
+        if let FeMenus::Ready(r) = self {
+            r.stage.push_popup(skate_core::fe_popup::PopupRequest {
+                title: "ID_COMMON_WARNING_TITLE".into(),
+                description: "ID_SKATEPARK_ALREADY_EXISTS".into(),
+                options: vec!["ID_COMMON_YES".into(), "ID_COMMON_NO".into()],
+                cancelable: true,
+                callback: PARK_OVERWRITE.into(),
+                ..Default::default()
+            });
+        }
+    }
+
+    /// My Parks (skate.Park's second row): retail's browser over the menu with the saved parks; false without its movie.
+    pub fn open_parks(&mut self, items: Vec<skate_ui::fe::browser_host::BrowserItem>) -> bool {
+        match self {
+            FeMenus::Ready(r) => r.stage.open_browser(items),
+            _ => false,
+        }
+    }
+
+    /// New Park (skate.Park's first row): retail's Park Setup over the menu with the lots; false without its movie.
+    pub fn open_park_setup(&mut self, lots: Vec<skate_ui::fe::park_setup_host::ParkSetupLot>) -> bool {
+        match self {
+            FeMenus::Ready(r) => r.stage.open_park_setup(lots),
+            _ => false,
+        }
+    }
+
+    /// Laying a template over unsaved edits (retail `825D2588`): `ID_SKATEPARK_DIRTY_TITLE` / `ID_SKATEPARK_DIRTY_DESC`,
+    /// No (0) / Yes (1); the answer comes in [`Update::answers`] under [`PARK_DIRTY`].
+    pub fn ask_park_dirty(&mut self) {
+        if let FeMenus::Ready(r) = self {
+            r.stage.push_popup(skate_core::fe_popup::PopupRequest {
+                title: "ID_SKATEPARK_DIRTY_TITLE".into(),
+                description: "ID_SKATEPARK_DIRTY_DESC".into(),
+                options: vec!["ID_COMMON_NO".into(), "ID_COMMON_YES".into()],
+                cancelable: true,
+                callback: PARK_DIRTY.into(),
+                ..Default::default()
+            });
+        }
+    }
+
+    /// Deleting a saved park (retail `82523BC0`): `ID_COMMON_WARNING_TITLE` / `ID_MEMCARD_PROMPT_DELETE_SKATEPARK`, No (0) /
+    /// Yes (1); the answer comes in [`Update::answers`] under [`PARK_DELETE`].
+    pub fn ask_park_delete(&mut self) {
+        if let FeMenus::Ready(r) = self {
+            r.stage.push_popup(skate_core::fe_popup::PopupRequest {
+                title: "ID_COMMON_WARNING_TITLE".into(),
+                description: "ID_MEMCARD_PROMPT_DELETE_SKATEPARK".into(),
+                options: vec!["ID_COMMON_NO".into(), "ID_COMMON_YES".into()],
+                cancelable: true,
+                callback: PARK_DELETE.into(),
+                ..Default::default()
+            });
+        }
+    }
+
+    /// The save wheel (a park being written or deleted): shown over the menus or the game while on.
+    pub fn set_saving(&mut self, on: bool) {
+        if let FeMenus::Ready(r) = self {
+            r.stage.set_save_tag(on);
+        }
+    }
+
+    /// The saved parks changed (a delete): the browser shows them.
+    pub fn set_parks(&mut self, items: Vec<skate_ui::fe::browser_host::BrowserItem>) {
+        if let FeMenus::Ready(r) = self {
+            r.stage.set_browser_items(items);
+        }
+    }
+
+    /// Loading a saved park over unsaved edits (retail `8262A570`): `ID_SKATEPARK_LOAD_PARK_CONFIRM`, Yes (0) / No (1);
+    /// the answer comes in [`Update::answers`] under [`PARK_LOAD`].
+    pub fn ask_park_load(&mut self) {
+        if let FeMenus::Ready(r) = self {
+            r.stage.push_popup(skate_core::fe_popup::PopupRequest {
+                title: String::new(),
+                description: "ID_SKATEPARK_LOAD_PARK_CONFIRM".into(),
+                options: vec!["ID_COMMON_YES".into(), "ID_COMMON_NO".into()],
+                cancelable: true,
+                callback: PARK_LOAD.into(),
                 ..Default::default()
             });
         }
@@ -407,11 +623,15 @@ impl FeMenus {
     /// title is passed on (their update posts it).
     pub fn hud(&mut self, signup: Option<String>, popup: Option<skate_core::fe_popup::PopupRequest>, seconds: f32, pad: &[f32; 24]) -> Option<i32> {
         let FeMenus::Ready(r) = self else { return None };
-        if !r.stage.has_signup() || r.stage.failed || !r.pending.is_empty() {
+        // The save wheel runs the stage over the game too.
+        let saving = r.stage.save_tag_active();
+        if (!r.stage.has_signup() && !saving) || r.stage.failed || !r.pending.is_empty() {
             return None;
         }
-        r.stage.set_signup(signup);
-        if r.shown || r.replay {
+        if r.stage.has_signup() {
+            r.stage.set_signup(signup);
+        }
+        if r.shown || r.replay || r.dropper {
             r.hud = false;
             return None;
         }
@@ -419,7 +639,7 @@ impl FeMenus {
             r.stage.push_popup(popup);
             r.hud = true;
         }
-        r.hud = r.hud && r.stage.popup_shown() || r.stage.signup_active();
+        r.hud = r.hud && r.stage.popup_shown() || r.stage.signup_active() || saving;
         if !r.hud {
             return None;
         }
@@ -516,7 +736,11 @@ impl FeMenus {
         let typing = false;
         #[cfg(target_os = "vita")]
         if let Some(text) = r.keyboard.poll() {
-            r.stage.text_entered(text);
+            match r.own_entry.take() {
+                // The game's own (Save Park's name): to the game, an empty or cancelled one dropped.
+                Some(callback) => out.texts.extend(text.map(|t| t.trim().to_owned()).filter(|t| !t.is_empty()).map(|t| (callback, t))),
+                None => r.stage.text_entered(text),
+            }
         }
         let pad = if typing { &[0.0; 24] } else { pad };
         let started = Instant::now();
@@ -535,9 +759,12 @@ impl FeMenus {
             }
         }
         out.teleports.extend(frame.teleports.iter().filter_map(|key| r.stage.teleport(key).cloned()));
+        out.answers.extend(frame.popup_choices.iter().filter(|(c, _)| c.starts_with("park.")).cloned());
+        out.browser.extend(r.stage.take_browser_events());
+        out.park_setup.extend(r.stage.take_park_setup_choices());
         if let Some((title, request)) = &frame.text_entry {
             #[cfg(target_os = "vita")]
-            let opened = r.keyboard.open(title, request.max_len);
+            let opened = r.keyboard.open_with(title, &request.default, request.max_len);
             #[cfg(not(target_os = "vita"))]
             let opened = false;
             println!("FE_MENUS keyboard for {} ({title:?}): {}", request.callback, if opened { "open" } else { "refused" });
@@ -590,7 +817,7 @@ impl FeMenus {
     /// glyphs, `app::draw_glyphs`: retail name with `_hud`, rectangle in stage space).
     pub fn draw(&mut self, apt: &mut Apt) -> Vec<(String, [f32; 4])> {
         let FeMenus::Ready(r) = self else { return Vec::new() };
-        if !r.shown && !r.replay && !r.hud && !r.loading_screen && (r.closing <= 0.0 || r.hidden) {
+        if !r.shown && !r.replay && !r.dropper && !r.hud && !r.loading_screen && (r.closing <= 0.0 || r.hidden) {
             return Vec::new();
         }
         let started = Instant::now();
@@ -643,6 +870,12 @@ const REPLAY_POPUP: &str = "replay.finished";
 /// A retail prompt's button as the replay screens name their glyphs: the face buttons as they are, the others with
 /// `_hud` (a stick or the D-pad without a direction suffix: the stick, the D-pad's arrows).
 fn glyph_name(retail: &str) -> String {
+    // The face buttons, Back and Start draw the same with or without `_hud` (the dropper's `Back_hud`, the language
+    // strings' inline `<B:A_hud>`).
+    let plain = retail.strip_suffix("_hud").unwrap_or(retail);
+    if matches!(plain, "A" | "B" | "X" | "Y" | "Back" | "Start") {
+        return plain.to_owned();
+    }
     // Already the HUD-style name (the replay screen's prompts: `L3_Click_hud`, `DPad_UpDown_hud`).
     if retail.ends_with("_hud") || matches!(retail, "A" | "B" | "X" | "Y") {
         return retail.to_owned();

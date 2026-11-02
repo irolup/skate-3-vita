@@ -10,6 +10,9 @@ use crate::fe::retail_menu_movies::{image_key, NAMED_IMAGE_PREFIX};
 pub const SLOTS: usize = 40;
 /// Texture key prefix the draw gives an `ImageRenderComponent` quad: `slot/<n>`.
 pub const SLOT_TEXTURE_PREFIX: &str = "slot/";
+/// Texture key prefix of `MemcardLoad` images: `memcard/<kind>/<index>`, a picture the game supplies under that key
+/// (a saved park's, kind 10).
+pub const MEMCARD_TEXTURE_PREFIX: &str = "memcard/";
 /// Texture key prefix of `LoadAssetByName` images: a texture another system keeps resident under that name (the
 /// player's park screenshot); nothing supplies them yet, so they draw nothing.
 pub const ASSET_TEXTURE_PREFIX: &str = "asset/";
@@ -86,8 +89,21 @@ impl ImageSlots {
                     }
                 }
             }
-            // LoadAsset / MemcardLoad / OnlineLoad / LoadTeamLogo: online and memory card sources, not ported; the
-            // slot keeps what it has (draws nothing new).
+            // (kind, index, slot): a memory card picture (the browser's saved parks), drawn from the game's texture
+            // `memcard/<kind>/<index>` (skate_vita: the Vita keeps the pictures as files).
+            "MemcardLoad" => {
+                if let Some(i) = index(2) {
+                    let n = |k: usize| args.get(k).map_or(0, to_integer);
+                    let file = match args.get(1) {
+                        Some(Value::Text(t)) => t.trim().parse::<i64>().unwrap_or(0),
+                        _ => n(1) as i64,
+                    };
+                    self.slots[i].image = Some(format!("{MEMCARD_TEXTURE_PREFIX}{}/{file}", n(0)));
+                    self.slots[i].lock = false;
+                }
+            }
+            // LoadAsset / OnlineLoad / LoadTeamLogo: online sources, not ported; the slot keeps what it has (draws
+            // nothing new).
             _ => {}
         }
         Some(Value::Undefined)

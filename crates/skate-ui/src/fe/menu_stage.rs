@@ -85,6 +85,28 @@ const REPLAY: &str = "Replay2";
 const REPLAY_PATH: &str = "replay2/replay_editor2.swf";
 const REPLAY_HELP: &str = "ReplayHelp";
 const REPLAY_HELP_PATH: &str = "replay2/replay_help.swf";
+/// The Object Dropper screen (docs/object-dropper-survey.md "The screen"): template 103 ObjectDropper, opened by the
+/// engine with the editor (FE state 0x35 in a park, 0x37 in the open world), not by a menu push.
+const OBJECT_DROPPER: &str = "ObjectDropper";
+const OBJECT_DROPPER_PATH: &str = "objectdropper/objectdropper.swf";
+/// Its Quick Menu ("Properties", FE state 0x36, template 104), opened over it while the editor's Quick Menu is open.
+const OBJECT_QUICK_MENU: &str = "ObjectQuickMenu";
+const OBJECT_QUICK_MENU_PATH: &str = "objectdropper/objectquickmenu.swf";
+/// The shared browser on parks (skate.Park > My Parks; FE 0x3B, screen record 59): template CommonBrowser, pushed by the
+/// game ([`MenuStage::open_browser`]).
+const BROWSER: &str = "CommonBrowser";
+const BROWSER_PATH: &str = "browser/browser.swf";
+const BROWSER_SCREEN: &str = "f34a9fae51e2b903";
+/// Park Setup (skate.Park > New Park; FE 0x3A, screen record 58): template ParkSetup, pushed by the game
+/// ([`MenuStage::open_park_setup`]).
+const PARK_SETUP: &str = "ParkSetup";
+const PARK_SETUP_PATH: &str = "skatepark/parksetup.swf";
+const PARK_SETUP_SCREEN: &str = "d2dfe72ee96887b1";
+/// The browser's tab keys (retail key codes: RB 6, LB 9 the top tabs; RT 7, LT 10 the bottom ones).
+const KEY_RB: u32 = 6;
+const KEY_RT: u32 = 7;
+const KEY_LB: u32 = 9;
+const KEY_LT: u32 = 10;
 /// The action overlay (research b426: template 59 SignUpHUD, `hud2/actionoverlay2`): the teleporter prompt, opened once
 /// on the "popup" layer like the popups; state 2 shows it with the title (`SignUpPoster.GetTeleportTitle`), 0 hides it.
 const SIGNUP: &str = "SignUpHUD";
@@ -140,8 +162,8 @@ const POPUP_KINDS: [PopupKind; 3] = [PopupKind::Standard, PopupKind::Small, Popu
 /// come along): the boot root and what it loads (the screen manager, the chyron, the dimmer, ...), the pause menu,
 /// Game Settings, Video Calibration, the Trick Guide, the Challenge Map, the instant replay screen and its help, the
 /// action overlay (the teleporter prompt), Extras, the text viewer, the Skate Profile, SpawnSkater, the Free Play
-/// options, the loading screen and the popups. Not the HUD movies.
-pub const PAUSE_ROOTS: [&str; 26] = [
+/// options, the loading screen, the popups and the Object Dropper and its Quick Menu. Not the HUD movies.
+pub const PAUSE_ROOTS: [&str; 30] = [
     "source/screens/main",
     "source/screens/main/FE_root",
     "source/screens/main/chyron",
@@ -168,6 +190,10 @@ pub const PAUSE_ROOTS: [&str; 26] = [
     "source/screens/main/tiploader",
     "source/screens/popup/sk8popup",
     "source/screens/popup/small_popup",
+    "source/screens/objectdropper/objectdropper",
+    "source/screens/objectdropper/objectquickmenu",
+    "source/screens/browser/browser",
+    "source/screens/skatepark/parksetup",
 ];
 
 /// What runs when the screen is black (the fade hold's callback).
@@ -269,9 +295,30 @@ pub struct MenuStage {
     replay_shown: bool,
     /// The game's replay this frame (`Self::set_replay`): Some while a replay is open.
     replay_feed: Option<crate::fe::replay_menu_host::ReplayScreenFeed>,
+    /// The Object Dropper screen's AS id (None: no template or movie in this install), its host, the editor this
+    /// frame (`Self::set_object_dropper`: Some while it is open) and the screen modes it posted since the last update.
+    object_dropper_id: Option<i32>,
+    /// The browser's movie id (its template registered and movie in the set), the host between updates, and the
+    /// game's requests: open with these parks, new parks.
+    browser_id: Option<i32>,
+    browser: crate::fe::browser_host::BrowserHost,
+    browser_open: Option<Vec<crate::fe::browser_host::BrowserItem>>,
+    browser_items: Option<Vec<crate::fe::browser_host::BrowserItem>>,
+    /// Park Setup's movie id, the host between updates, and the game's open request (its lots).
+    park_setup_id: Option<i32>,
+    park_setup: crate::fe::park_setup_host::ParkSetupHost,
+    park_setup_open: Option<Vec<crate::fe::park_setup_host::ParkSetupLot>>,
+    object_quick_menu_id: Option<i32>,
+    object_dropper: crate::fe::object_dropper_host::ObjectDropperHost,
+    object_dropper_feed: Option<crate::fe::object_dropper_host::ObjectDropperFeed>,
+    object_dropper_posts: Vec<u8>,
+    object_quick_posts: Vec<u8>,
     /// The action overlay's AS id (None: no movie in the set), the title the game asks it to show and the one shown.
     signup_id: Option<i32>,
     signup_title: Option<String>,
+    /// The autosave layer's save wheel: wanted by the game ([`MenuStage::set_save_tag`]), and as last applied.
+    save_tag: bool,
+    save_tag_shown: bool,
     signup_shown: Option<String>,
     /// The Extras screen's and the text viewer's AS ids, their hosts and the cheat table.
     extras_id: i32,
@@ -506,6 +553,35 @@ impl MenuStage {
                 &mut fe,
             )?;
         }
+        // The Object Dropper's screen modes, the same way (their C++ name table `0x8302C440`), when its movie is here.
+        if movies.movies.contains_key(&movie_key(OBJECT_DROPPER_PATH)) {
+            for (i, name) in crate::fe::object_dropper_host::SCREEN_MODES.iter().enumerate() {
+                stage.call_path(
+                    "_level0._root.RegisterChallengeEnum",
+                    vec![Value::Text(format!("FEObjectDropperScreenMode_{name}")), Value::Text(i.to_string())],
+                    &mut fe,
+                )?;
+            }
+        }
+        // The browser's modes (names `0x8302792C`).
+        if movies.movies.contains_key(&movie_key(BROWSER_PATH)) {
+            for (i, name) in crate::fe::browser_host::MODES.iter().enumerate() {
+                stage.call_path(
+                    "_level0._root.RegisterChallengeEnum",
+                    vec![Value::Text(format!("FECommonBrowserMode_{name}")), Value::Text(i.to_string())],
+                    &mut fe,
+                )?;
+            }
+        }
+        if movies.movies.contains_key(&movie_key(OBJECT_QUICK_MENU_PATH)) {
+            for (i, name) in crate::fe::object_dropper_host::QUICK_SCREEN_MODES.iter().enumerate() {
+                stage.call_path(
+                    "_level0._root.RegisterChallengeEnum",
+                    vec![Value::Text(format!("FEObjectQuickMenuScreenMode_{name}")), Value::Text(i.to_string())],
+                    &mut fe,
+                )?;
+            }
+        }
         // Popup host create (FE screen 29 vt+4, 0x825EF370): templates 17 Sk8Popup, 18 Sk8SmallPopup and 4
         // Sk8AutoSavePopup open once on the AS layer "popup"; they stay loaded and are shown / hidden per popup.
         let popup_movies: Vec<(PopupKind, String)> = POPUP_KINDS
@@ -583,6 +659,10 @@ impl MenuStage {
             row.greyed = !has(TEXT_VIEWER, TEXT_VIEWER_PATH);
         }
         let replay_id = has(REPLAY, REPLAY_PATH).then(|| as_id(REPLAY));
+        let object_dropper_id = has(OBJECT_DROPPER, OBJECT_DROPPER_PATH).then(|| as_id(OBJECT_DROPPER));
+        let browser_id = has(BROWSER, BROWSER_PATH).then(|| as_id(BROWSER));
+        let park_setup_id = has(PARK_SETUP, PARK_SETUP_PATH).then(|| as_id(PARK_SETUP));
+        let object_quick_menu_id = has(OBJECT_QUICK_MENU, OBJECT_QUICK_MENU_PATH).then(|| as_id(OBJECT_QUICK_MENU));
         // The loading screen's lines; without them its panels have nothing to say (Coach Frank and the hint).
         let tips_lines: skate_data::tips_loader::TipsLines =
             read(TIPS_LOADER_DATA).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
@@ -615,10 +695,25 @@ impl MenuStage {
             replay_id,
             replay_help_id,
             replay_menu: Default::default(),
+            object_dropper_id,
+            browser_id,
+            browser: Default::default(),
+            browser_open: None,
+            browser_items: None,
+            park_setup_id,
+            park_setup: Default::default(),
+            park_setup_open: None,
+            object_quick_menu_id,
+            object_dropper: Default::default(),
+            object_dropper_feed: None,
+            object_dropper_posts: Vec::new(),
+            object_quick_posts: Vec::new(),
             replay_shown: false,
             replay_feed: None,
             signup_id,
             signup_title: None,
+            save_tag: false,
+            save_tag_shown: false,
             signup_shown: None,
             extras_id: as_id(EXTRAS),
             viewer_id: as_id(TEXT_VIEWER),
@@ -781,6 +876,10 @@ impl MenuStage {
         let profile = self.index(OFFLINE_PROFILE_SCREEN);
         let spawn = self.index(SPAWN_SKATER_SCREEN);
         let free = self.index(FREE_SKATE_SCREEN);
+        let browser = self.index(BROWSER_SCREEN).filter(|_| self.browser_id.is_some());
+        let browser_id = self.browser_id.unwrap_or(0);
+        let park_setup = self.index(PARK_SETUP_SCREEN).filter(|_| self.park_setup_id.is_some());
+        let park_setup_id = self.park_setup_id.unwrap_or(0);
         let (spawn_id, free_id) = (self.spawn_skater_id, self.free_skate_id);
         let loader = self.index(LOADING_SCREEN).filter(|_| self.tips_loader_id.is_some());
         let loader_id = self.tips_loader_id.unwrap_or(0);
@@ -800,6 +899,21 @@ impl MenuStage {
         fe.challenge_map = std::mem::take(&mut self.challenge_map);
         fe.challenge_map.open = map.is_some() && self.stack.top(Layer::Main) == map;
         fe.replay_menu = std::mem::take(&mut self.replay_menu);
+        fe.object_dropper = std::mem::take(&mut self.object_dropper);
+        fe.browser = std::mem::take(&mut self.browser);
+        // The game's browser requests: pushed on the stack (its movie opens with the push), new parks shown.
+        if let (Some(items), Some(b)) = (self.browser_open.take(), browser) {
+            fe.browser = crate::fe::browser_host::BrowserHost::open(items);
+            self.stack.request(Layer::Main, Request::push(b));
+        }
+        if let Some(items) = self.browser_items.take() {
+            fe.browser.set_items(items);
+        }
+        fe.park_setup = std::mem::take(&mut self.park_setup);
+        if let (Some(lots), Some(p)) = (self.park_setup_open.take(), park_setup) {
+            fe.park_setup = crate::fe::park_setup_host::ParkSetupHost::open(lots);
+            self.stack.request(Layer::Main, Request::push(p));
+        }
         fe.signup_title = self.signup_shown.clone();
         fe.extras = std::mem::take(&mut self.extras);
         fe.extras.open = extras.is_some() && self.stack.top(Layer::Main) == extras;
@@ -815,6 +929,11 @@ impl MenuStage {
         let (replay_id, replay_help_id) = (self.replay_id, self.replay_help_id);
         let replay_feed = self.replay_feed.clone();
         let replay_shown = &mut self.replay_shown;
+        let object_dropper_id = self.object_dropper_id;
+        let object_dropper_feed = self.object_dropper_feed.clone();
+        let object_dropper_posts = std::mem::take(&mut self.object_dropper_posts);
+        let object_quick_posts = std::mem::take(&mut self.object_quick_posts);
+        let object_quick_menu_id = self.object_quick_menu_id;
         // Work for the registry once the movie work is done: the crossbar item, settings steps.
         let mut selected: Option<String> = None;
         let mut sub_selected: Option<(String, usize)> = None;
@@ -858,8 +977,19 @@ impl MenuStage {
                     }
                     continue;
                 }
+                // The Object Dropper's Quick Menu (FE 0x36, opened by the engine, not on the stack): on its Style and
+                // Branding pages the C++ handler (825CF360) leaves the keys to the movie's list (its UpdateInput,
+                // `mbAllowMenuPickerInput`).
+                {
+                    use crate::fe::object_dropper_host::{PAGE_BRANDING, PAGE_STYLE};
+                    let list = fe.object_dropper.quick_shown && fe.object_dropper.feed.quick.as_ref().is_some_and(|q| q.page == PAGE_STYLE || q.page == PAGE_BRANDING);
+                    if let Some(quick_id) = self.object_quick_menu_id.filter(|_| list) {
+                        update_input(stage, quick_id, key, controller, &mut fe)?;
+                        continue;
+                    }
+                }
                 let target = stack.input_target();
-                let Some(screen) = target.filter(|t| [pause, options, cal, trick, map, extras, viewer, profile, spawn, free].contains(&Some(*t))) else { continue };
+                let Some(screen) = target.filter(|t| [pause, options, cal, trick, map, extras, viewer, profile, spawn, free, browser, park_setup].contains(&Some(*t))) else { continue };
                 // sub_825EC0E8: the screen's C++ handler first, then the movie's UpdateInput when the handler did
                 // not consume the key and the screen's record says so (+12).
                 let mut consumed = false;
@@ -881,6 +1011,10 @@ impl MenuStage {
                     spawn_id
                 } else if Some(screen) == free {
                     free_id
+                } else if Some(screen) == browser {
+                    browser_id
+                } else if Some(screen) == park_setup {
+                    park_setup_id
                 } else {
                     trick_id
                 };
@@ -893,7 +1027,54 @@ impl MenuStage {
                     // while the close fades out (S+52).
                     continue;
                 }
-                if Some(screen) == free {
+                if Some(screen) == browser {
+                    // The browser's C++ keys (82621778): the d-pad, the tab shoulders, B; A / Y / X go to the movie
+                    // (its UpdateInput) until it is shown (no input while it waits for data).
+                    use crate::fe::browser_host::BrowserKey;
+                    let k = match key {
+                        APT_PREVIOUS => Some(BrowserKey::Back),
+                        KEY_RB => Some(BrowserKey::TopNext),
+                        KEY_LB => Some(BrowserKey::TopPrevious),
+                        KEY_RT => Some(BrowserKey::BottomNext),
+                        KEY_LT => Some(BrowserKey::BottomPrevious),
+                        // Only the pad's own codes (0xC - 0xF): a d-pad press also sends its AptD* twin.
+                        k if k == KEYS_UP[0] => Some(BrowserKey::Up),
+                        k if k == KEYS_DOWN[0] => Some(BrowserKey::Down),
+                        k if k == KEYS_LEFT[0] => Some(BrowserKey::Left),
+                        k if k == KEYS_RIGHT[0] => Some(BrowserKey::Right),
+                        _ => None,
+                    };
+                    match k {
+                        Some(k) => {
+                            consumed = fe.browser.key(k);
+                            if std::mem::take(&mut fe.browser.closed) {
+                                stack.request(Layer::Main, Request::Close { screen });
+                            }
+                        }
+                        None if !fe.browser.shown => consumed = true,
+                        None => {}
+                    }
+                } else if Some(screen) == park_setup {
+                    // Park Setup's C++ keys (825D28C0): the movie takes none.
+                    use crate::fe::park_setup_host::ParkSetupKey;
+                    let k = match key {
+                        APT_PREVIOUS => Some(ParkSetupKey::Back),
+                        APT_NEXT => Some(ParkSetupKey::Select),
+                        // Only the pad's own codes (0xC - 0xF, as 825D28C0): a d-pad press also sends its AptD* twin.
+                        k if k == KEYS_UP[0] => Some(ParkSetupKey::Up),
+                        k if k == KEYS_DOWN[0] => Some(ParkSetupKey::Down),
+                        k if k == KEYS_LEFT[0] => Some(ParkSetupKey::Left),
+                        k if k == KEYS_RIGHT[0] => Some(ParkSetupKey::Right),
+                        _ => None,
+                    };
+                    if let Some(k) = k.filter(|_| fe.park_setup.shown) {
+                        fe.park_setup.key(k);
+                        if std::mem::take(&mut fe.park_setup.closed) {
+                            stack.request(Layer::Main, Request::Close { screen });
+                        }
+                    }
+                    consumed = true;
+                } else if Some(screen) == free {
                     // Screen 34 input 8260A4E8 (b564): Up / Down pick the row (sound, SetState 999), Left / Right step
                     // it (SetState row; the movie plays the slider sound), B writes back and closes; the movie takes no
                     // keys.
@@ -1128,6 +1309,30 @@ impl MenuStage {
                         self.trick_guide_fade_in = None;
                         close(stage, trick_id, &mut fe)?;
                     }
+                    Effect::Open(i) if Some(i) == browser => {
+                        log.push(format!("open browser (FE {i})"));
+                        fe.browser.open = true;
+                        fe.browser.shown = false;
+                        open_screen(stage, BROWSER_PATH, BROWSER, &mut fe)?;
+                    }
+                    Effect::Close(i) if Some(i) == browser => {
+                        log.push(format!("close browser (FE {i})"));
+                        fe.browser.open = false;
+                        fe.browser.shown = false;
+                        close(stage, browser_id, &mut fe)?;
+                    }
+                    Effect::Open(i) if Some(i) == park_setup => {
+                        log.push(format!("open park setup (FE {i})"));
+                        fe.park_setup.open = true;
+                        fe.park_setup.shown = false;
+                        open_screen(stage, PARK_SETUP_PATH, PARK_SETUP, &mut fe)?;
+                    }
+                    Effect::Close(i) if Some(i) == park_setup => {
+                        log.push(format!("close park setup (FE {i})"));
+                        fe.park_setup.open = false;
+                        fe.park_setup.shown = false;
+                        close(stage, park_setup_id, &mut fe)?;
+                    }
                     Effect::Open(i) if Some(i) == map => {
                         // Init sub_826457E0 on the mode root (sub_8261BC30: `progression` in career and free skate).
                         log.push(format!("open Challenge Map (FE {i})"));
@@ -1322,6 +1527,56 @@ impl MenuStage {
                     (None, false) => {}
                 }
             }
+            // The Object Dropper screen (FE 0x35 / 0x37): opened with the editor, shown after its IntroComplete, fed
+            // every frame, closed with the editor.
+            if let Some(dropper_id) = object_dropper_id {
+                // A screen still playing its outro is let finish first (opened over it, the new one never shows).
+                let closing = stage.levels().iter().any(|l| l.key == movie_key(OBJECT_DROPPER_PATH));
+                match (object_dropper_feed.clone(), fe.object_dropper.open) {
+                    (Some(_), false) if closing => {}
+                    (Some(feed), false) => {
+                        log.push(format!("open {OBJECT_DROPPER} ({})", if feed.world { "FE 0x37, open world" } else { "FE 0x35, park" }));
+                        // Modes posted while a closing screen was let finish come along.
+                        let states = std::mem::take(&mut fe.object_dropper.states);
+                        fe.object_dropper = crate::fe::object_dropper_host::ObjectDropperHost { open: true, feed, states, ..Default::default() };
+                        open_screen(stage, OBJECT_DROPPER_PATH, OBJECT_DROPPER, &mut fe)?;
+                    }
+                    (Some(feed), true) => fe.object_dropper.feed = feed,
+                    (None, true) => {
+                        log.push(format!("close {OBJECT_DROPPER}"));
+                        fe.object_dropper = Default::default();
+                        close(stage, dropper_id, &mut fe)?;
+                    }
+                    (None, false) => {}
+                }
+                if object_dropper_feed.is_some() {
+                    fe.object_dropper.states.extend(object_dropper_posts.iter().map(|&m| i32::from(m)));
+                }
+                // The Quick Menu (FE 0x36) over the shown dropper screen while the editor's is open.
+                if let Some(quick_id) = object_quick_menu_id {
+                    let wanted = object_dropper_feed.as_ref().is_some_and(|f| f.quick.is_some()) && fe.object_dropper.shown;
+                    let host = &mut fe.object_dropper;
+                    match (wanted, host.quick_open) {
+                        (true, false) => {
+                            log.push(format!("open {OBJECT_QUICK_MENU} (FE 0x36)"));
+                            host.quick_open = true;
+                            host.quick_shown = false;
+                            host.quick_states.clear();
+                            open_screen(stage, OBJECT_QUICK_MENU_PATH, OBJECT_QUICK_MENU, &mut fe)?;
+                        }
+                        (false, true) => {
+                            log.push(format!("close {OBJECT_QUICK_MENU}"));
+                            host.quick_open = false;
+                            host.quick_shown = false;
+                            close(stage, quick_id, &mut fe)?;
+                        }
+                        _ => {}
+                    }
+                    if fe.object_dropper.quick_open {
+                        fe.object_dropper.quick_states.extend(object_quick_posts.iter().map(|&m| i32::from(m)));
+                    }
+                }
+            }
             // NOT RETAIL (guard): with no screen left the fade would stay black, so release it.
             if stack.top(Layer::Main).is_none() && self.fade.held(FADE_SCREEN) {
                 self.fade.release(FADE_SCREEN, false, &self.fade_params);
@@ -1365,9 +1620,72 @@ impl MenuStage {
                     log.push(format!("loading screen {step:?}"));
                 }
             }
+            if self.save_tag != self.save_tag_shown {
+                save_tag(stage, self.save_tag, &mut fe, log);
+                self.save_tag_shown = self.save_tag;
+            }
             stage.update(seconds * 1000.0, &movies.movies, &mut fe)?;
             // The instant replay screen after this frame's movie update: shown once its intro completed, then told what
             // changed in the replay; its help (FE 13) opened and closed with the feed, each page turn posted.
+            // The browser: shown after its intro (ready: keys), then its modes in order.
+            if let Some(b) = browser.filter(|_| fe.browser.open) {
+                take_call(&mut fe, &format!("Game.OnScreenLoaded({browser_id})"));
+                if !fe.browser.shown && take_call(&mut fe, &format!("Game.OnScreenIntroComplete({browser_id})")) {
+                    fe.browser.shown = true;
+                    stack.ready(b);
+                    show_screen(stage, browser_id, true, &mut fe)?;
+                }
+                if fe.browser.shown {
+                    for state in std::mem::take(&mut fe.browser.states) {
+                        set_state(stage, browser_id, state, &mut fe)?;
+                    }
+                }
+            }
+            // Park Setup: shown after its intro (ready: keys), then its refreshes.
+            if let Some(p) = park_setup.filter(|_| fe.park_setup.open) {
+                take_call(&mut fe, &format!("Game.OnScreenLoaded({park_setup_id})"));
+                if !fe.park_setup.shown && take_call(&mut fe, &format!("Game.OnScreenIntroComplete({park_setup_id})")) {
+                    fe.park_setup.shown = true;
+                    stack.ready(p);
+                    show_screen(stage, park_setup_id, true, &mut fe)?;
+                }
+                if fe.park_setup.shown {
+                    for state in std::mem::take(&mut fe.park_setup.states) {
+                        set_state(stage, park_setup_id, state, &mut fe)?;
+                    }
+                }
+            }
+            // The Object Dropper screen: shown after its intro, then the editor's screen modes in order.
+            if let Some(dropper_id) = object_dropper_id.filter(|_| fe.object_dropper.open) {
+                take_call(&mut fe, &format!("Game.OnScreenLoaded({dropper_id})"));
+                if !fe.object_dropper.shown && take_call(&mut fe, &format!("Game.OnScreenIntroComplete({dropper_id})")) {
+                    fe.object_dropper.shown = true;
+                    show_screen(stage, dropper_id, true, &mut fe)?;
+                }
+                if let Some(quick_id) = object_quick_menu_id.filter(|_| fe.object_dropper.quick_open) {
+                    take_call(&mut fe, &format!("Game.OnScreenLoaded({quick_id})"));
+                    if !fe.object_dropper.quick_shown && take_call(&mut fe, &format!("Game.OnScreenIntroComplete({quick_id})")) {
+                        fe.object_dropper.quick_shown = true;
+                        show_screen(stage, quick_id, true, &mut fe)?;
+                    }
+                    if fe.object_dropper.quick_shown {
+                        for state in std::mem::take(&mut fe.object_dropper.quick_states) {
+                            set_state(stage, quick_id, state, &mut fe)?;
+                        }
+                    }
+                }
+                if fe.object_dropper.shown {
+                    for state in std::mem::take(&mut fe.object_dropper.states) {
+                        // A catalogue state builds its lists from scratch (about 3,000 script objects): collected
+                        // first when half the VM's budget is in use, else a few in one update pass the budget (the
+                        // stage collects only after its update; device run 2026-10-29).
+                        if stage.vm.live_objects() > crate::fe::apt_vm::MAX_OBJECTS / 2 {
+                            stage.collect()?;
+                        }
+                        set_state(stage, dropper_id, state, &mut fe)?;
+                    }
+                }
+            }
             if let Some(replay_id) = replay_id.filter(|_| fe.replay_menu.open) {
                 take_call(&mut fe, &format!("Game.OnScreenLoaded({replay_id})"));
                 if !*replay_shown && take_call(&mut fe, &format!("Game.OnScreenIntroComplete({replay_id})")) {
@@ -1723,6 +2041,9 @@ impl MenuStage {
         self.popup = std::mem::take(&mut fe.popup);
         self.trick_guide = std::mem::take(&mut fe.trick_guide);
         self.replay_menu = std::mem::take(&mut fe.replay_menu);
+        self.object_dropper = std::mem::take(&mut fe.object_dropper);
+        self.browser = std::mem::take(&mut fe.browser);
+        self.park_setup = std::mem::take(&mut fe.park_setup);
         self.extras = std::mem::take(&mut fe.extras);
         self.tos = std::mem::take(&mut fe.tos);
         self.offline_profile = std::mem::take(&mut fe.offline_profile);
@@ -1888,6 +2209,10 @@ impl MenuStage {
                 expanded.extend(crate::fe::replay_menu_host::timeline_draws(&draw, &self.replay_menu.feed));
                 continue;
             }
+            if draw.texture == crate::fe::apt_scene::FENG_SHUI_TERRAIN || draw.texture == crate::fe::apt_scene::FENG_SHUI_PROPS {
+                expanded.extend(self.object_dropper.bar_draws(&draw, draw.texture == crate::fe::apt_scene::FENG_SHUI_PROPS));
+                continue;
+            }
             if draw.texture != crate::fe::apt_scene::MAP_MARKERS {
                 expanded.push(draw);
                 continue;
@@ -1907,6 +2232,20 @@ impl MenuStage {
             }
         }
         let mut draws = expanded;
+        // Swatches (SwatchRenderComponent, `swatch/<n>`): a solid quad of the slot's colour; an unset slot draws nothing.
+        {
+            use crate::fe::object_dropper_host::SWATCH_TEXTURE_PREFIX;
+            let swatches = &self.object_dropper.swatches;
+            draws.retain_mut(|d| {
+                let Some(slot) = d.texture.strip_prefix(SWATCH_TEXTURE_PREFIX) else { return true };
+                let Some(colour) = slot.parse::<usize>().ok().and_then(|s| swatches.get(s).copied().flatten()) else { return false };
+                d.texture.clear();
+                d.fill = Fill::Solid;
+                d.multiply = [colour[0], colour[1], colour[2], d.multiply[3]];
+                d.add = [0.0; 4];
+                true
+            });
+        }
         // Image slots (ImageRenderComponent, `slot/<n>`): the slot's loaded image; an empty slot or an image nobody
         // has draws nothing (retail: the texture lookup finds nothing, b258 section 2), never the white fallback.
         use crate::fe::image_renderer_host::{ASSET_TEXTURE_PREFIX, SLOT_TEXTURE_PREFIX};
@@ -1973,6 +2312,16 @@ impl MenuStage {
     /// The teleporter prompt (the action overlay) with this title, or hidden; posted on the next update.
     pub fn set_signup(&mut self, title: Option<String>) {
         self.signup_title = title;
+    }
+
+    /// skate_vita: the save wheel on (a memory card write runs) or off; applied on the next update.
+    pub fn set_save_tag(&mut self, on: bool) {
+        self.save_tag = on;
+    }
+
+    /// The save wheel is wanted or still up: the stage must update and draw.
+    pub fn save_tag_active(&self) -> bool {
+        self.save_tag || self.save_tag_shown
     }
 
     /// The action overlay is in this install (else the game shows its own prompt).
@@ -2042,6 +2391,50 @@ impl MenuStage {
         self.free_play = values;
     }
 
+    /// skate_vita: opens the shared browser on parks (skate.Park > My Parks, FE 0x3B) with the saved parks; false
+    /// without its movie.
+    pub fn open_browser(&mut self, items: Vec<crate::fe::browser_host::BrowserItem>) -> bool {
+        if self.browser_id.is_none() || self.index(BROWSER_SCREEN).is_none() {
+            return false;
+        }
+        self.browser_open = Some(items);
+        true
+    }
+
+    /// skate_vita: the saved parks changed (a delete): the browser shows them.
+    pub fn set_browser_items(&mut self, items: Vec<crate::fe::browser_host::BrowserItem>) {
+        self.browser_items = Some(items);
+    }
+
+    /// skate_vita: what the player did in the browser since the last call (select or delete a saved park).
+    pub fn take_browser_events(&mut self) -> Vec<crate::fe::browser_host::BrowserEvent> {
+        std::mem::take(&mut self.browser.events)
+    }
+
+    /// skate_vita: the browser is on the stack.
+    pub fn browser_open(&self) -> bool {
+        self.browser.open || self.browser_open.is_some()
+    }
+
+    /// skate_vita: opens Park Setup (skate.Park > New Park, FE 0x3A) with the lots; false without its movie.
+    pub fn open_park_setup(&mut self, lots: Vec<crate::fe::park_setup_host::ParkSetupLot>) -> bool {
+        if self.park_setup_id.is_none() || self.index(PARK_SETUP_SCREEN).is_none() {
+            return false;
+        }
+        self.park_setup_open = Some(lots);
+        true
+    }
+
+    /// skate_vita: the lot and template the player took in Park Setup since the last call.
+    pub fn take_park_setup_choices(&mut self) -> Vec<crate::fe::park_setup_host::ParkSetupChoice> {
+        std::mem::take(&mut self.park_setup.choices)
+    }
+
+    /// skate_vita: a string id in the menus' language (the game's own keyboard titles).
+    pub fn text(&self, id: &str) -> String {
+        crate::fe::fe_language::template(&self.language, id).to_owned()
+    }
+
     /// The game's answer to [`Frame::text_entry`]: the text typed, or None (cancelled). Taken on the next update.
     pub fn text_entered(&mut self, text: Option<String>) {
         self.entry_answer = Some(text);
@@ -2071,6 +2464,31 @@ impl MenuStage {
     /// feeds it, opens its help with the feed and closes it with the replay.
     pub fn set_replay(&mut self, feed: Option<crate::fe::replay_menu_host::ReplayScreenFeed>) {
         self.replay_feed = feed;
+    }
+
+    /// The Object Dropper this frame (None: closed) and the screen modes its editor posted: the next update opens the
+    /// retail screen, feeds it and posts the modes, and closes it with the editor.
+    pub fn set_object_dropper(&mut self, feed: Option<crate::fe::object_dropper_host::ObjectDropperFeed>, posts: &[u8], quick_posts: &[u8]) {
+        self.object_dropper_feed = feed;
+        self.object_dropper_posts.extend_from_slice(posts);
+        self.object_quick_posts.extend_from_slice(quick_posts);
+    }
+
+    /// The Object Dropper movie is still on the stage (after a close, until its outro ends and the screen manager
+    /// unloads it).
+    pub fn object_dropper_loaded(&self) -> bool {
+        let key = movie_key(OBJECT_DROPPER_PATH);
+        self.stage.levels().iter().any(|l| l.key == key)
+    }
+
+    /// The Quick Menu's Style / Branding list callbacks since the last call: (row, selected).
+    pub fn take_object_dropper_list_calls(&mut self) -> Vec<(usize, bool)> {
+        std::mem::take(&mut self.object_dropper.list_calls)
+    }
+
+    /// The retail Object Dropper screen can show (its template and movie are in this install).
+    pub fn has_object_dropper(&self) -> bool {
+        self.object_dropper_id.is_some()
     }
 
     /// The retail replay screen can show (its template and movie are in this install).
@@ -2187,6 +2605,17 @@ fn flush_offline_profile(stage: &mut Stage, id: i32, fe: &mut FrontEnd) -> Resul
 /// (FE 52)"). A menu set without the autosave layer has no such function; the load runs without the wheel.
 fn load_tag(stage: &mut Stage, on: bool, fe: &mut FrontEnd, log: &mut Vec<String>) {
     let (path, args) = if on { ("_global.Load_EnableTag", vec![Value::Bool(true)]) } else { ("_global.Load_HideTag", Vec::new()) };
+    if let Err(e) = stage.call_path(path, args, fe) {
+        log.push(format!("{path}: {e}"));
+    }
+}
+
+/// The autosave layer's save wheel in the corner (`Save_EnableTag(style, isdelete)`, style "false": the corner wheel, not
+/// the central panel) while the game writes to the memory card (owner, on retail: saving or deleting a skate.Park shows
+/// it until done). NOT RETAIL YET: the style retail passes for parks is not read.
+fn save_tag(stage: &mut Stage, on: bool, fe: &mut FrontEnd, log: &mut Vec<String>) {
+    let (path, args) = if on { ("_global.Save_EnableTag", vec![Value::Text("false".into()), Value::Bool(false)]) } else { ("_global.Save_HideTag", Vec::new()) };
+    log.push(format!("save tag {}", if on { "on" } else { "off" }));
     if let Err(e) = stage.call_path(path, args, fe) {
         log.push(format!("{path}: {e}"));
     }
@@ -2669,6 +3098,272 @@ mod tests {
 mod replay_tests {
     use super::*;
     use crate::fe::replay_menu_host::{mode, ReplayScreenFeed};
+
+    /// Park Setup (New Park) on the lean set: opened over the pause menu with lots, shown after its intro, every
+    /// `ParkSetup_*` native answered and the thumbnail drawn from the exported images; the C++ keys move the rows, A takes
+    /// the template, B goes back to the pause menu. Data-gated like the pause test.
+    #[test]
+    fn park_setup_opens_moves_takes_a_template_and_closes() {
+        use crate::fe::park_setup_host::{ParkSetupChoice, ParkSetupLot};
+        let Some(root) = crate::fe::apt_imports::test_menu_set() else { return };
+        let assets = crate::fe::apt_imports::main_checkout().join("assets");
+        let read_set = |p: &str| std::fs::read(root.join(p)).map_err(|e| format!("{p}: {e}"));
+        let read = |p: &str| std::fs::read(assets.join(p)).map_err(|e| format!("{p}: {e}"));
+        if read(TABLES).is_err() {
+            eprintln!("skipped: no menu tables");
+            return;
+        }
+        let movies = RetailMenuMovies::read_lean(&read_set, Some(&PAUSE_ROOTS)).unwrap();
+        let thumbs = movies.has_named_image("fe\\source\\images\\skatepark\\starter_full");
+        let mut ms = MenuStage::boot(movies, &read).unwrap();
+        let lot = |name: &str| ParkSetupLot {
+            name: name.into(),
+            unlocked: true,
+            templates: vec![("ID_FULL".into(), format!("{name}_full")), ("ID_EMPTY".into(), format!("{name}_empty"))],
+        };
+        let run = |ms: &mut MenuStage, keys: Vec<u32>, frames: usize| {
+            let mut log = Vec::new();
+            for frame in 0..frames {
+                let keys = if frame == 0 { keys.iter().map(|&k| (k, 0)).collect() } else { Vec::new() };
+                log.append(&mut ms.update_keys(keys, 1.0 / 60.0).log);
+            }
+            assert!(!ms.failed, "{log:?}");
+            log
+        };
+        run(&mut ms, vec![APT_START], 90);
+        if !ms.open_park_setup(vec![lot("starter"), lot("industrial")]) {
+            eprintln!("skipped: no Park Setup movie in this set");
+            return;
+        }
+        let log = run(&mut ms, Vec::new(), 120);
+        assert!(log.iter().any(|l| l.starts_with("open park setup")), "{log:?}");
+        assert!(ms.park_setup.shown, "shown after its intro: {log:?}");
+        let draws = ms.draw();
+        eprintln!("park setup: {} draws, thumbnails exported {thumbs}, unhandled {:?}", draws.len(), ms.stage.unhandled());
+        assert!(!ms.stage.unhandled().iter().any(|n| n.starts_with("SkatePark.")), "{:?}", ms.stage.unhandled());
+        if thumbs {
+            // The image slot's quad draws the slot's image itself.
+            let shown = draws.iter().any(|d| d.texture == "image/fe/source/images/skatepark/starter_full");
+            assert!(shown, "the thumbnail is drawn");
+        }
+        // Right: the next lot; Down, Right: its Empty template; A takes it. Each press as the Vita sends it: the pad's code
+        // and its d-pad twin, one step.
+        run(&mut ms, vec![KEYS_RIGHT[0], KEYS_RIGHT[1]], 5);
+        run(&mut ms, vec![KEYS_DOWN[0], KEYS_DOWN[1]], 5);
+        run(&mut ms, vec![KEYS_RIGHT[0], KEYS_RIGHT[1]], 5);
+        assert_eq!((ms.park_setup.lot, ms.park_setup.template, ms.park_setup.bar), (1, 1, 1));
+        run(&mut ms, vec![APT_NEXT], 5);
+        assert_eq!(ms.take_park_setup_choices(), vec![ParkSetupChoice { lot: 1, template: 1 }]);
+        let log = run(&mut ms, vec![APT_PREVIOUS], 60);
+        assert!(log.iter().any(|l| l.starts_with("close park setup")), "{log:?}");
+        assert!(ms.open(), "B returns to the pause menu");
+    }
+
+    /// The browser on parks (My Parks) on the lean set: opened with saved parks, shown after its intro, every
+    /// CommonBrowser native it asks answered; the d-pad and the tab shoulders move it, A selects the park, B closes it.
+    /// Data-gated like the pause test.
+    #[test]
+    fn the_park_browser_opens_moves_selects_and_closes() {
+        use crate::fe::browser_host::{BrowserEvent, BrowserItem};
+        let Some(root) = crate::fe::apt_imports::test_menu_set() else { return };
+        let assets = crate::fe::apt_imports::main_checkout().join("assets");
+        let read_set = |p: &str| std::fs::read(root.join(p)).map_err(|e| format!("{p}: {e}"));
+        let read = |p: &str| std::fs::read(assets.join(p)).map_err(|e| format!("{p}: {e}"));
+        if read(TABLES).is_err() {
+            eprintln!("skipped: no menu tables");
+            return;
+        }
+        let movies = RetailMenuMovies::read_lean(&read_set, Some(&PAUSE_ROOTS)).unwrap();
+        let mut ms = MenuStage::boot(movies, &read).unwrap();
+        let parks: Vec<BrowserItem> = (0..3).map(|i| BrowserItem { name: format!("park {i}"), date: "#2026-11-01".into(), picture: Some(i) }).collect();
+        let run = |ms: &mut MenuStage, keys: Vec<u32>, frames: usize| {
+            let mut log = Vec::new();
+            for frame in 0..frames {
+                let keys = if frame == 0 { keys.iter().map(|&k| (k, 0)).collect() } else { Vec::new() };
+                log.append(&mut ms.update_keys(keys, 1.0 / 60.0).log);
+            }
+            assert!(!ms.failed, "{log:?}");
+            log
+        };
+        // Over the pause menu, as skate.Park > My Parks opens it.
+        run(&mut ms, vec![APT_START], 90);
+        assert!(ms.open());
+        if !ms.open_browser(parks.clone()) {
+            eprintln!("skipped: no browser movie in this set");
+            return;
+        }
+        let log = run(&mut ms, Vec::new(), 120);
+        assert!(log.iter().any(|l| l.starts_with("open browser")), "{log:?}");
+        assert!(ms.browser.shown, "shown after its intro: {log:?}");
+        eprintln!("browser: {} draws, unhandled {:?}", ms.draw().len(), ms.stage.unhandled());
+        assert!(!ms.stage.unhandled().iter().any(|n| n.starts_with("CommonBrowser.")), "{:?}", ms.stage.unhandled());
+        // Right twice (the last park), RB to Downloaded (empty) and back with LB: the selection starts over.
+        run(&mut ms, vec![KEYS_RIGHT[0], KEYS_RIGHT[1]], 5);
+        run(&mut ms, vec![KEYS_RIGHT[0], KEYS_RIGHT[1]], 5);
+        assert_eq!(ms.browser.current, 2, "one step a press (the d-pad twin is not a second)");
+        run(&mut ms, vec![KEY_RB], 10);
+        assert_eq!((ms.browser.top, ms.browser.shown_items().len()), (1, 0));
+        run(&mut ms, vec![KEY_LB], 10);
+        assert_eq!((ms.browser.top, ms.browser.current), (0, 0));
+        // A: the movie selects the park under the cursor.
+        run(&mut ms, vec![KEYS_RIGHT[0]], 5);
+        run(&mut ms, vec![APT_NEXT], 10);
+        assert_eq!(ms.take_browser_events(), vec![BrowserEvent::Select(1)]);
+        // A delete: the parks shown again, the cursor kept in range.
+        ms.set_browser_items(parks[..1].to_vec());
+        run(&mut ms, Vec::new(), 5);
+        assert_eq!(ms.browser.current, 0);
+        // A park written or deleted: the autosave layer's save wheel, then hidden.
+        let before = ms.draw().len();
+        ms.set_save_tag(true);
+        let log = run(&mut ms, Vec::new(), 10);
+        assert!(log.iter().any(|l| l == "save tag on") && !log.iter().any(|l| l.starts_with("_global.Save")), "{log:?}");
+        assert!(ms.draw().len() > before, "the wheel draws");
+        ms.set_save_tag(false);
+        let log = run(&mut ms, Vec::new(), 2);
+        assert!(log.iter().any(|l| l == "save tag off") && !ms.save_tag_active(), "{log:?}");
+        let log = run(&mut ms, vec![APT_PREVIOUS], 60);
+        assert!(log.iter().any(|l| l.starts_with("close browser")), "{log:?}");
+        assert!(!ms.browser_open() && ms.open(), "B returns to the pause menu");
+    }
+
+    /// The Object Dropper screen on the lean set: opened with the editor's feed (park, then the open world), shown after
+    /// its intro, the editor's screen modes posted (catalogue, items, manipulate), every SkatePark native it asks
+    /// answered, the Feng Shui bars drawn; closed with the editor. Data-gated like the pause test.
+    #[test]
+    fn the_object_dropper_screen_opens_takes_the_editor_modes_and_draws_the_bars() {
+        use crate::fe::object_dropper_host::ObjectDropperFeed;
+        let Some(root) = crate::fe::apt_imports::test_menu_set() else { return };
+        let assets = crate::fe::apt_imports::main_checkout().join("assets");
+        let read_set = |p: &str| std::fs::read(root.join(p)).map_err(|e| format!("{p}: {e}"));
+        let read = |p: &str| std::fs::read(assets.join(p)).map_err(|e| format!("{p}: {e}"));
+        if read(TABLES).is_err() {
+            eprintln!("skipped: no menu tables");
+            return;
+        }
+        let movies = RetailMenuMovies::read_lean(&read_set, Some(&PAUSE_ROOTS)).unwrap();
+        let mut ms = MenuStage::boot(movies, &read).unwrap();
+        if !ms.has_object_dropper() {
+            eprintln!("skipped: no Object Dropper movie in this set");
+            return;
+        }
+        let run = |ms: &mut MenuStage, frames: usize| {
+            let mut log = Vec::new();
+            for _ in 0..frames {
+                log.append(&mut ms.update_keys(Vec::new(), 1.0 / 60.0).log);
+            }
+            assert!(!ms.failed, "{log:?}");
+            log
+        };
+        for world in [false, true] {
+            let feed = ObjectDropperFeed {
+                world,
+                supers: vec!["terrain".into(), "props".into()],
+                subs: vec![("street".into(), 2), ("vert".into(), 1)],
+                items: vec!["aa_padStreet_md_University".into(), "ab_kicker_lrg_Downtown".into()],
+                terrain: true,
+                terrain_bar: [0.5, 0.2],
+                props_bar: [0.8, 0.0],
+                ..Default::default()
+            };
+            ms.set_object_dropper(Some(feed.clone()), &[0], &[]);
+            let log = run(&mut ms, 90);
+            assert!(log.iter().any(|l| l.starts_with("open ObjectDropper")), "{log:?}");
+            assert!(ms.object_dropper.shown, "shown after its intro: {log:?}");
+            // The catalogue, its item list, an item down, the size, then the item taken.
+            let item = Some(("aa_padStreet_md_University".to_owned(), [2.0, 1.0, 4.0]));
+            ms.set_object_dropper(Some(ObjectDropperFeed { item: item.clone(), ..feed.clone() }), &[1, 29, 27, 8, 2, 25, 13, 2, 19], &[]);
+            run(&mut ms, 30);
+            let draws = ms.draw();
+            let bars = draws.iter().filter(|d| d.fill == crate::fe::apt_scene::Fill::Solid && d.multiply[..3] == [0.0, 1.0, 1.0]).count();
+            let props = draws.iter().filter(|d| d.fill == crate::fe::apt_scene::Fill::Solid && d.multiply[..3] == [1.0, 1.0, 0.0]).count();
+            eprintln!("world {world}: {} draws, FungShui quads {bars}, FungShuiDynamic quads {props}, unhandled {:?}", draws.len(), ms.stage.unhandled());
+            assert!(!ms.stage.unhandled().iter().any(|n| n.starts_with("SkatePark.")), "{:?}", ms.stage.unhandled());
+            assert_eq!((bars, props), (usize::from(!world), 1), "the open world hides the terrain bar");
+            for native in ["GetSuperCategories", "GetItems", "GetItemsUnlocked", "GetCurrentItemSizeInfo"] {
+                assert!(ms.object_dropper.seen.contains(native), "{native}: {:?}", ms.object_dropper.seen);
+            }
+            // B back to the sub category list.
+            ms.set_object_dropper(Some(ObjectDropperFeed { selecting_sub: true, ..feed.clone() }), &[28], &[]);
+            run(&mut ms, 5);
+            assert!(ms.object_dropper.seen.contains("GetSubCategories") && ms.object_dropper.seen.contains("GetSubCategoryDescription"));
+            ms.set_object_dropper(None, &[], &[]);
+            let log = run(&mut ms, 60);
+            assert!(log.iter().any(|l| l.starts_with("close ObjectDropper")), "{log:?}");
+            assert!(!ms.object_dropper_loaded(), "the closed screen unloads after its outro");
+        }
+        // The Quick Menu over the park editor: opened, shown, its rows and the Options page asked, closed.
+        if ms.object_quick_menu_id.is_some() {
+            use crate::fe::object_dropper_host::QuickFeed;
+            let park = ObjectDropperFeed { supers: vec!["terrain".into()], subs: vec![("street".into(), 2)], ..Default::default() };
+            ms.set_object_dropper(Some(park.clone()), &[0], &[]);
+            run(&mut ms, 90);
+            // The colour grid is built as the menu loads, from the table then (red here).
+            let quick = QuickFeed { rows: [true, true, true, true, false, false, true, false], snap: true, collision: true, cursor_speed: 1.0, colours: vec![[1.0, 0.0, 0.0]; 64], ..Default::default() };
+            ms.object_dropper.seen.clear();
+            ms.set_object_dropper(Some(ObjectDropperFeed { quick: Some(quick.clone()), ..park.clone() }), &[], &[]);
+            let log = run(&mut ms, 90);
+            assert!(log.iter().any(|l| l.starts_with("open ObjectQuickMenu")), "{log:?}");
+            assert!(ms.object_dropper.quick_shown, "the Quick Menu shows after its intro: {log:?}");
+            // Down to Options, A, Snapping off, B back to the list.
+            ms.set_object_dropper(Some(ObjectDropperFeed { quick: Some(QuickFeed { snap: false, ..quick.clone() }), ..park.clone() }), &[], &[1, 2, 3, 8, 18, 13, 9, 3]);
+            run(&mut ms, 10);
+            let draws = ms.draw();
+            eprintln!("quick menu: {} draws, seen {:?}, unhandled {:?}", draws.len(), ms.object_dropper.seen, ms.stage.unhandled());
+            assert!(!ms.stage.unhandled().iter().any(|n| n.starts_with("SkatePark.")), "{:?}", ms.stage.unhandled());
+            for native in ["QuickMenu_IsQuickMenuItemEnabled", "GetCurrentSnapState", "GetCurrentCursorSpeed"] {
+                assert!(ms.object_dropper.seen.contains(native), "{native}: {:?}", ms.object_dropper.seen);
+            }
+            // The Style page: the movie's list takes the pad; Down highlights the next style for the editor.
+            let style = QuickFeed { page: crate::fe::object_dropper_host::PAGE_STYLE, style_allowed: true, ..quick.clone() };
+            ms.set_object_dropper(Some(ObjectDropperFeed { quick: Some(style.clone()), ..park.clone() }), &[], &[2, 11]);
+            run(&mut ms, 10);
+            ms.take_object_dropper_list_calls();
+            let mut down = [0.0f32; 24];
+            down[1] = 1.0;
+            for frame in 0..12 {
+                let pad = if frame < 6 { down } else { [0.0; 24] };
+                ms.update(std::slice::from_ref(&pad), 1.0 / 60.0);
+            }
+            let calls = ms.take_object_dropper_list_calls();
+            eprintln!("style list calls {calls:?}");
+            assert!(calls.contains(&(1, false)), "Down highlights the second style: {calls:?}");
+            // The colour grid: the swatches show the table's colours.
+            let colour = QuickFeed { page: 2, ..quick.clone() };
+            ms.set_object_dropper(Some(ObjectDropperFeed { quick: Some(colour), ..park.clone() }), &[], &[9, 0, 10, 23]);
+            run(&mut ms, 10);
+            let reds = ms.draw().iter().filter(|d| d.fill == crate::fe::apt_scene::Fill::Solid && d.multiply[..3] == [1.0, 0.0, 0.0]).count();
+            assert!(reds >= 64, "the grid's swatches are drawn in their colours: {reds}");
+            ms.set_object_dropper(Some(park.clone()), &[], &[]);
+            let log = run(&mut ms, 60);
+            assert!(log.iter().any(|l| l.starts_with("close ObjectQuickMenu")), "{log:?}");
+            ms.set_object_dropper(None, &[], &[]);
+            run(&mut ms, 60);
+        }
+        // The catalogue posted over and over in one update stays inside the VM's object budget.
+        let feed = ObjectDropperFeed { supers: vec!["terrain".into(), "props".into()], subs: vec![("street".into(), 99)], items: (0..99).map(|i| format!("aa_pad{i}_md_University")).collect(), terrain: true, ..Default::default() };
+        ms.set_object_dropper(Some(feed.clone()), &[0], &[]);
+        run(&mut ms, 90);
+        ms.set_object_dropper(Some(feed.clone()), &[1, 29, 28, 29, 4, 29, 28, 5, 29, 0, 1, 29, 28, 29, 4, 29, 28, 5, 29], &[]);
+        run(&mut ms, 2);
+        ms.set_object_dropper(None, &[], &[]);
+        run(&mut ms, 60);
+        // Closed and opened again at once (the outro still running): the new screen shows and takes its modes.
+        let feed = ObjectDropperFeed { supers: vec!["props".into()], subs: vec![("dmo_ramps".into(), 2)], selecting_sub: true, ..Default::default() };
+        ms.set_object_dropper(Some(feed.clone()), &[0], &[]);
+        run(&mut ms, 90);
+        ms.set_object_dropper(None, &[], &[]);
+        run(&mut ms, 2);
+        ms.set_object_dropper(Some(feed.clone()), &[0, 1], &[]);
+        run(&mut ms, 90);
+        assert!(ms.object_dropper.shown, "the reopened screen shows");
+        ms.object_dropper.seen.clear();
+        ms.set_object_dropper(Some(feed), &[28], &[]);
+        run(&mut ms, 5);
+        assert!(ms.object_dropper.seen.contains("GetSubCategories"), "{:?}", ms.object_dropper.seen);
+        let levels = ms.stage.levels().iter().filter(|l| l.key == movie_key(OBJECT_DROPPER_PATH)).count();
+        assert_eq!(levels, 1, "one dropper screen on the stage");
+    }
 
     /// The instant replay screen on the lean set: opened with the replay's feed, shown after its intro, every
     /// FEReplayMenu native it asks answered; the timeline mode draws the strip (bands and keys); the help opens over

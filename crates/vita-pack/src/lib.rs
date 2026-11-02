@@ -3,6 +3,7 @@
 //! A pack is one container: a 56-byte header (magic, kind, kind version, payload
 //! length, blake3 hash of the payload) and a little-endian payload whose layout the
 //! kind's module defines. Packs hold retail-derived data and are never committed.
+pub mod catalog;
 pub mod district;
 pub mod files;
 pub mod map;
@@ -24,6 +25,10 @@ pub enum Kind {
     District,
     /// The movable props' render (`map::PropRender`).
     Props,
+    /// An Object Dropper catalogue item's render (`catalog::ItemRender`).
+    CatalogItem,
+    /// A texture of the catalogue's shared tables (`catalog::texture_to_pack`).
+    CatalogTexture,
 }
 impl Kind {
     fn code(self) -> u32 {
@@ -33,6 +38,8 @@ impl Kind {
             Kind::Map => 3,
             Kind::District => 4,
             Kind::Props => 5,
+            Kind::CatalogItem => 6,
+            Kind::CatalogTexture => 7,
         }
     }
     fn from_code(code: u32) -> Option<Self> {
@@ -42,6 +49,8 @@ impl Kind {
             3 => Some(Kind::Map),
             4 => Some(Kind::District),
             5 => Some(Kind::Props),
+            6 => Some(Kind::CatalogItem),
+            7 => Some(Kind::CatalogTexture),
             _ => None,
         }
     }

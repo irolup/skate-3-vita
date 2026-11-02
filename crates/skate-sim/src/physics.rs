@@ -22,6 +22,8 @@ mod foot_physical_output;
 pub(crate) mod ground;
 mod render_pose;
 mod world_handle;
+pub(crate) mod park_edit;
+pub(crate) mod dropped;
 pub(crate) use world_handle::WorldHandle;
 mod riding_outputs;
 mod skateboard_controller;
@@ -170,6 +172,12 @@ pub(crate) struct GamePhysics {
     /// Offboard prop carry state (Phase 3); one held prop at a time.
     pub(crate) prop_carry: prop_carry::PropCarry,
     grind_world: std::sync::Arc<crate::grind_world::StaticProvider>,
+    /// skate_vita (Object Dropper): a baked park's layout pieces as the editor moves them (`park_edit.rs`).
+    park: Option<park_edit::ParkPieces>,
+    /// skate_vita (Object Dropper): the catalogue items dropped into the world, by scene id (`dropped.rs`), and the
+    /// cars' rails without theirs (`car_rails` is both).
+    dropped: std::collections::BTreeMap<u32, dropped::Dropped>,
+    cars_only_rails: crate::grind_world::props::PropRailPoses,
     /// The living-world cars' rails at this tick's car poses (`set_car_rails`), after the props in the rail query.
     car_rails: crate::grind_world::props::PropRailPoses,
     grind_materials: grind_materials::GrindMaterials,
@@ -359,7 +367,15 @@ impl GamePhysics {
     }
     /// This tick's traffic cars in the grab scene (`living_world::vehicles::push_vehicle_grab_splines`).
     pub(crate) fn set_car_rails(&mut self, rails: crate::grind_world::props::PropRailPoses) {
-        self.car_rails = rails;
+        if self.dropped.is_empty() {
+            self.car_rails = rails.clone();
+        } else {
+            // skate_vita (Object Dropper): the dropped terrain's rails stay after the cars'.
+            let mut all = rails.0.clone();
+            all.extend(self.car_rails.0.iter().filter(|r| r.tag == crate::grind_world::props::PIECE_OWNER_TAG).cloned());
+            self.car_rails = crate::grind_world::props::PropRailPoses(all);
+        }
+        self.cars_only_rails = rails;
     }
     pub(crate) fn set_grab_cars(&mut self, cars: Vec<skate_core::player::offboard::grab_scene::Object>) -> Result<(), String> {
         shared_mut(&mut self.offboard_grab_scene).set_cars(cars)
@@ -684,7 +700,9 @@ impl GamePhysics {
     /// Mod convenience: [`Self::reset_prop`] for every prop away from its authored pose or with a
     /// saved placement, in id order. NOT RETAIL YET: no retail "reset all moved objects" code was
     /// found (the phone getter GetPhoneListCanResetAllObjectsOption exists, its handler is not
-    /// located). Returns the reset ids.
+    /// located). Returns the reset ids. skate_vita: the open-world Object Dropper's reset question
+    /// reaches it (`825C6638` -> `82884100` on the DMO manager, docs/object-dropper-survey.md); what
+    /// `82884100` resets exactly is not read.
     pub(crate) fn reset_moved_props(&mut self) -> Vec<u32> {
         let mut ids: Vec<u32> = self.prop_dynamics.as_ref().map(|d| d.moved_ids()).unwrap_or_default();
         ids.extend(self.prop_carry.layout().keys().copied());
@@ -897,6 +915,10 @@ impl GamePhysics {
         //those identities from triangle/mesh IDs. Queries use the real registry.
         let offboard_grab_scene =
             offboard::grab_scene::Registry::new(&world, Vec::new(), Vec::new())?;
+        let park = match (&baked, &window) {
+            (Some(baked), None) if !baked.ids.is_empty() => Some(park_edit::ParkPieces::from_baked(baked, world.triangles().len(), map.and_then(crate::park_layout::layout_of).map(str::to_owned))),
+            _ => None,
+        };
         let processed_flags_2468 = 0x2000;
         let riding = RidingOutputs::load(&data, &board, processed_flags_2468)?;
         let (query, retention) = ground::query_settings();
@@ -917,6 +939,9 @@ impl GamePhysics {
             prop_dynamics: prop_dynamics.map(std::sync::Arc::new),
             prop_carry,
             grind_world,
+            park,
+            dropped: Default::default(),
+            cars_only_rails: Default::default(),
             grind_materials,
             offboard_grab_scene: std::sync::Arc::new(offboard_grab_scene),
             car_rails: Default::default(),
@@ -964,6 +989,9 @@ impl GamePhysics {
             prop_dynamics: self.prop_dynamics.clone(),
             prop_carry: parts.prop_carry,
             grind_world: std::sync::Arc::clone(&self.grind_world),
+            park: None,
+            dropped: Default::default(),
+            cars_only_rails: Default::default(),
             grind_materials: self.grind_materials.clone(),
             offboard_grab_scene: std::sync::Arc::clone(&self.offboard_grab_scene),
             car_rails: self.car_rails.clone(),

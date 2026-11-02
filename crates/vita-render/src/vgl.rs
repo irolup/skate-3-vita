@@ -55,6 +55,12 @@ pub const GL_CLAMP_TO_EDGE: GLint = 0x812F;
 pub const GL_COMPRESSED_RGBA_S3TC_DXT1_EXT: GLenum = 0x83F1;
 pub const GL_COMPRESSED_RGBA_S3TC_DXT5_EXT: GLenum = 0x83F3;
 pub const GL_TEXTURE1: GLenum = 0x84C1;
+pub const GL_STENCIL_TEST: GLenum = 0x0B90;
+pub const GL_STENCIL_BUFFER_BIT: GLbitfield = 0x0000_0400;
+pub const GL_KEEP: GLenum = 0x1E00;
+pub const GL_REPLACE: GLenum = 0x1E01;
+pub const GL_ALWAYS: GLenum = 0x0207;
+pub const GL_NOTEQUAL: GLenum = 0x0205;
 
 /// `SceGxmMultisampleMode`
 pub const SCE_GXM_MULTISAMPLE_NONE: c_int = 0;
@@ -144,6 +150,11 @@ unsafe extern "C" {
     pub fn glBlendFunc(sfactor: GLenum, dfactor: GLenum);
     pub fn glDepthFunc(func: GLenum);
     pub fn glDepthMask(flag: GLboolean);
+    pub fn glColorMask(red: GLboolean, green: GLboolean, blue: GLboolean, alpha: GLboolean);
+    pub fn glStencilFunc(func: GLenum, reference: GLint, mask: GLuint);
+    pub fn glStencilOp(sfail: GLenum, dpfail: GLenum, dppass: GLenum);
+    pub fn glStencilMask(mask: GLuint);
+    pub fn glClearStencil(s: GLint);
     pub fn glClearDepthf(depth: GLfloat);
     pub fn glCullFace(mode: GLenum);
     pub fn glFrontFace(mode: GLenum);

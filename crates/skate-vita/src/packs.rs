@@ -99,6 +99,10 @@ pub fn mount() -> &'static str {
     if let Err(e) = add("props.pak") {
         println!("{DIR}/props.pak: {e}; no movable props");
     }
+    // The Object Dropper's catalogue (optional: without catalog.pak the phone's dropper row does nothing).
+    if let Err(e) = add("catalog.pak") {
+        println!("{DIR}/catalog.pak: {e}; no Object Dropper");
+    }
     // The living world (traffic); after props.pak, whose living-world tables it extends.
     if let Err(e) = add("living.pak") {
         println!("{DIR}/living.pak: {e}; no traffic");
@@ -384,7 +388,8 @@ fn load_district(name: &str) -> Result<(skate_data::skate_map::SkateMap, Render)
 }
 
 /// The park's pack: (sim map for the session, render data for the scene).
-pub fn load_park(name: &str) -> Result<(skate_data::skate_map::SkateMap, Render), String> {
+/// A world's simulation map, render, and its park pieces' spans in the render (Object Dropper; none in a district).
+pub fn load_park(name: &str) -> Result<(skate_data::skate_map::SkateMap, Render, Vec<vita_pack::map::PieceDraws>), String> {
     // Sessions loaded afterwards stream their collision for a district and hold it whole
     // for a park.
     if DISTRICTS.contains(&name) {
@@ -403,10 +408,10 @@ pub fn load_park(name: &str) -> Result<(skate_data::skate_map::SkateMap, Render)
     }
     set_district(None);
     if DISTRICTS.contains(&name) && std::path::Path::new(&format!("{DIR}/district_{name}.pak")).is_file() {
-        return load_district(name);
+        return load_district(name).map(|(sim, render)| (sim, render, Vec::new()));
     }
     let path = format!("{DIR}/map_{name}.pak");
     let bytes = std::fs::read(&path).map_err(|e| format!("{path}: {e}"))?;
     let map = Map::from_pack(&bytes)?;
-    Ok((map.sim, map.render))
+    Ok((map.sim, map.render, map.pieces))
 }

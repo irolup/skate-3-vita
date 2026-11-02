@@ -20,6 +20,8 @@ use crate::settings::{Difficulty, Settings, PEDESTRIANS, TRAFFIC};
 const OWNER: &str = "vita";
 /// The free skate mode (`RetailMenus` context): the pause menu.
 const MODE: &str = "FreePlay";
+/// Retail's free skate in a skate.park: the pause menu there (its Create tab has Save Park).
+const PARK_MODE: &str = "FreePlayPark";
 /// The Vita's main menu: a mode of the same crossbar.
 const MAIN_MODE: &str = "VitaMain";
 
@@ -41,6 +43,11 @@ const QUIT: &str = "VitaQuit";
 const CONTROLS: &str = "VitaControls";
 const CALIBRATION: &str = "VitaCalibration";
 const REPLAY: &str = "ReplayEditor";
+/// Retail's Save Park (crossbar item 0x12, flow message 0x78): the keyboard for the name, then the park saved.
+const SAVE_PARK: &str = "SavePark";
+/// Retail's skate.Park (item 5, sub option kind 0): New Park, My Parks, Community Parks (the tutorial row hidden,
+/// `sub_option_counts`).
+const ENTER_SKATE_PARK: &str = "EnterSkatePark";
 const ON_SCREEN_HELP: &str = "OnScreenHelp";
 /// Retail's items: the stage gives them their engine handlers when their data and movies are there (greyed
 /// otherwise).
@@ -66,6 +73,10 @@ const FRONT_TOUCH: &str = "VITA_FRONT_TOUCH";
 const TRAFFIC_ROW: &str = "VITA_TRAFFIC";
 const PEDESTRIANS_ROW: &str = "VITA_PEDESTRIANS";
 const AI_SKATERS: &str = "VITA_AI_SKATERS";
+/// The Object Dropper's "All objects": every catalogue item anywhere (ours, owner 2026-10-29).
+const DROPPER_ALL: &str = "VITA_DROPPER_ALL";
+/// The Object Dropper's "Free camera": the open world's camera moves with the cursor (ours, owner 2026-11-01).
+const DROPPER_FREE_CAMERA: &str = "VITA_DROPPER_FREE_CAMERA";
 const PHYSICS: &str = "VITA_PHYSICS";
 const AUDIO: &str = "VITA_AUDIO";
 const DEBUG_HUD: &str = "VITA_DEBUG_HUD";
@@ -95,6 +106,11 @@ pub enum Choice {
     Replay(usize),
     TrickAnalyzer,
     ManualMeter,
+    /// Save the skate.park (Save Park).
+    SavePark,
+    /// skate.Park's rows: Park Setup, the saved parks.
+    NewPark,
+    MyParks,
 }
 
 fn row(labels: &[&str], helpers: &[&str]) -> SubOptionRow {
@@ -137,7 +153,7 @@ pub fn customize(c: Customize, worlds: &Worlds) {
                 // stands in for Respawn), quit at the end of Options (user 2026-10-23; the start-up menu is not reached
                 // from here: the Challenge Map has every world).
                 "SinglePlayer" => vec![CHALLENGE_MAP, RESUME_CAREER, FREE_PLAY_OPTIONS, SKATE_WITH, SKATE_PROFILE],
-                "Create" => vec![REPLAY],
+                "Create" => vec![REPLAY, ENTER_SKATE_PARK],
                 "Learn" => vec![TRICK_GUIDE, ON_SCREEN_HELP, CONTROLS, CALIBRATION],
                 "Options" => vec![GAME_SETTINGS, EXTRAS, QUIT],
                 _ => vec![],
@@ -147,6 +163,20 @@ pub fn customize(c: Customize, worlds: &Worlds) {
             .collect()
         };
         mode.tabs = mode.tabs.iter().map(|t| Tab { category: t.category.clone(), items: rows(&t.category) }).filter(|t| !t.items.is_empty()).collect();
+        // In a skate.park (retail FreePlayPark): the same tabs, Save Park first in Create.
+        let park_tabs: Vec<Tab> = mode
+            .tabs
+            .iter()
+            .map(|t| {
+                let mut items = t.items.clone();
+                if t.category == "Create" {
+                    // Retail FreePlayPark's order: Save Park, skate.Park, then the replay.
+                    items = vec![SAVE_PARK.to_owned(), ENTER_SKATE_PARK.to_owned(), REPLAY.to_owned()];
+                }
+                Tab { category: t.category.clone(), items }
+            })
+            .collect();
+        let park = skate_core::menus::Mode { key: PARK_MODE.into(), title: mode.title.clone(), slots: mode.slots, tabs: park_tabs };
         // The main menu: the same tabs without what needs a session (respawn, the replay, the main menu itself).
         let main_rows = |category: &str| -> Vec<String> {
             match category {
@@ -166,6 +196,8 @@ pub fn customize(c: Customize, worlds: &Worlds) {
             tabs: mode.tabs.iter().map(|t| Tab { category: t.category.clone(), items: main_rows(&t.category) }).filter(|t| !t.items.is_empty()).collect(),
         };
         c.data.modes.push(main);
+        c.data.modes.retain(|m| m.key != PARK_MODE);
+        c.data.modes.push(park);
     }
     let sub = &mut *c.sub_options;
     if sub.len() <= REPLAY_KIND {
@@ -195,6 +227,8 @@ pub fn customize(c: Customize, worlds: &Worlds) {
                 setting(PEDESTRIANS_ROW, "Pedestrians", Widget::Selector),
                 setting(AI_SKATERS, "AI skaters", Widget::Selector),
                 setting(PHYSICS, "Physics", Widget::Selector),
+                setting(DROPPER_ALL, "Object Dropper: all objects", Widget::Selector),
+                setting(DROPPER_FREE_CAMERA, "Object Dropper: free camera", Widget::Selector),
             ],
         ),
         (
@@ -237,7 +271,7 @@ fn cycle(labels: &[&str]) -> ValueRule {
 
 /// The registry side: handlers for the Vita's items, rules and values for its settings rows.
 pub fn register(registry: &mut MenuRegistry, settings: &Settings) {
-    for id in [SKATE, RESPAWN, PARKS, DISTRICTS, TRAINING, MAIN_MENU, QUIT, CONTROLS, CALIBRATION, REPLAY, ON_SCREEN_HELP] {
+    for id in [SKATE, RESPAWN, PARKS, DISTRICTS, TRAINING, MAIN_MENU, QUIT, CONTROLS, CALIBRATION, REPLAY, ON_SCREEN_HELP, SAVE_PARK, ENTER_SKATE_PARK] {
         if registry.data().item(id).is_some() {
             registry.register_handler(EntryRef::item(id), Handler { owner: owner(), select: true, highlight: false, callback: None });
         }
@@ -246,7 +280,7 @@ pub fn register(registry: &mut MenuRegistry, settings: &Settings) {
     let pedestrians: Vec<&str> = PEDESTRIANS.iter().map(|t| t.0).collect();
     let difficulty: Vec<String> = ["EASY", "NORMAL", "HARDCORE"].iter().map(|l| format!("ID_GAMESETTINGS_DIFFICULTY_{l}")).collect();
     let units = skate_core::menu_values::retail_rule(UNITS).unwrap_or_else(toggle);
-    let rules: [(&str, ValueRule); 14] = [
+    let rules: [(&str, ValueRule); 16] = [
         (DIFFICULTY, cycle(&difficulty.iter().map(String::as_str).collect::<Vec<_>>())),
         (SFX_VOLUME, ValueRule::retail_slider()),
         (MINIMAP, toggle()),
@@ -257,6 +291,8 @@ pub fn register(registry: &mut MenuRegistry, settings: &Settings) {
         (TRAFFIC_ROW, cycle(&traffic)),
         (PEDESTRIANS_ROW, cycle(&pedestrians)),
         (AI_SKATERS, toggle()),
+        (DROPPER_ALL, toggle()),
+        (DROPPER_FREE_CAMERA, toggle()),
         (PHYSICS, cycle(&["Fast", "Retail"])),
         (AUDIO, cycle(&["Retail", "Synth"])),
         (DEBUG_HUD, toggle()),
@@ -292,6 +328,8 @@ pub fn write_settings(registry: &mut MenuRegistry, s: &Settings) {
         (TRAFFIC_ROW, int(s.traffic)),
         (PEDESTRIANS_ROW, int(s.pedestrians)),
         (AI_SKATERS, flag(s.ai_skaters)),
+        (DROPPER_ALL, flag(s.dropper_all)),
+        (DROPPER_FREE_CAMERA, flag(s.dropper_free_camera)),
         (PHYSICS, flag(!s.fast_physics)),
         (AUDIO, flag(!s.retail_audio)),
         (DEBUG_HUD, flag(s.debug_hud)),
@@ -322,6 +360,8 @@ pub fn read_setting(registry: &MenuRegistry, id: &str, s: &mut Settings) -> bool
         TRAFFIC_ROW => s.traffic = index(TRAFFIC.len()),
         PEDESTRIANS_ROW => s.pedestrians = index(PEDESTRIANS.len()),
         AI_SKATERS => s.ai_skaters = on,
+        DROPPER_ALL => s.dropper_all = on,
+        DROPPER_FREE_CAMERA => s.dropper_free_camera = on,
         PHYSICS => s.fast_physics = !on,
         AUDIO => s.retail_audio = !on,
         DEBUG_HUD => s.debug_hud = on,
@@ -331,9 +371,19 @@ pub fn read_setting(registry: &MenuRegistry, id: &str, s: &mut Settings) -> bool
     *s != before
 }
 
-/// The crossbar's mode: the main menu (it stays: Back and Start do not close it) or the pause menu.
-pub fn set_main_menu(context: &mut MenuContext, main: bool) {
-    context.mode = if main { MAIN_MODE } else { MODE }.into();
+/// The crossbar's mode: the main menu (it stays: Back and Start do not close it) or the pause menu, in a skate.park
+/// (`park`) retail's park one.
+pub fn set_main_menu(context: &mut MenuContext, main: bool, park: bool) {
+    // Save Park is selectable in a park (retail IsItemEnabled 8261FB18 reads the park's state; every park here).
+    context.facts.insert(skate_core::menus::facts::PARK_SAVEABLE.into(), f64::from(u8::from(park && !main)));
+    context.mode = if main {
+        MAIN_MODE
+    } else if park {
+        PARK_MODE
+    } else {
+        MODE
+    }
+    .into();
 }
 
 /// The facts the crossbar reads: the on-screen help rows offer "off" for what is on.
@@ -352,6 +402,9 @@ pub fn replay_row(choices: &[String]) -> SubOptionRow {
 pub fn choice(item: &str, sub: Option<usize>, worlds: &Worlds) -> Option<Choice> {
     let world = |list: &[(usize, &str)]| sub.and_then(|k| list.get(k)).map(|(w, _)| Choice::World(*w));
     match (item, sub) {
+        (SAVE_PARK, _) => Some(Choice::SavePark),
+        (ENTER_SKATE_PARK, Some(0)) => Some(Choice::NewPark),
+        (ENTER_SKATE_PARK, Some(1)) => Some(Choice::MyParks),
         (SKATE, _) => Some(Choice::Skate),
         (RESPAWN, _) => Some(Choice::Respawn),
         (PARKS, _) => world(&worlds.parks),
@@ -392,7 +445,7 @@ mod tests {
         let tab = |c: &str, items: &[&str]| Tab { category: c.into(), items: items.iter().map(|i| (*i).to_owned()).collect() };
         let item = |id: &str| Item { id: id.into(), label: id.into(), icon: Icon::Retail("x".into()), help: String::new(), sub_option_kind: -1 };
         MenuData {
-            items: [REPLAY, ON_SCREEN_HELP, GAME_SETTINGS, "ChallengeMap", "TrickGuide"].map(item).to_vec(),
+            items: [REPLAY, ON_SCREEN_HELP, GAME_SETTINGS, "ChallengeMap", "TrickGuide", SAVE_PARK, ENTER_SKATE_PARK].map(item).to_vec(),
             settings: vec![Setting { id: DIFFICULTY.into(), label: "d".into(), widget: Widget::Selector, link: None }],
             screens: vec![vec![], vec![], vec![DIFFICULTY.into()]],
             modes: vec![Mode {
@@ -419,6 +472,11 @@ mod tests {
         assert_eq!(mode.tabs[0].items, [CHALLENGE_MAP, RESUME_CAREER, FREE_PLAY_OPTIONS, SKATE_WITH, SKATE_PROFILE]);
         assert_eq!(mode.tabs[3].items, [GAME_SETTINGS, EXTRAS, QUIT]);
         assert_eq!(mode.tabs[2].items, [TRICK_GUIDE, ON_SCREEN_HELP, CONTROLS, CALIBRATION]);
+        // In a skate.park: Save Park first in Create (retail FreePlayPark).
+        let park = data.mode(PARK_MODE).unwrap();
+        let create = park.tabs.iter().find(|t| t.category == "Create").unwrap();
+        assert_eq!(create.items[0], SAVE_PARK);
+        assert_eq!(choice(SAVE_PARK, None, &worlds()), Some(Choice::SavePark));
         assert_eq!(sub[TRAINING_KIND].labels, ["Skate School", "Course"]);
         assert_eq!(titles.len(), 6, "three Vita screens after retail's");
         assert_eq!(rows_of(&data, 3), [REAR_TOUCH, DPAD_BUMPERS, FRONT_TOUCH]);
@@ -428,6 +486,11 @@ mod tests {
         register(&mut registry, &settings);
         let context = MenuContext::new(MODE);
         assert!(registry.enabled(&EntryRef::item(PARKS), &context));
+        let mut in_park = MenuContext::new(MODE);
+        set_main_menu(&mut in_park, false, true);
+        assert!(registry.enabled(&EntryRef::item(SAVE_PARK), &in_park), "Save Park selectable in a park");
+        assert!(registry.enabled(&EntryRef::item(ENTER_SKATE_PARK), &context));
+        assert_eq!(choice(ENTER_SKATE_PARK, Some(1), &worlds()), Some(Choice::MyParks));
         assert!(registry.enabled(&EntryRef::setting(REAR_TOUCH), &context));
         // Right on Traffic steps the stored value; the settings follow.
         let before = settings.traffic;
@@ -559,7 +622,7 @@ mod column_tests {
             register(&mut ms.menus.registry, &Settings::default());
             ms.set_sub_options(REPLAY_KIND, replay_row(&["Instant replay".to_owned(), "Saved one".to_owned()]));
             // The world lists are the main menu's (the pause menu reaches the worlds through the Challenge Map).
-            set_main_menu(&mut ms.menus.context, target == PARKS);
+            set_main_menu(&mut ms.menus.context, target == PARKS, false);
             let run = |ms: &mut MenuStage, keys: Vec<(u32, usize)>, frames: usize| {
                 ms.update_keys(keys, 1.0 / 60.0);
                 for _ in 1..frames {

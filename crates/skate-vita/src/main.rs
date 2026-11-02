@@ -10,6 +10,9 @@ mod stream_bench;
 mod lab;
 #[cfg(target_os = "vita")]
 mod packs;
+mod dropper;
+#[cfg(target_os = "vita")]
+mod parks;
 #[cfg(target_os = "vita")]
 mod fe_menus;
 #[cfg(target_os = "vita")]

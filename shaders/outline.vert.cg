@@ -1,0 +1,16 @@
+// skate vita Object Dropper selection outline: the item at its pose, moved by a few pixels on screen (`offset` in clip
+// units per w), so the copies around it make its edge.
+uniform float4x4 viewproj;
+uniform float4x4 model;
+uniform float2 offset;
+
+void main(
+	float3 aPosition,
+	float2 aUv,
+	float2 out vUv : TEXCOORD0,
+	float4 out gl_Position : POSITION
+) {
+	float4 p = mul(mul(float4(aPosition, 1.0f), model), viewproj);
+	gl_Position = float4(p.xy + offset * p.w, p.zw);
+	vUv = aUv;
+}

@@ -62,7 +62,7 @@ fn play(shared: &Mutex<Shared>, assets: &Path, path: &Path, name: &str) -> Resul
     let park = std::fs::read_to_string(format!("{INPUTS}/park.txt")).ok().map(|t| t.trim().to_owned()).filter(|t| !t.is_empty());
     let mut session = match &park {
         Some(name) => {
-            let (sim, render) = crate::packs::load_park(name)?;
+            let (sim, render, _) = crate::packs::load_park(name)?;
             let world = crate::packs::WORLDS.iter().position(|w| w == name).unwrap_or(0);
             shared.lock().unwrap().park_render = Some((world, Some(render)));
             Session::load_map(assets, &scenario.difficulty, Some(sim))?

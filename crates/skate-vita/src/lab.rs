@@ -150,6 +150,30 @@ pub(crate) struct Shared {
     pub props_render: Option<Option<vita_pack::map::PropRender>>,
     /// The props streamed in, at the last tick's poses.
     pub props: Vec<skate_sim::live::PropPose>,
+    /// The loaded park's pieces' spans in its render (Object Dropper), handed over with `park_render`.
+    pub park_pieces: Option<Vec<vita_pack::map::PieceDraws>>,
+    /// The Object Dropper's frame (None until it first opens in this world).
+    pub dropper: Option<skate_sim::object_dropper::world::DropperFrame>,
+    /// Its retail screen while the editor is open (`dropper::screen_feed`) and the screen modes posted since the main
+    /// thread last took them.
+    pub dropper_screen: Option<skate_ui::fe::object_dropper_host::ObjectDropperFeed>,
+    pub dropper_posts: Vec<u8>,
+    pub dropper_quick_posts: Vec<u8>,
+    /// The Quick Menu's Style / Branding list callbacks from the movie, for the editor: (row, selected).
+    pub dropper_list: Vec<(usize, bool)>,
+    /// The open world's reset question: raised by the editor (the main thread shows it), answered by the main thread
+    /// (Yes: true).
+    pub dropper_ask_reset: bool,
+    pub dropper_reset: Option<bool>,
+    /// Start in a park editor: the main thread asks the editor to close before the pause menu opens (retail
+    /// `825CB440`), and keeps whether its screen is still on the menu stage (the pause waits for both, else the pause
+    /// menu's captured frame shows the editor's screen under it).
+    pub dropper_close: bool,
+    pub dropper_screen_loaded: bool,
+    /// The loaded world is a skate.Park (the phone's rows: Edit Park, Reset All Props).
+    pub in_skate_park: bool,
+    /// The park teleporters the player placed with the Object Dropper (`Session::dropper_teleporters`).
+    pub park_teleporters: Vec<skate_sim::object_dropper::world::ParkTeleporter>,
     /// The loaded world's car models for the main thread (`Session::car_models` order; an
     /// empty list: no traffic).
     pub cars_render: Option<Vec<Option<vita_pack::skater::Skater>>>,
@@ -169,6 +193,12 @@ pub(crate) struct Shared {
     pub difficulty: crate::settings::Difficulty,
     /// The solve's constraint iterations (the Physics setting: 25 Fast, 50 Retail).
     pub solver_iterations: u32,
+    /// The Object Dropper's "All objects" setting (taken when the editor next opens), and its measuring limits (the
+    /// debug overlay on, D6d).
+    pub dropper_all: bool,
+    pub dropper_measure: bool,
+    /// The Object Dropper's "Free camera" setting (taken when the editor next opens).
+    pub dropper_free_camera: bool,
     /// No stepping while set (menus); the clock restarts on resume.
     pub paused: bool,
     /// The replay asks for the collision world (its cameras' sweeps); the paused sim thread lends it and takes it
@@ -177,6 +207,16 @@ pub(crate) struct Shared {
     pub camera_world: Option<skate_sim::live::CameraWorld>,
     /// Request: teleport the skater to the world's spawn.
     pub respawn: bool,
+    /// Request (Save Park): the skate.park's `.park` bytes under this name; answered in `park_saved` (None outside a
+    /// park).
+    pub park_save: Option<String>,
+    pub park_saved: Option<(String, Option<Vec<u8>>)>,
+    /// Request (My Parks): lay this saved park (`.park` bytes) over the park, once its world has loaded.
+    pub park_load: Option<Vec<u8>>,
+    /// Request (New Park): lay this Park Setup template (its world row) over the park, once its world has loaded.
+    pub park_template: Option<String>,
+    /// The skate.park has Object Dropper edits not saved yet.
+    pub park_unsaved: bool,
     /// Requests from Call Skater (FE 62): a character key to call (true) or dismiss (false), in order.
     pub skater_calls: Vec<(String, bool)>,
     /// The called skaters (character keys, oldest first) and the NPC serials of those riding, as of the last tick.
@@ -249,8 +289,11 @@ pub(crate) fn sim_thread(shared: &Mutex<Shared>) {
             Session::load(assets, difficulty)
         } else {
             match crate::packs::load_park(name) {
-                Ok((sim, render)) => {
-                    shared.lock().unwrap().park_render = Some((world, Some(render)));
+                Ok((sim, render, pieces)) => {
+                    let mut s = shared.lock().unwrap();
+                    s.park_render = Some((world, Some(render)));
+                    s.park_pieces = Some(pieces);
+                    drop(s);
                     Session::load_map(assets, difficulty, Some(sim))
                 }
                 Err(e) => Err(e),
@@ -413,6 +456,11 @@ fn run_session(shared: &Mutex<Shared>, input: &Input, session: &mut Session, mut
     crate::world_replay::clear();
     println!("physics: {iterations} solver iterations");
     let mut paused_since: Option<Instant> = None;
+    // The Object Dropper: the last tick's buttons (the phone's LB + B opens it) and the stand-in catalogue list.
+    let mut previous_buttons = 0u16;
+    // The reset question is up: the editor waits for its answer.
+    let mut asking_reset = false;
+    shared.lock().unwrap().dropper = None;
     #[cfg(feature = "state-log")]
     let mut last_state = String::new();
     loop {
@@ -431,6 +479,14 @@ fn run_session(shared: &Mutex<Shared>, input: &Input, session: &mut Session, mut
                     neutral = true;
                 } else {
                     paused_since.get_or_insert_with(Instant::now);
+                    // Start in the editor leaves it for the pause menu (retail `825CB440`, "to pause"), its edits kept.
+                    if session.editor_open() {
+                        session.close_editor();
+                        s.dropper = session.dropper_frame();
+                        s.dropper_screen = None;
+                        asking_reset = false;
+                        println!("object dropper: closed for the pause menu");
+                    }
                     if s.want_camera_world {
                         if s.camera_world.is_none() {
                             s.camera_world = Some(session.camera_world());
@@ -460,6 +516,9 @@ fn run_session(shared: &Mutex<Shared>, input: &Input, session: &mut Session, mut
                 last_wake = next;
                 session.suspend_session_markers();
             }
+            session.set_dropper_all(s.dropper_all);
+            session.set_dropper_free_camera(s.dropper_free_camera);
+            session.set_dropper_measure(s.dropper_measure);
             if s.solver_iterations != iterations {
                 iterations = s.solver_iterations;
                 session.set_solver_iterations(iterations);
@@ -489,12 +548,27 @@ fn run_session(shared: &Mutex<Shared>, input: &Input, session: &mut Session, mut
                 }
                 println!("difficulty: {difficulty} (live)");
             }
+            if let Some(name) = s.park_save.take() {
+                s.park_saved = Some((name, session.park_file()));
+            }
             if std::mem::take(&mut s.respawn) {
                 if let Err(e) = session.respawn() {
                     println!("respawn: {e}");
                 }
             }
             if !s.reload && !s.loading {
+                if let Some(bytes) = s.park_load.take() {
+                    match session.load_park(&bytes) {
+                        Ok((kept, dropped, refused)) => println!("park loaded: {kept} pieces kept, {dropped} dropped, {refused} over the budgets"),
+                        Err(e) => println!("park load: {e}"),
+                    }
+                }
+                if let Some(world) = s.park_template.take() {
+                    match session.load_template(&world) {
+                        Ok((kept, dropped, refused)) => println!("park template {world}: {kept} pieces kept, {dropped} dropped, {refused} over the budgets"),
+                        Err(e) => println!("park template {world}: {e}"),
+                    }
+                }
                 if let Some(matrix) = s.teleport.take() {
                     match session.teleport(matrix) {
                         Ok(()) => println!("teleport to ({:.1}, {:.1}, {:.1})", matrix[3][0], matrix[3][1], matrix[3][2]),
@@ -527,9 +601,15 @@ fn run_session(shared: &Mutex<Shared>, input: &Input, session: &mut Session, mut
         }
         for _ in 0..due {
             #[cfg_attr(feature = "soak", allow(unused_variables))]
-            let settings = shared.lock().unwrap().settings;
+            let mut settings = shared.lock().unwrap().settings;
+            // The Object Dropper's menus (the catalogue, the Quick Menu) take Left / Right from the d-pad and use no
+            // bumpers: there the d-pad stays a d-pad whatever the "D-pad left / right as LB / RB" setting says.
+            use skate_sim::object_dropper::Mode;
+            if session.dropper_editor().is_some_and(|e| matches!(e.mode, Mode::Catalog | Mode::Properties)) {
+                settings.dpad_bumpers = false;
+            }
             let sample = input.poll();
-            let state = if neutral {
+            let mut state = if neutral {
                 XboxState { buttons: 0, triggers: [0, 0], left: [0, 0], right: [0, 0] }
             } else {
                 #[cfg(feature = "soak")]
@@ -556,8 +636,59 @@ fn run_session(shared: &Mutex<Shared>, input: &Input, session: &mut Session, mut
                     i32::from(state.right[1]),
                 ]);
             }
+            // The phone's Object Dropper row (LB held, B pressed: retail FE input 0x40) opens the editor.
+            let pressed = state.buttons & !previous_buttons;
+            previous_buttons = state.buttons;
+            if !session.editor_open() && !session.editor_pending() && state.buttons & crate::dropper::LB != 0 && pressed & crate::dropper::B != 0 {
+                // The skater brakes first; the editor opens once they have stopped.
+                session.request_editor();
+                println!("object dropper: asked (the skater brakes)");
+            }
+            // The phone's Reset All Props row (LB held, Y pressed: retail FE input 0x100, offered in skate.Parks only,
+            // gate `826691D0`): every edit undone and the moved props back.
+            if !session.editor_open() && session.in_skate_park() && state.buttons & crate::dropper::LB != 0 && pressed & crate::dropper::Y != 0 {
+                session.reset_dropper();
+                println!("object dropper: reset all props");
+            }
+            // Start in a park editor: closed before the pause menu opens.
+            if std::mem::take(&mut shared.lock().unwrap().dropper_close) && session.editor_open() {
+                session.close_editor();
+                asking_reset = false;
+                println!("object dropper: closed for the pause menu");
+            }
+            // The Quick Menu's Style / Branding list (the movie's highlight and select).
+            let list = std::mem::take(&mut shared.lock().unwrap().dropper_list);
+            for (row, select) in list {
+                session.dropper_quick_list(row, select);
+            }
+            // The reset question's answer (Yes resets every object; the editor stays open).
+            if asking_reset {
+                match shared.lock().unwrap().dropper_reset.take() {
+                    Some(yes) => {
+                        asking_reset = false;
+                        println!("object dropper: reset all {}", if yes { "yes" } else { "no" });
+                        if yes {
+                            session.reset_dropper();
+                        }
+                    }
+                    None => state = XboxState { buttons: 0, triggers: [0, 0], left: [0, 0], right: [0, 0] },
+                }
+            }
             let tick_start = Instant::now();
+            let was_open = session.editor_open();
             let report = session.step(state);
+            if !was_open && session.editor_open() {
+                println!("object dropper: open");
+            }
+            if !report.editor.is_empty() {
+                println!("object dropper: {:?}", report.editor);
+            }
+            let mut asking_reset_raised = false;
+            if report.editor.contains(&skate_sim::object_dropper::Event::ConfirmReset) {
+                asking_reset = true;
+                asking_reset_raised = true;
+            }
+            // The editor closed: its edits to save (written by the main thread).
             #[cfg(feature = "stage-profile")]
             if session.ticks() % 600 == 0 {
                 let mut stages = skate_sim::profile_take();
@@ -621,6 +752,17 @@ fn run_session(shared: &Mutex<Shared>, input: &Input, session: &mut Session, mut
                     crate::world_replay::record(session, &cars, &npcs, &peds, &ped_parents, &hand_props, &props);
                 }
             }
+            // The editor's frame and screen, built before taking the lock (the main thread waits on it).
+            let dropper_frame = session.dropper_frame();
+            let dropper_screen = session.dropper_editor().map(crate::dropper::screen_feed);
+            let dropper_posts = session.take_dropper_posts();
+            let dropper_quick_posts = session.take_dropper_quick_posts();
+            // Every ten seconds while the editor is open: what the world holds (D6d measurements).
+            if session.editor_open() && session.ticks() % 600 == 0 {
+                if let Some(line) = session.dropper_usage_line() {
+                    println!("{line}");
+                }
+            }
             let mut s = shared.lock().unwrap();
             if let Some((previous, current)) = session.presentation() {
                 publish(&mut s.frames, due_at, session.period(), previous, current, &cars, &npcs, &peds, &hand_props);
@@ -628,6 +770,14 @@ fn run_session(shared: &Mutex<Shared>, input: &Input, session: &mut Session, mut
                 s.props.extend_from_slice(&props);
             }
             push_hud(&mut s, session.hud_feed());
+            s.dropper = dropper_frame;
+            s.dropper_screen = dropper_screen;
+            s.in_skate_park = session.in_skate_park();
+            s.park_teleporters = session.dropper_teleporters();
+            s.park_unsaved = session.park_unsaved();
+            s.dropper_posts.extend(dropper_posts);
+            s.dropper_quick_posts.extend(dropper_quick_posts);
+            s.dropper_ask_reset |= std::mem::take(&mut asking_reset_raised);
             s.marker = session.marker_view();
             s.manual = session.manual_view();
             s.state_id = id;
@@ -674,6 +824,11 @@ fn run_session(shared: &Mutex<Shared>, input: &Input, session: &mut Session, mut
         if due > 0 {
             let riding = crate::retail_audio::publish(session);
             crate::session_replay::record_riding(riding);
+            // The park editor hides the skater: its sounds go too (NOT RETAIL YET: the whole game is muted as under the
+            // pause menu, the park's ambience included; the editor's own sounds still play).
+            if session.editor_open() && session.in_skate_park() {
+                crate::retail_audio::silence();
+            }
         }
         if second.elapsed() >= Duration::from_secs(1) {
             let mut s = shared.lock().unwrap();

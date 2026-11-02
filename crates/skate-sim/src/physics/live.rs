@@ -18,7 +18,7 @@ pub use crate::transform::Transform;
 
 pub struct Session {
     graphs: crate::graph_runtime::StockGraphs,
-    physics: GamePhysics,
+    pub(crate) physics: GamePhysics,
     skater: SkaterRuntime,
     controls: PlayerControls,
     camera: crate::camera::CameraRuntime,
@@ -54,6 +54,16 @@ pub struct Session {
     pub(crate) living: Option<crate::living_world::LivingWorldState>,
     /// The local player's career stats (off unless `start_career_stats`: the oracle corpus runs without them).
     career: Option<crate::career_stats::CareerStatsTracker>,
+    /// skate_vita: the Object Dropper (made when it first opens; its scene stays with the world).
+    pub(crate) dropper: Option<crate::object_dropper::world::Dropper>,
+    /// The "All objects" setting (ours): the catalogue lists every item anywhere.
+    dropper_all: bool,
+    /// The "Free camera" setting (ours): the open world's dropper camera follows the cursor instead of standing still.
+    dropper_free_camera: bool,
+    /// The measuring limits (D6d; the Vita's debug overlay).
+    dropper_measure: bool,
+    /// The editor asked for, waiting for the skater to stop: ticks waited.
+    dropper_pending: Option<u32>,
 }
 
 /// A placed prop streamed in, as the renderer draws it: its template range in the props
@@ -133,6 +143,8 @@ pub struct StepReport {
     pub error: Option<String>,
     /// Native audio ids of this tick's session marker events (`AUDIO_*`).
     pub marker_audio: Vec<u64>,
+    /// The Object Dropper's events this tick (while it is open).
+    pub editor: Vec<crate::object_dropper::Event>,
 }
 
 /// skate-game's `LivingWorldPlugin` switches (PR #52 `618e824`): prop grab (Move Object on
@@ -142,6 +154,13 @@ pub fn enable_game_switches() {
     crate::physics::prop_dynamics::set_prop_grab_enabled(true);
     crate::physics::set_skitch_enabled(true);
 }
+
+/// The asked-for editor's wait (retail `8270A5F0`): at most 4 s (`0x82257308`), the skater taken as stopped below
+/// 0.2 m/s once the brake has had a quarter second; B held meanwhile (the skater's brake).
+const DROPPER_WAIT: u32 = 240;
+const DROPPER_SETTLE: u32 = 15;
+const DROPPER_STOPPED: f32 = 0.2;
+const DROPPER_BRAKE: u16 = 0x2000;
 
 impl Session {
     /// The production load in skate-game's order (manifest, graphs, physics, skater,
@@ -198,6 +217,11 @@ impl Session {
             map_name,
             living: None,
             career: None,
+            dropper: None,
+            dropper_all: false,
+            dropper_free_camera: false,
+            dropper_measure: false,
+            dropper_pending: None,
             markers: None,
             asset_root: asset_root.to_path_buf(),
         };
@@ -318,6 +342,247 @@ impl Session {
 
     /// Turns the manual session markers on or off (LB held shows the prompt;
     /// LB + D-pad down places a marker, LB + D-pad up held returns to it).
+    /// Opens the Object Dropper at the skater (the phone's dropper row): its catalogue and tuning come from the baked
+    /// catalogue (`object_dropper::world::CATALOG`).
+    pub fn open_editor(&mut self) -> Result<(), String> {
+        if self.dropper.is_none() {
+            self.dropper = Some(crate::object_dropper::world::Dropper::load(&self.asset_root, &self.physics, self.map_name.as_deref())?);
+        }
+        let (at, _) = self.board();
+        let yaw = self.camera_yaw();
+        // Edit Park (FE 0x35) in a skate.Park, the phone's Object Dropper (FE 0x37) in the open world.
+        let variant = if self.physics.is_park() { crate::object_dropper::Variant::Park } else { crate::object_dropper::Variant::World };
+        let listing = self.dropper_listing(self.dropper_all).unwrap_or_default();
+        let limits = if self.dropper_measure { crate::object_dropper::Limits::measure() } else { crate::object_dropper::Limits::default() };
+        if let Some(dropper) = &mut self.dropper {
+            dropper.open(glam::Vec3::from_array(at), yaw, variant, listing, self.dropper_free_camera);
+            dropper.set_limits(limits);
+        }
+        Ok(())
+    }
+
+    /// The loaded world is a skate.Park (the phone's Edit Park and Reset All Props rows), not the open world.
+    pub fn in_skate_park(&self) -> bool {
+        self.physics.is_park()
+    }
+
+    /// The Object Dropper's measure line (D6d, the budgets set from device measurements): what the world holds against
+    /// the limits, None before the editor first opened. `used` counts the world's items; the frame and sim times are
+    /// in the same log.
+    pub fn dropper_usage_line(&self) -> Option<String> {
+        let editor = self.dropper.as_ref()?.editor()?;
+        let used = editor.scene.usage(&editor.catalog);
+        let l = &editor.limits;
+        let m = editor.meter();
+        let catalogue_items = editor.scene.items.iter().filter(|p| p.origin == crate::object_dropper::Origin::Dropped || p.tint != 0).count();
+        let awake = self.physics.prop_dynamics().map_or(0, |d| d.awake_runtime());
+        Some(format!(
+            "DROPPER usage: memory {:.1}/{:.1} MiB, terrain {} pieces / {} of {} triangles, props {}/{} ({awake} awake), catalogue-drawn items {}, meter terrain {:.2} props {:.2}",
+            used.memory as f64 / 1048576.0,
+            l.memory as f64 / 1048576.0,
+            used.terrain_pieces,
+            used.terrain_cost,
+            l.terrain_cost,
+            used.props_dropped,
+            l.props_dropped,
+            catalogue_items,
+            m.terrain[0],
+            m.props[0],
+        ))
+    }
+
+    /// The measuring limits (`Limits::measure`), taken at the next opening.
+    pub fn set_dropper_measure(&mut self, on: bool) {
+        self.dropper_measure = on;
+    }
+
+    /// The "All objects" setting: the catalogue lists every item anywhere (taken at the next opening).
+    pub fn set_dropper_all(&mut self, all: bool) {
+        self.dropper_all = all;
+    }
+
+    /// The "Free camera" setting: the open world's dropper camera moves with the cursor (taken at the next opening).
+    pub fn set_dropper_free_camera(&mut self, free: bool) {
+        self.dropper_free_camera = free;
+    }
+
+    /// The open editor, for its screen.
+    pub fn dropper_editor(&self) -> Option<&crate::object_dropper::Editor> {
+        self.dropper.as_ref()?.editor()
+    }
+
+    /// The Quick Menu's Style / Branding list (the movie's `Game.OnMenuHilight` / `OnMenuSelect`): row `index`
+    /// highlighted or selected.
+    pub fn dropper_quick_list(&mut self, index: usize, select: bool) {
+        if let Some(dropper) = &mut self.dropper {
+            dropper.quick_list(index, select, &mut self.physics, &self.asset_root);
+        }
+    }
+
+    /// The Quick Menu's screen modes posted since the last call (`object_dropper::quick::screen`).
+    pub fn take_dropper_quick_posts(&mut self) -> Vec<u8> {
+        self.dropper.as_mut().map(|d| d.take_quick_posts()).unwrap_or_default()
+    }
+
+    /// The screen modes the editor posted since the last call (`object_dropper::screen`).
+    pub fn take_dropper_posts(&mut self) -> Vec<u8> {
+        self.dropper.as_mut().map(|d| d.take_posts()).unwrap_or_default()
+    }
+
+    /// The phone's Object Dropper row: the editor opens once the skater has stopped (`8270A5F0`; the skater brakes
+    /// meanwhile).
+    pub fn request_editor(&mut self) {
+        if !self.editor_open() && self.dropper_pending.is_none() {
+            self.dropper_pending = Some(0);
+        }
+    }
+
+    /// The editor is asked for and waits for the skater to stop.
+    pub fn editor_pending(&self) -> bool {
+        self.dropper_pending.is_some()
+    }
+
+    pub fn editor_open(&self) -> bool {
+        self.dropper.as_ref().is_some_and(|d| d.is_open())
+    }
+
+    pub fn close_editor(&mut self) {
+        if let Some(dropper) = &mut self.dropper {
+            dropper.close(&mut self.physics, &self.asset_root);
+        }
+        self.to_spawner();
+    }
+
+    /// Closing the park editor puts the skater at the park's spawner (retail `825CB440`); the open world's dropper
+    /// leaves the skater where it was.
+    fn to_spawner(&mut self) {
+        let Some(pose) = self.dropper.as_ref().filter(|_| self.physics.is_park()).and_then(|d| d.spawner_pose()) else { return };
+        if let Err(error) = self.skater.travel_to(pose) {
+            tracing::warn!("SKATE_DROPPER: to the spawner: {error}");
+        }
+    }
+
+    /// The world's Object Dropper edits as a save file's bytes, when they changed since the last call (the caller
+    /// writes them, off the simulation thread).
+    pub fn take_dropper_save(&mut self) -> Option<Vec<u8>> {
+        self.dropper.as_mut()?.take_save().map(|s| s.to_bytes())
+    }
+
+    /// Replays a world's saved edits (`take_dropper_save`'s bytes) after the world loaded.
+    pub fn restore_dropper(&mut self, bytes: &[u8]) -> Result<(), String> {
+        let saved = crate::object_dropper::save::Saved::from_bytes(bytes)?;
+        if self.dropper.is_none() {
+            self.dropper = Some(crate::object_dropper::world::Dropper::load(&self.asset_root, &self.physics, self.map_name.as_deref())?);
+        }
+        if let Some(dropper) = &mut self.dropper {
+            dropper.restore(&saved, &mut self.physics, &self.asset_root);
+        }
+        Ok(())
+    }
+
+    /// Every Object Dropper edit undone: the park back to its layout, the dropped items gone (the save follows), and
+    /// the world's props moved by play back on their spawn pose (retail's reset question in the open world,
+    /// `825C6638` -> `82884100` on the DMO manager). An open editor stays open.
+    pub fn reset_dropper(&mut self) {
+        if let Some(dropper) = &mut self.dropper {
+            dropper.reset_all(&mut self.physics, &self.asset_root);
+        }
+        let props = self.physics.reset_moved_props();
+        tracing::info!("SKATE_DROPPER: reset all, {} props back", props.len());
+    }
+
+    /// The catalogue's choice: an item id of `dropper_catalog()`.
+    pub fn editor_choose(&mut self, item: &str) -> Vec<crate::object_dropper::Event> {
+        self.dropper.as_mut().map(|d| d.choose(item)).unwrap_or_default()
+    }
+
+    /// What the catalogue lists in this world (`Catalog::listing`): a park everything, the open world the props of
+    /// the DMO banks it loads; `all` (the "All objects" setting) everything anywhere.
+    pub fn dropper_listing(&self, all: bool) -> Option<Vec<(String, Vec<(String, Vec<String>)>)>> {
+        let catalog = self.dropper.as_ref()?.catalog();
+        Some(catalog.listing(self.physics.is_park(), self.map_name.as_deref().unwrap_or_default(), all))
+    }
+
+    pub fn dropper_catalog(&self) -> Option<&crate::object_dropper::Catalog> {
+        self.dropper.as_ref().map(|d| d.catalog())
+    }
+
+    /// The skate.park being skated as a retail `.park` file's bytes (Save Park), None outside a park; the Object
+    /// Dropper's catalogue loads if it has not yet.
+    pub fn park_file(&mut self) -> Option<Vec<u8>> {
+        if !self.physics.is_park() {
+            return None;
+        }
+        if self.dropper.is_none() {
+            match crate::object_dropper::world::Dropper::load(&self.asset_root, &self.physics, self.map_name.as_deref()) {
+                Ok(d) => self.dropper = Some(d),
+                Err(error) => {
+                    tracing::warn!("SKATE_PARK: {error}");
+                    return None;
+                }
+            }
+        }
+        let asset_root = self.asset_root.clone();
+        self.dropper.as_mut().map(|d| d.park_bytes(&asset_root))
+    }
+
+    /// The skate.park has Object Dropper edits not saved yet.
+    pub fn park_unsaved(&self) -> bool {
+        self.dropper.as_ref().is_some_and(|d| d.unsaved())
+    }
+
+    /// Lays a saved skate.park (`.park` bytes, My Parks) over the park being skated (the editor closes first); the
+    /// skater goes to its spawner. Returns the pieces kept, dropped and refused (over the budgets).
+    pub fn load_park(&mut self, bytes: &[u8]) -> Result<(usize, usize, usize), String> {
+        if !self.physics.is_park() {
+            return Err("not in a skate.park".into());
+        }
+        if self.dropper.is_none() {
+            self.dropper = Some(crate::object_dropper::world::Dropper::load(&self.asset_root, &self.physics, self.map_name.as_deref())?);
+        }
+        let Some(dropper) = self.dropper.as_mut() else { return Err("no dropper".into()) };
+        let counts = dropper.load_park(bytes, self.map_name.as_deref(), &mut self.physics, &self.asset_root)?;
+        self.to_spawner();
+        Ok(counts)
+    }
+
+    /// Park Setup's lots and templates (none before the dropper first loaded).
+    pub fn park_lots(&self) -> Vec<crate::object_dropper::world::ParkLot> {
+        self.dropper.as_ref().map(|d| d.lots().to_vec()).unwrap_or_default()
+    }
+
+    /// Lays a Park Setup template (New Park: `world`, the template row's key, on this park's map) over the park being
+    /// skated, as [`Self::load_park`]; it counts as saved.
+    pub fn load_template(&mut self, world: &str) -> Result<(usize, usize, usize), String> {
+        if self.dropper.is_none() {
+            self.dropper = Some(crate::object_dropper::world::Dropper::load(&self.asset_root, &self.physics, self.map_name.as_deref())?);
+        }
+        let bytes = self.dropper.as_ref().ok_or("no dropper")?.template_park(world, &self.asset_root)?;
+        self.load_park(&bytes)
+    }
+
+    /// The park teleporters the player placed (none before the editor first opened).
+    pub fn dropper_teleporters(&self) -> Vec<crate::object_dropper::world::ParkTeleporter> {
+        self.dropper.as_ref().map(|d| d.teleporters()).unwrap_or_default()
+    }
+
+    /// What the renderer draws of the editor and of the world's edits (none before the editor first opened).
+    pub fn dropper_frame(&self) -> Option<crate::object_dropper::world::DropperFrame> {
+        self.dropper.as_ref().map(|d| d.frame(&self.physics))
+    }
+
+    /// The camera's heading around the skater (yaw about +y; 0 looks down -z), for opening the editor behind them.
+    fn camera_yaw(&self) -> f32 {
+        self.presentation
+            .pair()
+            .map(|(_, current)| {
+                // The camera looks down its -z (a Bevy transform).
+                let f = current.camera.rotation * glam::Vec3::NEG_Z;
+                (-f.x).atan2(-f.z)
+            })
+            .unwrap_or(0.0)
+    }
+
     pub fn set_session_markers(&mut self, on: bool) -> Result<(), String> {
         self.markers = if on { Some(crate::session_marker::SessionMarker::new(&self.asset_root)?) } else { None };
         Ok(())
@@ -358,13 +623,47 @@ impl Session {
     /// One fixed tick with this pad state.
     pub fn step(&mut self, state: XboxState) -> StepReport {
         let _tick = skate_core::profile::scope("z_tick");
+        // skate_vita (Object Dropper): an asked-for editor waits for the skater to stop (retail's flow `8270A5F0`:
+        // input locked, the editor opens once the skater no longer moves, at most 4 s); meanwhile the skater holds the
+        // brake (B: brake, then off the board). NOT RETAIL YET: retail's lock message (`0x7949dac1`) is not decoded.
+        let state = match self.dropper_pending {
+            Some(ticks) => {
+                let (_, speed) = self.board();
+                if (ticks >= DROPPER_SETTLE && speed < DROPPER_STOPPED) || ticks >= DROPPER_WAIT {
+                    self.dropper_pending = None;
+                    if let Err(error) = self.open_editor() {
+                        tracing::warn!("SKATE_DROPPER: {error}");
+                    }
+                    XboxState::default()
+                } else {
+                    self.dropper_pending = Some(ticks + 1);
+                    XboxState { buttons: DROPPER_BRAKE, ..XboxState::default() }
+                }
+            }
+            None => state,
+        };
+        // While the editor is open it takes the pad and the skater gets a neutral one.
+        let mut editor_events = Vec::new();
+        let state = match self.dropper.as_mut().filter(|d| d.is_open()) {
+            Some(dropper) => {
+                let slots = skate_core::input::xbox::convert(&state, 0);
+                editor_events = dropper.update(&slots, &mut self.physics, &self.asset_root);
+                let exit = editor_events.contains(&crate::object_dropper::Event::Exit);
+                if exit {
+                    dropper.close(&mut self.physics, &self.asset_root);
+                    self.to_spawner();
+                }
+                XboxState::default()
+            }
+            None => state,
+        };
         // 1. PreUpdate customiser preferences.
         crate::customiser::apply_preferences(&self.profile, &mut self.physics, &mut self.skater.animation);
         // 2. Input.
         let published = crate::input::live_input::publish(&mut self.input, state);
         // 2b. Session markers: after the input, before the controls (the reference's
         // `SimulationSet::Input` → marker `update` → `SimulationSet::Controls`).
-        let mut report = StepReport::default();
+        let mut report = StepReport { editor: editor_events, ..StepReport::default() };
         if let Some(markers) = &mut self.markers {
             report.marker_audio = markers.update(self.physics.period().as_secs_f64(), &self.input, &self.physics, &mut self.skater);
         }
@@ -528,6 +827,10 @@ impl Session {
     /// Teleports the skater to the world's spawn, as skate-game's pause-menu teleport
     /// does (`SkaterRuntime::travel_to`, a manual teleport through the stock state).
     pub fn respawn(&mut self) -> Result<(), String> {
+        // In a park the spawner, once the editor has placed it (it may have been moved).
+        if let Some(pose) = self.dropper.as_ref().filter(|_| self.physics.is_park()).and_then(|d| d.spawner_pose()) {
+            return self.skater.travel_to(pose);
+        }
         let ([x, y, z], heading) = self.spawn;
         let (s, c) = heading.sin_cos();
         // teleports.json layout: rows right, up, forward, translation.

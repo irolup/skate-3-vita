@@ -17,9 +17,10 @@ pub mod ui;
 #[cfg(target_os = "vita")]
 pub mod vgl;
 
-/// MAIN memory vitaGL leaves free for everything else.
+/// MAIN memory vitaGL leaves free for everything else. 16 MiB left 10-14 MiB that nothing took (kernel's free size in
+/// DownTown, loading and playing): 6 went to the heap, which leaves 4-8.
 #[cfg(target_os = "vita")]
-const RAM_THRESHOLD: i32 = 16 * 1024 * 1024;
+const RAM_THRESHOLD: i32 = 10 * 1024 * 1024;
 
 /// Initializes vitaGL (960 × 544, no MSAA, vsync on). Call once before anything else.
 #[cfg(target_os = "vita")]
@@ -42,16 +43,22 @@ pub fn swap(dialog: bool) {
 }
 
 #[cfg(target_os = "vita")]
-/// The frame buffer as RGBA8, opaque (alpha 255), bottom row first (GL's order): `WIDTH` x `HEIGHT`.
-pub fn read_rgba() -> Vec<u8> {
+/// The frame buffer as RGBA8, opaque (alpha 255), bottom row first (GL's order): `WIDTH` x `HEIGHT`, into `rgba`, which
+/// keeps its capacity. False when it has too little and the heap has no block that large: the callers can go without,
+/// and aborting is not worth a picture.
+pub fn read_rgba(rgba: &mut Vec<u8>) -> bool {
     use vgl::*;
     let (w, h) = (math::WIDTH as usize, math::HEIGHT as usize);
-    let mut rgba = vec![0u8; w * h * 4];
+    rgba.clear();
+    if rgba.try_reserve_exact(w * h * 4).is_err() {
+        return false;
+    }
+    rgba.resize(w * h * 4, 0u8);
     unsafe { glReadPixels(0, 0, w as GLsizei, h as GLsizei, GL_RGBA, GL_UNSIGNED_BYTE, rgba.as_mut_ptr().cast()) };
     for px in rgba.chunks_exact_mut(4) {
         px[3] = 255;
     }
-    rgba
+    true
 }
 
 #[cfg(target_os = "vita")]

@@ -10,5 +10,7 @@ publish.workspace = true
 [dependencies]
 # Map packs carry the sim part of a converted .skate map (skate_data::skate_map types).
 skate-data = { path = "../skate-data" }
+serde.workspace = true
+serde_json.workspace = true
 # Pure Rust (no C/assembly), so the same code builds for the Vita.
 blake3 = { version = "1", default-features = false, features = ["pure"] }

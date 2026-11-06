@@ -11,7 +11,7 @@ pub mod skater;
 pub mod texture;
 mod wire;
 
-pub use wire::{Reader, Writer};
+pub use wire::{Reader, Source, StreamReader, Writer};
 
 /// Container magic and layout version.
 pub const MAGIC: [u8; 8] = *b"SKVPACK1";

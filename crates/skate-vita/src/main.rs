@@ -23,6 +23,7 @@ mod audio;
 mod retail_audio;
 #[cfg(target_os = "vita")]
 mod district_stream;
+mod memory_budget;
 mod hud;
 mod menu;
 mod button_icons;
@@ -59,7 +60,7 @@ pub static STACK: u32 = 2 * 1024 * 1024;
 #[cfg(target_os = "vita")]
 #[used]
 #[unsafe(export_name = "_newlib_heap_size_user")]
-pub static HEAP: u32 = 304 * 1024 * 1024;
+pub static HEAP: u32 = 310 * 1024 * 1024;
 #[cfg(target_os = "vita")]
 #[used]
 #[unsafe(export_name = "sceLibcHeapSize")]

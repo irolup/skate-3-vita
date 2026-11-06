@@ -303,6 +303,14 @@ static RETAIL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::ne
 /// Set once the sound.pak loader has been started (it runs once per launch).
 static LOADER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Whether the retail audio is loading or loaded.
+pub fn retail_started() -> bool {
+    LOADER.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `start` has run, so `retail_started` says what the setting wants (the simulation thread starts before it does).
+pub static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Applies the Audio setting. Retail starts loading sound.pak the first time it is chosen;
 /// back to Synth only stops the retail render (its memory is freed at the next launch).
 pub fn set_retail(on: bool) {
@@ -319,6 +327,7 @@ pub fn set_retail(on: bool) {
                 let _ = vita_platform::vita::pin_current_thread(0);
                 vita_platform::vita::set_current_thread_priority(160);
                 if let Err(e) = crate::retail_audio::load_and_run() {
+                    crate::retail_audio::mark_host_ready();
                     println!("{}: {e}; the procedural sounds play instead", crate::retail_audio::PACK);
                 }
             });
@@ -334,6 +343,11 @@ pub fn set_retail(on: bool) {
 /// session-marker cues until those are ported.
 #[cfg(target_os = "vita")]
 pub fn start(retail_audio: bool) {
+    start_audio(retail_audio);
+    STARTED.store(true, std::sync::atomic::Ordering::Release);
+}
+
+fn start_audio(retail_audio: bool) {
     let mut synth = Synth::default();
     let mut retail: Option<crate::retail_audio::Player> = None;
     let ok = vita_platform::vita::start_audio(move |out| {

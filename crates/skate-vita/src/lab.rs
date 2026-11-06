@@ -264,6 +264,16 @@ pub(crate) fn sim_thread(shared: &Mutex<Shared>) {
     println!("sim thread: core 1 ({pinned:#x}), fpscr {:#010x}, panels {:?} / {:?}", vita::fpscr(), input.front_area, input.rear_area);
     let assets = std::path::Path::new(crate::packs::mount());
     skate_sim::live::enable_game_switches();
+    // What lasts the whole game comes before any world, so that it stands at the start of the heap and not among a
+    // world's blocks: the sound, then the animation banks (15 MB, two 10.8 MB blocks while they are read, and 20 MB of
+    // small blocks) and the collections. They stay: read again before each load, 10.8 MB was refused.
+    crate::retail_audio::wait_for_host();
+    if let Err(e) = skate_data::animation_banks::AnimationBanks::load(assets) {
+        println!("animation banks at boot: {e}");
+    }
+    if let Err(e) = skate_data::collections::Collections::load(assets) {
+        println!("collections at boot: {e}");
+    }
     #[cfg(feature = "replay")]
     crate::autoplay::run(shared, assets);
     loop {
@@ -275,14 +285,30 @@ pub(crate) fn sim_thread(shared: &Mutex<Shared>) {
         // The last world's recordings go before the next world loads (they are of no use in it): the instant
         // replay's keys are tens of MB of small blocks spread through the heap, and with them still held a district's
         // 7.4 MB index found no free piece that large (DownTown to Industrial, streaming benchmark).
+        // Everything of the last world stops and goes before anything of the next one is asked for (the session itself
+        // went at the end of the last pass of this loop). The audio host acts on its next frame.
+        crate::retail_audio::leave_map();
         crate::session_replay::clear();
         crate::world_replay::clear();
+        crate::packs::stop_district();
+        crate::alloc::chunk_census("at the change");
+        crate::alloc::flush_every_thread();
+        std::thread::sleep(Duration::from_millis(100));
+        {
+            let world = shared.lock().unwrap().world;
+            crate::packs::prepare_window_buffers(crate::packs::WORLDS[world]);
+        }
+        crate::alloc::flush_thread_cache();
         let started = Instant::now();
         let (world, difficulty) = {
             let s = shared.lock().unwrap();
             (s.world, s.difficulty.key())
         };
         let name = crate::packs::WORLDS[world];
+        crate::alloc::take_biggest_asked();
+        println!("LOAD {name}: largest free block {} MiB, large blocks {:.1} MB, small {:.1} MB", crate::alloc::largest_free_mib(), crate::alloc::large_blocks().0 as f64 / 1e6, crate::alloc::small_blocks() as f64 / 1e6);
+        crate::alloc::chunk_census("every thread's cache given back");
+        crate::alloc::heap_map(&format!("before loading {name}"));
         let session = if world == 0 {
             crate::packs::clear_district();
             shared.lock().unwrap().park_render = Some((0, None));
@@ -365,6 +391,7 @@ pub(crate) fn sim_thread(shared: &Mutex<Shared>) {
                     s.hand_props_render = Some(hands);
                 }
                 println!("session loaded in {:.1} s: {name}", started.elapsed().as_secs_f32());
+                println!("LOAD {name}: biggest block asked {:.1} MB, largest free block now {} MiB", crate::alloc::take_biggest_asked() as f64 / 1e6, crate::alloc::largest_free_mib());
                 crate::alloc::stage(&format!("{name}: living world and its models loaded"));
                 static LOADS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 crate::retail_audio::set_map(name, LOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1);
@@ -454,6 +481,8 @@ fn run_session(shared: &Mutex<Shared>, input: &Input, session: &mut Session, mut
     session.set_animation_budget(ANIMATION_BUDGET);
     crate::session_replay::clear();
     crate::world_replay::clear();
+    let mut budgets = crate::memory_budget::Budgets::new(crate::world_replay::BUDGET, ANIMATION_BUDGET);
+    let mut budget_logged = None;
     println!("physics: {iterations} solver iterations");
     let mut paused_since: Option<Instant> = None;
     // The Object Dropper: the last tick's buttons (the phone's LB + B opens it) and the stand-in catalogue list.
@@ -839,6 +868,15 @@ fn run_session(shared: &Mutex<Shared>, input: &Input, session: &mut Session, mut
             s.speed = session.board().1;
             publish_career(&mut s, session);
             drop(s);
+            let held = crate::alloc::large_blocks().0 + crate::alloc::small_blocks();
+            if budgets.update(held, crate::world_replay::bytes(), session.animation_bytes()) {
+                crate::world_replay::set_budget(budgets.replay);
+                session.set_animation_budget(budgets.animation);
+                if budget_logged.is_none_or(|at: Instant| at.elapsed() >= Duration::from_secs(10)) {
+                    budget_logged = Some(Instant::now());
+                    println!("MEMORY {:.1} MB held, largest free block {} MiB: replay budget {:.1} MB, animation budget {:.1} MB", held as f64 / 1e6, crate::alloc::largest_free_mib(), budgets.replay as f64 / 1e6, budgets.animation as f64 / 1e6);
+                }
+            }
             max_this_second = 0;
             second = Instant::now();
         } else if due > 0 {

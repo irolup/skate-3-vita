@@ -103,6 +103,41 @@ pub fn read(path: &Path) -> io::Result<Vec<u8>> {
     }
 }
 
+/// [`read`] into `buffer`, which keeps its capacity: nothing is allocated when the file fits. An error, not an abort,
+/// when it does not fit and the heap has no block that large.
+pub fn read_into(path: &Path, buffer: &mut Vec<u8>) -> io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let room = |buffer: &mut Vec<u8>, len: usize| -> io::Result<()> {
+        buffer.clear();
+        buffer.try_reserve_exact(len).map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e.to_string()))?;
+        buffer.resize(len, 0);
+        Ok(())
+    };
+    match lookup(path) {
+        Some(Entry::Memory(bytes, range)) => {
+            room(buffer, range.len())?;
+            buffer.copy_from_slice(&bytes[range]);
+        }
+        Some(Entry::Disk(pack, offset, len)) => {
+            let _foreground = crate::io_gate::foreground();
+            let started = std::time::Instant::now();
+            let mut file = std::fs::File::open(&*pack)?;
+            file.seek(SeekFrom::Start(offset))?;
+            room(buffer, len)?;
+            file.read_exact(buffer)?;
+            let source = pack.file_name().map_or(std::borrow::Cow::Borrowed("?"), |n| n.to_string_lossy());
+            crate::io_gate::account(&source, len, started.elapsed().as_micros() as u64);
+        }
+        None if strict() => return Err(not_found(path)),
+        None => {
+            let mut file = std::fs::File::open(path)?;
+            room(buffer, file.metadata()?.len() as usize)?;
+            file.read_exact(buffer)?;
+        }
+    }
+    Ok(())
+}
+
 /// [`read`] without a copy for a file in memory: the buffer and the file's range in it
 /// (skate_vita retail audio: the samples keep it).
 pub fn read_shared(path: &Path) -> io::Result<(Arc<[u8]>, Range<usize>)> {
@@ -132,6 +167,24 @@ pub fn is_file(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_into_reuses_its_buffer() {
+        let path = Path::new("vfs-test:/read-into/a.bin");
+        mount(path, Arc::from(&[1u8, 2, 3][..]));
+        let mut buffer = Vec::with_capacity(16);
+        let start = buffer.as_ptr();
+        read_into(path, &mut buffer).unwrap();
+        assert_eq!(buffer, [1, 2, 3]);
+        assert_eq!(buffer.as_ptr(), start, "it fitted: no new block");
+        // From the disk, and shorter or longer than what was there.
+        let cargo = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        read_into(&cargo, &mut buffer).unwrap();
+        assert_eq!(buffer, std::fs::read(&cargo).unwrap());
+        read_into(path, &mut buffer).unwrap();
+        assert_eq!(buffer, [1, 2, 3]);
+        assert!(read_into(Path::new("vfs-test:/read-into/none.bin"), &mut buffer).is_err());
+    }
 
     #[test]
     fn mounted_files_shadow_the_disk_and_others_fall_through() {

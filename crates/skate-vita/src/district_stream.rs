@@ -187,27 +187,42 @@ impl Streamer {
         self.coverage
     }
 
+    /// Every frame, whatever the screen: a district that went is let go of at once (`frame` is not called on the loading
+    /// screen, and `packs::stop_district` waits for this while the next world's load waits for it).
+    pub fn poll_stop(&mut self, scene: &mut Scene) {
+        let generation = DISTRICT_GENERATION.load(Ordering::Relaxed);
+        if generation != self.generation && DISTRICT.lock().unwrap().is_none() {
+            self.apply_generation(scene, generation);
+        }
+    }
+
+    /// The district of `generation` replaces the one open.
+    fn apply_generation(&mut self, scene: &mut Scene, generation: u64) {
+        self.generation = generation;
+        self.stop();
+        // Uploads queued for the previous district (or start) go with it.
+        self.tasks.clear();
+        self.wanted.clear();
+        self.last_eye = None;
+        self.view = DISTRICT.lock().unwrap().clone();
+        self.failure = None;
+        match &self.view {
+            Some(view) => {
+                scene.load_district(view.tile_size, view.horizon, view.exposure);
+                self.loader = Some(spawn_loader(view.clone()));
+                println!("district stream: {} started", view.name);
+            }
+            None => scene.unload_district(),
+        }
+        GENERATION_SEEN.store(generation, Ordering::Release);
+    }
+
     /// Once per frame, before drawing.
     pub fn frame(&mut self, scene: &mut Scene, eye: Vec3, have_eye: bool) {
         self.frame += 1;
         let generation = DISTRICT_GENERATION.load(Ordering::Relaxed);
         if generation != self.generation {
-            self.generation = generation;
-            self.stop();
-            // Uploads queued for the previous district (or start) go with it.
-            self.tasks.clear();
-            self.wanted.clear();
-            self.last_eye = None;
-            self.view = DISTRICT.lock().unwrap().clone();
-            self.failure = None;
-            match &self.view {
-                Some(view) => {
-                    scene.load_district(view.tile_size, view.horizon, view.exposure);
-                    self.loader = Some(spawn_loader(view.clone()));
-                    println!("district stream: {} started", view.name);
-                }
-                None => scene.unload_district(),
-            }
+            self.apply_generation(scene, generation);
         }
         let (Some(view), Some(loader)) = (&self.view, &self.loader) else { return };
         let Some(gpu) = scene.district_mut() else { return };
@@ -393,13 +408,29 @@ impl Streamer {
 
 static LOADER_ID: AtomicU64 = AtomicU64::new(0);
 
+/// The district generation the streamer has acted on, and its loader threads still running (each stopped one can hold
+/// a tile it was reading): [`crate::packs::stop_district`] waits for both before a world loads.
+pub static GENERATION_SEEN: AtomicU64 = AtomicU64::new(u64::MAX);
+pub static LOADERS_RUNNING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+struct LoaderRunning;
+
+impl Drop for LoaderRunning {
+    fn drop(&mut self) {
+        LOADERS_RUNNING.fetch_sub(1, Ordering::Release);
+    }
+}
+
 fn spawn_loader(view: Arc<DistrictView>) -> Loader {
     let shared = Arc::new(Mutex::new(Shared::default()));
     let (tx, results) = sync_channel(3);
     let stop = Arc::new(AtomicBool::new(false));
     let (shared2, stop2) = (shared.clone(), stop.clone());
     let id = LOADER_ID.fetch_add(1, Ordering::Relaxed);
+    LOADERS_RUNNING.fetch_add(1, Ordering::AcqRel);
+    let running = LoaderRunning;
     let _ = std::thread::Builder::new().name(format!("tile-load-{id}")).stack_size(1 << 20).spawn(move || {
+        let _running = running;
         crate::alloc::tag_thread("tile");
         // Core 2 alone left it starved where the retail audio's render takes most of that core (20 voices on
         // Industrial's roads: decoding a tile 20x slower, the tiles late). On core 0 too, just below the main thread:

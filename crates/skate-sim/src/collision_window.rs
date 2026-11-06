@@ -63,6 +63,62 @@ pub fn reserve_buffers(sets: usize, triangles: usize) {
     }
 }
 
+/// What a streamed world's long-lived buffers are reserved under (the device: its window area).
+static RESERVE_SCOPE: std::sync::Mutex<Option<fn(&mut dyn FnMut())>> = std::sync::Mutex::new(None);
+
+pub fn configure_reserve_scope(scope: fn(&mut dyn FnMut())) {
+    *RESERVE_SCOPE.lock().unwrap() = Some(scope);
+}
+
+/// Runs `reserve` under the configured scope.
+pub(crate) fn in_reserve_scope(reserve: &mut dyn FnMut()) {
+    let scope = *RESERVE_SCOPE.lock().unwrap();
+    match scope {
+        Some(scope) => scope(reserve),
+        None => reserve(),
+    }
+}
+
+/// A world without windows (a park, the Course) needs no buffer sets: their memory goes back, in one piece while it is
+/// next to itself, for that world's own large blocks (MegaPark's collision takes 21 MB at once).
+pub fn release_buffers() {
+    if let Ok(mut pool) = RECYCLED.lock() {
+        pool.clear();
+    }
+}
+
+/// One buffer set per entry, for that many triangles, before a streamed world loads; what the pool held goes first unless
+/// it is already this. A set that finds no room is left out: a window then asks for its own, as with no reservation at all.
+pub fn ensure_buffers(sizes: &[usize]) {
+    if let Ok(mut pool) = RECYCLED.lock() {
+        let mut held: Vec<usize> = pool.iter().map(|b| b.triangles.capacity()).collect();
+        let mut wanted = sizes.to_vec();
+        held.sort_unstable();
+        wanted.sort_unstable();
+        if held == wanted {
+            return;
+        }
+        pool.clear();
+        for &triangles in sizes {
+            let mut set = skate_core::physics::board_world::WorldBuffers::default();
+            if set.triangles.try_reserve_exact(triangles).is_err()
+                || set.triangle_bounds.try_reserve_exact(triangles).is_err()
+                || set.packed_surfaces.try_reserve_exact(triangles).is_err()
+            {
+                break;
+            }
+            pool.push(set);
+        }
+        // Largest first, as `recycle` keeps them (`take_buffers` takes the smallest that holds a window).
+        pool.sort_by_key(|b| std::cmp::Reverse(b.triangles.capacity()));
+    }
+}
+
+/// A window's buffers found no room: the old window stays and the build is tried again (`follow`).
+const NO_ROOM: &str = "no room for a window's buffers";
+/// Ticks before a window that found no room is tried again.
+const NO_ROOM_RETRY_TICKS: u32 = 30;
+
 /// The smallest kept set that holds `triangles` (none: an empty one).
 fn take_buffers(triangles: usize) -> skate_core::physics::board_world::WorldBuffers {
     let Ok(mut pool) = RECYCLED.lock() else { return Default::default() };
@@ -288,10 +344,12 @@ impl ClusterSet {
         // A retired window's buffers are refilled when they are big enough: after the first
         // windows no new 10 MB block is needed, which a fragmented heap may not have (the Vita
         // with the retail audio). A fresh buffer gets a quarter more room for the next windows.
-        let upper: usize = ids.iter().map(|&i| self.clusters[i].triangles as usize).sum();
-        let skate_core::physics::board_world::WorldBuffers { triangles, triangle_bounds, packed_surfaces } = take_buffers(upper);
-        let room = upper + upper / 4;
-        let fresh = triangles.capacity() < upper || packed_surfaces.capacity() < upper || triangle_bounds.capacity() < upper;
+        // What this window holds, not its clusters' sum: 64,269 by the clusters, past a set of 64,000 that held the window,
+        // was a fresh 10.6 MB refused in University.
+        let needed: usize = selected.iter().flat_map(|runs| runs.iter()).filter(|run| regions.is_none_or(|r| r.iter().any(|r| run.bounds.overlaps(*r)))).map(|run| run.triangles.len()).sum();
+        let skate_core::physics::board_world::WorldBuffers { triangles, triangle_bounds, packed_surfaces } = take_buffers(needed);
+        let room = needed + needed / 4;
+        let fresh = triangles.capacity() < needed || packed_surfaces.capacity() < needed || triangle_bounds.capacity() < needed;
         let t_buffers = t0.elapsed();
         let (triangles, packed_surfaces, triangle_bounds) = if fresh {
             // No kept set holds this world (or none is free): a fresh one; the small set goes
@@ -301,7 +359,12 @@ impl ClusterSet {
                     pool.push(skate_core::physics::board_world::WorldBuffers { triangles, triangle_bounds, packed_surfaces });
                 }
             }
-            (Vec::with_capacity(room), Vec::with_capacity(room), Vec::with_capacity(room))
+            // With the room for the next windows if there is that much, else just this one's; a failure must not end the game.
+            let reserve = |size: usize| {
+                let (mut t, mut s, mut b) = (Vec::new(), Vec::new(), Vec::new());
+                (t.try_reserve_exact(size).is_ok() && s.try_reserve_exact(size).is_ok() && b.try_reserve_exact(size).is_ok()).then_some((t, s, b))
+            };
+            reserve(room).or_else(|| reserve(needed)).ok_or_else(|| NO_ROOM.to_string())?
         } else {
             (triangles, packed_surfaces, triangle_bounds)
         };
@@ -368,6 +431,8 @@ pub(crate) struct Window {
     pub(crate) triangles: usize,
     /// Times a tick had to wait for the background build.
     pub(crate) waits: u32,
+    /// Ticks until a window that found no room for its buffers is tried again.
+    no_room_ticks: u32,
     /// Where a replaced window goes to be freed: dropping 100,000 triangles and their indices
     /// inside a tick cost the simulation several milliseconds (dropped ticks on the device).
     retired: Option<std::sync::mpsc::Sender<BoardWorld>>,
@@ -432,7 +497,7 @@ impl Window {
 
     fn over(set: ClusterSet, half: f32, trigger: f32, at: [f32; 3]) -> Result<(Self, BoardWorld), String> {
         let set = std::sync::Arc::new(set);
-        let mut window = Self { set, half, trigger, centres: Vec::new(), pending: None, builds: 0, last_ms: 0.0, max_ms: 0.0, triangles: 0, waits: 0, retired: None };
+        let mut window = Self { set, half, trigger, centres: Vec::new(), pending: None, builds: 0, last_ms: 0.0, max_ms: 0.0, triangles: 0, waits: 0, no_room_ticks: 0, retired: None };
         // The first window is built around the spawn for both foci (deck and skater).
         let world = window.build(&[at, at])?;
         Ok((window, world))
@@ -522,6 +587,10 @@ impl Window {
         // in the tick (the desktop oracle: its windows stay where they were).
         let lead = if background { lead(velocity) } else { [0.0; 3] };
         let aims: Vec<[f32; 3]> = foci.iter().map(|f| [f[0] + lead[0], f[1], f[2] + lead[2]]).collect();
+        if self.no_room_ticks > 0 {
+            self.no_room_ticks -= 1;
+            return Ok(());
+        }
         // At most two rounds: a window that arrives may be for foci the skater has since
         // left (a teleport), and the next one is then waited for.
         for _ in 0..2 {
@@ -536,8 +605,16 @@ impl Window {
                     }
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => return Err("the window builder stopped".into()),
                 };
-                let (fresh, ms) = ready?;
                 let (new_foci, _) = self.pending.take().unwrap();
+                let (fresh, ms) = match ready {
+                    // The old window stays; the skater goes on in it.
+                    Err(e) if e == NO_ROOM => {
+                        println!("WINDOW no room for its buffers: the old window stays, tried again in {NO_ROOM_RETRY_TICKS} ticks");
+                        self.no_room_ticks = NO_ROOM_RETRY_TICKS;
+                        return Ok(());
+                    }
+                    other => other?,
+                };
                 self.built(&new_foci, &fresh, ms);
                 let old = std::mem::replace(world, fresh);
                 self.retire(old);

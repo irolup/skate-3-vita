@@ -11,7 +11,7 @@
 //! - **Render**: material draw groups (each with its own vertex range and u16 indices),
 //!   albedo and lightmap textures, the horizon colour and an exposure.
 use crate::texture::Texture;
-use crate::{Kind, Reader, Writer};
+use crate::{Kind, Reader, Source, Writer};
 use skate_data::skate_map::{
     Collision, Extension, Geometry, Light, Material, Rail, Route, SkateMap, Texture as MapTexture,
 };
@@ -210,6 +210,107 @@ pub fn encode_sim(m: &SkateMap) -> Vec<u8> {
     write_sim(&mut w, m);
     w.bytes
 }
+/// One grind rail of the `WMET` manifest: the keys the grind provider reads (`grind_world/provider.rs`). The rest of a
+/// record (mostly `native_segment_payloads`, read only from the prop and car sidecars) is three quarters of the JSON.
+#[derive(serde::Deserialize, serde::Serialize)]
+struct WmetRail {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stream_file: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    asset_id: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    section_index: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    section_offset: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rail_index: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    spline_id: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    segment_count: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    type_signature: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    flags: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    trailing_word: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    closed: Option<serde_json::Value>,
+}
+
+struct WmetManifest<'a>(&'a mut Vec<u8>);
+
+impl<'de> serde::de::Visitor<'de> for WmetManifest<'_> {
+    type Value = ();
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("the WMET manifest")
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        use serde::de::Error;
+        self.0.push(b'{');
+        let mut first = true;
+        while let Some(key) = map.next_key::<String>()? {
+            if key != "grind_coordinate_policy" && key != "grind_splines" {
+                map.next_value::<serde::de::IgnoredAny>()?;
+                continue;
+            }
+            if !std::mem::take(&mut first) {
+                self.0.push(b',');
+            }
+            serde_json::to_writer(&mut *self.0, &key).map_err(A::Error::custom)?;
+            self.0.push(b':');
+            if key == "grind_splines" {
+                map.next_value_seed(WmetRails(&mut *self.0))?;
+            } else {
+                serde_json::to_writer(&mut *self.0, &map.next_value::<serde_json::Value>()?).map_err(A::Error::custom)?;
+            }
+        }
+        self.0.push(b'}');
+        Ok(())
+    }
+}
+
+/// The rails are written out one by one as they are read, so that none of them is held.
+struct WmetRails<'a>(&'a mut Vec<u8>);
+
+impl<'de> serde::de::DeserializeSeed<'de> for WmetRails<'_> {
+    type Value = ();
+    fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        deserializer.deserialize_seq(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for WmetRails<'_> {
+    type Value = ();
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("the WMET grind_splines list")
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+        use serde::de::Error;
+        self.0.push(b'[');
+        let mut first = true;
+        while let Some(rail) = seq.next_element::<WmetRail>()? {
+            if !std::mem::take(&mut first) {
+                self.0.push(b',');
+            }
+            serde_json::to_writer(&mut *self.0, &rail).map_err(A::Error::custom)?;
+        }
+        self.0.push(b']');
+        Ok(())
+    }
+}
+
+/// The `WMET` manifest (JSON read from `json`) cut down to what the grind provider reads: DownTown's 9.7 MB become 2.3.
+pub(crate) fn slim_wmet<R: std::io::Read>(json: R, capacity: usize) -> Result<Vec<u8>, String> {
+    use serde::Deserializer as _;
+    let mut slim = Vec::with_capacity(capacity);
+    let mut de = serde_json::Deserializer::from_reader(json);
+    (&mut de).deserialize_map(WmetManifest(&mut slim)).map_err(|e| format!("WMET: {e}"))?;
+    de.end().map_err(|e| format!("WMET: {e}"))?;
+    slim.shrink_to_fit();
+    Ok(slim)
+}
+
 pub fn decode_sim(bytes: &[u8]) -> Result<SkateMap, String> {
     let mut r = Reader::new(bytes);
     let m = read_sim(&mut r)?;
@@ -223,7 +324,7 @@ fn write_f32s(w: &mut Writer, v: &[f32]) {
         w.f32(x);
     }
 }
-fn read_f32s(r: &mut Reader) -> Result<Vec<f32>, String> {
+fn read_f32s<S: Source>(r: &mut S) -> Result<Vec<f32>, String> {
     (0..r.u32()?).map(|_| r.f32()).collect()
 }
 fn write_bytes_opt(w: &mut Writer, b: &Option<Vec<u8>>) {
@@ -235,10 +336,10 @@ fn write_bytes_opt(w: &mut Writer, b: &Option<Vec<u8>>) {
         None => w.u8(0),
     }
 }
-fn read_bytes_opt(r: &mut Reader) -> Result<Option<Vec<u8>>, String> {
+fn read_bytes_opt<S: Source>(r: &mut S) -> Result<Option<Vec<u8>>, String> {
     Ok(match r.u8()? {
         0 => None,
-        _ => Some(r.block()?.to_vec()),
+        _ => Some(r.block_vec()?),
     })
 }
 fn write_rail(w: &mut Writer, rail: &Rail) {
@@ -250,7 +351,7 @@ fn write_rail(w: &mut Writer, rail: &Rail) {
     }
     write_bytes_opt(w, &rail.native);
 }
-fn read_rail(r: &mut Reader) -> Result<Rail, String> {
+fn read_rail<S: Source>(r: &mut S) -> Result<Rail, String> {
     Ok(Rail {
         name: r.str()?,
         closed: r.u8()? != 0,
@@ -340,7 +441,7 @@ fn write_sim(w: &mut Writer, m: &SkateMap) {
     }
 }
 
-fn read_sim(r: &mut Reader) -> Result<SkateMap, String> {
+pub(crate) fn read_sim<S: Source>(r: &mut S) -> Result<SkateMap, String> {
     let version = r.u8()?;
     let name = r.str()?;
     let spawn = [r.f32()?, r.f32()?, r.f32()?];
@@ -417,7 +518,9 @@ fn read_sim(r: &mut Reader) -> Result<SkateMap, String> {
         .collect::<Result<Vec<_>, _>>()?;
     let extensions = (0..r.u32()?)
         .map(|_| -> Result<Extension, String> {
-            Ok(Extension { tag: [r.u8()?, r.u8()?, r.u8()?, r.u8()?], schema: r.u32()?, payload: r.block()?.to_vec() })
+            let tag = [r.u8()?, r.u8()?, r.u8()?, r.u8()?];
+            let schema = r.u32()?;
+            Ok(Extension { tag, schema, payload: r.extension_payload(tag, schema)? })
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(SkateMap {
@@ -508,4 +611,31 @@ fn validate_render(m: &Render) -> Result<(), String> {
         }
     }
     m.textures.iter().try_for_each(Texture::validate)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn slim_wmet_keeps_the_keys_the_provider_reads() {
+        let json = serde_json::json!({
+            "other": { "big": [1, 2, 3] },
+            "grind_coordinate_policy": { "mode": "world_space", "classification_margin": 40.0 },
+            "grind_splines": [
+                { "stream_file": "a.str", "asset_id": "0x1", "section_index": 2, "section_offset": 3, "rail_index": 4, "spline_id": "0x00000000000000AB", "segment_count": 5, "type_signature": "0x2", "flags": 6, "trailing_word": 18446744073709551615u64, "closed": true, "native_segment_payloads": ["00"], "section_header_halfword": 7 },
+                { "stream_file": "b.str", "closed": false },
+            ],
+        });
+        let slim: serde_json::Value = serde_json::from_slice(&super::slim_wmet(json.to_string().as_bytes(), 0).unwrap()).unwrap();
+        let mut expected = json;
+        expected.as_object_mut().unwrap().remove("other");
+        for rail in expected["grind_splines"].as_array_mut().unwrap() {
+            rail.as_object_mut().unwrap().remove("native_segment_payloads");
+            rail.as_object_mut().unwrap().remove("section_header_halfword");
+        }
+        assert_eq!(slim, expected);
+        // A manifest without the keys stays without them (the provider reports it); broken JSON is refused.
+        assert_eq!(super::slim_wmet(&b"{}"[..], 0).unwrap(), b"{}");
+        assert!(super::slim_wmet(&b"{\"grind_splines\":["[..], 0).is_err());
+        assert!(super::slim_wmet(&b"{} trailing"[..], 0).is_err());
+    }
 }

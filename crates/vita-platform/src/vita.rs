@@ -232,6 +232,23 @@ pub fn heap() -> (usize, usize) {
     (used, arena)
 }
 
+/// The kernel's free memory: (user RAM, CDRAM, physically contiguous), bytes: what no heap or pool has taken.
+pub fn free_memory() -> (usize, usize, usize) {
+    #[repr(C)]
+    struct Info {
+        size: usize,
+        size_user: usize,
+        size_cdram: usize,
+        size_phycont: usize,
+    }
+    unsafe extern "C" {
+        fn sceKernelGetFreeMemorySize(info: *mut Info) -> i32;
+    }
+    let mut info = Info { size: std::mem::size_of::<Info>(), size_user: 0, size_cdram: 0, size_phycont: 0 };
+    unsafe { sceKernelGetFreeMemorySize(&mut info) };
+    (info.size_user, info.size_cdram, info.size_phycont)
+}
+
 /// `mallinfo` with the free side: (bytes in use, arena size, bytes free, free chunks).
 pub fn heap_detail() -> (usize, usize, usize, usize) {
     #[repr(C)]

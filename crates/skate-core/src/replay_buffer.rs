@@ -90,6 +90,16 @@ impl ReplayBuffer {
         *self = Self::new(self.limits);
     }
 
+    /// Changes the byte budget; the next [`Self::begin_frame`] evicts down to it. skate_vita: the budget goes down when
+    /// the world leaves the recording less room.
+    pub fn set_byte_budget(&mut self, bytes: usize) {
+        self.limits.byte_budget = bytes;
+    }
+
+    pub fn byte_budget(&self) -> usize {
+        self.limits.byte_budget
+    }
+
     /// Start a recorder frame at `time` (seconds on the replay clock). A clock that went back clears the recording.
     pub fn begin_frame(&mut self, time: f64) {
         match self.frames.back() {

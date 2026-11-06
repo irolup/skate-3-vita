@@ -14,6 +14,8 @@ use crate::replay_camera::{self, BASE_FOV, Cam, ClipCamera, Kind};
 
 /// Ticks kept: 60 s at 60 Hz. With 35 bones that is about 8 MB, allocated once.
 pub const CAPACITY: usize = 3600;
+/// The skater's bones: what [`reserve`] holds room for (another count takes a new block).
+const SKATER_BONES: usize = 36;
 
 #[derive(Clone, Copy)]
 pub struct Frame {
@@ -76,6 +78,15 @@ impl Recorder {
         self.head = 0;
         self.len = 0;
         self.frames.clear();
+    }
+
+    /// The memory for `nbones` bones, for good: 10.5 MB in two blocks. Asked for at a world's first tick they stood in
+    /// the free heap in the next world's way (and freed before a load, 8.3 MB was refused when asked for again after
+    /// DownTown's skate park).
+    fn reserve(&mut self, nbones: usize) {
+        self.nbones = nbones;
+        self.bones = vec![Mat4::IDENTITY; CAPACITY * nbones];
+        self.frames = Vec::with_capacity(CAPACITY);
     }
 
     fn physical(&self, logical: usize) -> usize {
@@ -203,6 +214,11 @@ pub fn record_riding(riding: skate_sim::AudioRiding) {
 /// A new session starts: the old frames belong to another world.
 pub fn clear() {
     RECORDER.lock().unwrap().clear();
+}
+
+/// At boot, before the heap has anything to be in the way of: see [`Recorder::reserve`].
+pub fn reserve() {
+    RECORDER.lock().unwrap().reserve(SKATER_BONES);
 }
 
 /// Held LT or RT: wind this fast (ticks per tick).

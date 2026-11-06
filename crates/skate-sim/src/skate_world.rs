@@ -1155,6 +1155,10 @@ struct PropTemplate {
     cosines: Vec<[f32; 3]>,
 }
 
+/// skate_vita: a district's prop world, reserved at load (see [`PropCollisionLayer::reserve_for_streaming`]), 132 bytes
+/// a triangle: DownTown's held just over 41,984 when doubling to 83,968 (11 MB) failed, 6 minutes into a ride.
+const STREAMED_TRIANGLES: usize = 84_000;
+
 impl PropTemplate {
     /// From a template's retail collision shape ([`PropShape`]): the native edge codes decoded
     /// per triangle (`portable_world`'s rule: a triangle without codes takes the welded features
@@ -1388,6 +1392,17 @@ impl PropCollisionLayer {
             }
         }
         errors
+    }
+
+    /// skate_vita: a streamed world's room for its props, so that they ask for no block as they stream in. Every prop in
+    /// a slot of its own would be more than the props around ever hold (a template's slots are reused), hence the cap.
+    pub(crate) fn reserve_for_streaming(&mut self) {
+        if crate::collision_window::configured().is_none() {
+            return;
+        }
+        let total = self.instances.iter().map(|i| i.local.len()).sum::<usize>().min(STREAMED_TRIANGLES);
+        crate::collision_window::in_reserve_scope(&mut || self.world.reserve_triangles(total));
+        println!("PROP WORLD room for {} triangles", self.world.triangle_capacity());
     }
 
     /// skate_vita: every instance in `instances` baked where it was placed (props without a
@@ -2068,6 +2083,7 @@ fn load_prop_layer_at(
             for (instance, error) in layer.bake_placed(bodiless) {
                 warn!("SKATE_PROP_COLLISION: {map_name} instance {instance}: {error}");
             }
+            layer.reserve_for_streaming();
             if let Some(types) = load_types(asset_root, sidecar, map_name) {
                 let typed = dynamics.set_type_data(&types);
                 info!("SKATE_PROP_TYPES: {map_name} types={} props_with_type_data={typed}/{}", types.len(), objects.len());

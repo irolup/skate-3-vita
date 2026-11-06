@@ -301,8 +301,7 @@ pub const DISTRICTS: [&str; 3] = ["Industrial", "University", "DownTown"];
 /// 100 / 25): windows of up to 187k triangles (23 MB) did not fit the heap beside it (80 m still
 /// reached 83k in DownTown); the next build starts 8 m out, 12 m before the skater would wait.
 pub const WINDOW: (f32, f32) = (60.0, 8.0);
-/// Streamed-world buffer sets reserved at boot and their size in triangles (80 m windows held
-/// 83k at most in DownTown; 60 m about 0.56 of that).
+/// Streamed-world buffer sets reserved at boot and their size in triangles; each district then has its own (`window_sets`).
 pub const WINDOW_BUFFERS: (usize, usize) = (3, 64_000);
 
 /// What the renderer needs of the open district: the file (for tiles and textures read by offset)
@@ -324,6 +323,49 @@ pub static DISTRICT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic
 
 pub fn clear_district() {
     set_district(None);
+}
+
+/// A district's buffer sets, in triangles. The largest window anywhere in it, from the packs (every 5 m, clusters within
+/// [`WINDOW`]'s half side): Industrial 59,441, DownTown 66,292, University 77,750. Three sets of that for University do not
+/// fit the window area beside the prop world, and the third is only for a window built while the last one is still going
+/// back: 64,000 holds most of its windows, and a window that finds no set waits for one.
+fn window_sets(name: &str) -> &'static [usize] {
+    match name {
+        "Industrial" => &[60_000; 3],
+        "University" => &[78_000, 78_000, 64_000],
+        _ => &[67_000; 3],
+    }
+}
+
+/// Before the world `name` loads: the collision windows' buffers are there for a district and gone for anything else.
+pub fn prepare_window_buffers(name: &str) {
+    static LOADED_ONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let later = LOADED_ONE.swap(true, std::sync::atomic::Ordering::Relaxed);
+    if DISTRICTS.contains(&name) {
+        crate::alloc::set_park_growth(false);
+        crate::alloc::in_window_area(|| skate_sim::collision_window::ensure_buffers(window_sets(name)));
+    } else {
+        skate_sim::collision_window::release_buffers();
+        crate::alloc::set_park_growth(later);
+    }
+}
+
+/// Before a world loads: the open district's tiles and textures go and its loader stops, and the caller goes on when the
+/// main thread has done it (at most 1 s: a screen that does not run the streamer). They used to go on the main thread's
+/// next frame, while the new world's first blocks were being asked for.
+pub fn stop_district() {
+    use crate::district_stream::{GENERATION_SEEN, LOADERS_RUNNING};
+    use std::sync::atomic::Ordering;
+    if DISTRICT.lock().unwrap().is_none() && LOADERS_RUNNING.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let started = std::time::Instant::now();
+    set_district(None);
+    let generation = DISTRICT_GENERATION.load(Ordering::Relaxed);
+    while (GENERATION_SEEN.load(Ordering::Acquire) != generation || LOADERS_RUNNING.load(Ordering::Acquire) != 0) && started.elapsed().as_secs() < 1 {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    println!("district stopped in {:.0} ms ({} loaders running)", started.elapsed().as_secs_f32() * 1000.0, LOADERS_RUNNING.load(Ordering::Acquire));
 }
 
 fn set_district(view: Option<std::sync::Arc<DistrictView>>) {
@@ -394,6 +436,7 @@ pub fn load_park(name: &str) -> Result<(skate_data::skate_map::SkateMap, Render,
     // for a park.
     if DISTRICTS.contains(&name) {
         skate_sim::collision_window::configure(WINDOW.0, WINDOW.1);
+        skate_sim::collision_window::configure_reserve_scope(|reserve| crate::alloc::in_window_area(|| reserve()));
         // Windows are built on core 0 or 2, whichever is idle, while the simulation keeps
         // ticking on core 1. Core 2 alone (with the retail audio render on it) made builds take
         // 2.5–5.6 s and stalled the simulation 2.9 s waiting for one. Just below the game
@@ -411,7 +454,9 @@ pub fn load_park(name: &str) -> Result<(skate_data::skate_map::SkateMap, Render,
         return load_district(name).map(|(sim, render)| (sim, render, Vec::new()));
     }
     let path = format!("{DIR}/map_{name}.pak");
-    let bytes = std::fs::read(&path).map_err(|e| format!("{path}: {e}"))?;
+    // In a park after the first world the pack goes to the window area, gone before its collision grows there.
+    let read = || std::fs::read(&path).map_err(|e| format!("{path}: {e}"));
+    let bytes = if crate::alloc::park_growth() { crate::alloc::in_window_area(read)? } else { read()? };
     let map = Map::from_pack(&bytes)?;
     Ok((map.sim, map.render, map.pieces))
 }

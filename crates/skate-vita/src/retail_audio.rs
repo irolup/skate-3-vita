@@ -45,6 +45,36 @@ pub fn frontend_ready() -> bool {
 }
 
 /// A world is loaded: the zone beds follow it (`name` is the retail map name, `generation` counts loads).
+static HOST_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// sound.pak is in memory (or will not be).
+pub fn mark_host_ready() {
+    HOST_READY.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Waits for sound.pak, before anything of the first world loads (at most 20 s): its 40 MB block, read during that load,
+/// landed among the world's blocks and stayed in the way of every later one. Adds its 4 s to the boot.
+pub fn wait_for_host() {
+    let started = std::time::Instant::now();
+    while !crate::audio::STARTED.load(std::sync::atomic::Ordering::Acquire) && started.elapsed().as_secs() < 20 {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    if !crate::audio::retail_started() {
+        return;
+    }
+    while !HOST_READY.load(std::sync::atomic::Ordering::Acquire) && started.elapsed().as_secs() < 20 {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// Before another world loads: the sound stops and the audio host lets go of the last map's banks (a map of no name,
+/// no emitters). `set_map` comes only when the new world has loaded, and the old map's banks waited for it in memory.
+pub fn leave_map() {
+    let mut m = MAILBOX.lock().unwrap();
+    m.silenced = true;
+    m.map = Some((String::new(), 0));
+}
+
 pub fn set_map(name: &str, generation: u64) {
     MAILBOX.lock().unwrap().map = Some((name.to_owned(), generation));
 }
@@ -187,6 +217,7 @@ pub fn load_and_run() -> Result<(), String> {
         started.elapsed().as_secs_f32()
     );
     *READY.lock().unwrap() = Some(native.renderer());
+    mark_host_ready();
     let period = std::time::Duration::from_secs_f32(FRAME);
     let mut next = Instant::now();
     let mut last = Instant::now();

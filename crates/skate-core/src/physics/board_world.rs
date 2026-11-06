@@ -786,6 +786,23 @@ impl BoardWorld {
     /// skate_vita: several [`Self::append_triangles`] runs in order, each with its own query
     /// meshes, and the query index rebuilt once at the end (props streamed in by one census pass).
     /// Every run is checked first: an error changes nothing. Returns the new ranges in order.
+    /// skate_vita: room for `total` triangles, so that appending up to there asks for no block. Growing doubles the
+    /// buffers, and an 11 MB one failed in the middle of a ride with the heap in pieces (DownTown's prop world).
+    pub fn reserve_triangles(&mut self, total: usize) {
+        let more = total.saturating_sub(self.triangles.len());
+        self.triangles.reserve_exact(more);
+        self.triangle_bounds.reserve_exact(more);
+        if let Some(metadata) = &mut self.query_metadata {
+            metadata.packed_surfaces.reserve_exact(more);
+            metadata.meshes.reserve_exact(more / 64);
+        }
+    }
+
+    /// skate_vita: the triangles the world has room for.
+    pub fn triangle_capacity(&self) -> usize {
+        self.triangles.capacity()
+    }
+
     pub fn append_triangles_batch(
         &mut self,
         parts: &[(&[WorldTriangle], &[u16])],

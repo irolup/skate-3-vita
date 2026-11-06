@@ -141,9 +141,22 @@ fn rooted(translation: Vec3, rotation: Quat) -> JointPose {
     JointPose { translation: translation.to_array(), rotation: rotation.to_array(), scale: [1.0; 3] }
 }
 
+/// The bytes the recording holds.
+pub fn bytes() -> usize {
+    RECORDER.lock().unwrap().as_ref().map_or(0, |r| r.buffer.bytes())
+}
+
+/// Lowers (or restores) the recording's byte budget; the oldest frames go on the next recorded tick.
+pub fn set_budget(bytes: usize) {
+    if let Some(r) = RECORDER.lock().unwrap().as_mut() {
+        r.buffer.set_byte_budget(bytes);
+    }
+}
+
 /// A new session or world: the old recording belongs to another one.
 pub fn clear() {
     if let Some(r) = RECORDER.lock().unwrap().as_mut() {
+        r.buffer.set_byte_budget(BUDGET);
         r.buffer.clear();
         r.seen.clear();
         r.looks.clear();
@@ -220,7 +233,7 @@ pub fn record(
             r.buffer.frame_count(),
             r.buffer.bytes(),
             r.buffer.bytes() as f64 / (1 << 20) as f64,
-            BUDGET >> 20,
+            r.buffer.byte_budget() >> 20,
             r.seen.len(),
             r.spent_us as f64 / LOG_TICKS as f64 / 1000.0,
             r.worst_us as f64 / 1000.0,

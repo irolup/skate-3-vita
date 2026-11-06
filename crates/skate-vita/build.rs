@@ -54,6 +54,17 @@ fn main() {
     // link-args land after the libraries, so pthread is listed again after the objects.
     println!("cargo:rustc-link-arg-bins=-lpthread");
     println!("cargo:rustc-link-arg-bins=-Wl,--wrap=pthread_create");
+    // The C code's small mallocs go to an area of their own (src/alloc.rs, c_malloc). Not `_malloc_r` nor `_calloc_r`:
+    // newlib's own `_memalign_r` and `_realloc_r` call `_malloc_r` and take its result for a chunk of the main heap.
+    for sym in ["malloc", "free", "realloc", "calloc", "malloc_usable_size", "_free_r", "_realloc_r", "_malloc_usable_size_r"] {
+        println!("cargo:rustc-link-arg-bins=-Wl,--wrap={sym}");
+    }
+    // `mem-log`: these pass through, counting who calls them (what stays in the main heap).
+    if std::env::var_os("CARGO_FEATURE_MEM_LOG").is_some() {
+        for sym in ["_malloc_r", "_calloc_r", "memalign"] {
+            println!("cargo:rustc-link-arg-bins=-Wl,--wrap={sym}");
+        }
+    }
     // vita-elf-create reads these by symbol name, but nothing references them, so
     // --gc-sections drops them (#[used] only survives until link time). Make them roots.
     for sym in ["sceUserMainThreadStackSize", "sceLibcHeapSize", "__aeabi_memcpy8"] {

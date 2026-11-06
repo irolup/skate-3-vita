@@ -204,7 +204,9 @@ pub fn run() -> ! {
     // Before anything fragments the heap: the streamed districts' collision buffers.
     crate::alloc::tag_thread("main");
     crate::alloc::stage("boot");
-    skate_sim::collision_window::reserve_buffers(crate::packs::WINDOW_BUFFERS.0, crate::packs::WINDOW_BUFFERS.1);
+    crate::alloc::in_window_area(|| skate_sim::collision_window::reserve_buffers(crate::packs::WINDOW_BUFFERS.0, crate::packs::WINDOW_BUFFERS.1));
+    crate::alloc::SCRATCH.lock().unwrap().reserve_exact(crate::alloc::SCRATCH_BYTES);
+    crate::session_replay::reserve();
     crate::alloc::stage("window buffers reserved");
     let mut settings = Settings::load();
     let world = usize::from(settings.world).min(WORLDS.len() - 1);
@@ -401,6 +403,7 @@ pub fn run() -> ! {
     while !quit {
         vita::keep_awake();
         let frame_start = Instant::now();
+        streamer.poll_stop(&mut scene);
         if frame_start - last_frame > Duration::from_millis(250) {
             println!("SUSPEND main thread: {} ms gap on the {} screen", (frame_start - last_frame).as_millis(), screen.name());
         }
@@ -1447,13 +1450,18 @@ pub fn run() -> ! {
                     );
                 }
             }
-            if freeze && paused_frames >= FREEZE_AFTER_FRAMES {
+            // Without room for the capture the scene goes on being drawn behind the menu; tried again every 2 s.
+            if freeze && paused_frames >= FREEZE_AFTER_FRAMES && (paused_frames - FREEZE_AFTER_FRAMES) % 120 == 0 {
                 let started = Instant::now();
-                let screen = vita_render::read_rgba();
-                // Save Park's picture: the park as the pause menu froze it.
-                park_picture = Some(crate::parks::picture(&screen, math::WIDTH as usize, math::HEIGHT as usize));
-                apt.add_texture(FROZEN_WORLD, math::WIDTH as u32, math::HEIGHT as u32, &screen);
-                println!("pause: world captured in {:.1} ms", started.elapsed().as_secs_f32() * 1000.0);
+                let mut screen = crate::alloc::SCRATCH.lock().unwrap();
+                if vita_render::read_rgba(&mut screen) {
+                    // Save Park's picture: the park as the pause menu froze it.
+                    park_picture = Some(crate::parks::picture(&screen, math::WIDTH as usize, math::HEIGHT as usize));
+                    apt.add_texture(FROZEN_WORLD, math::WIDTH as u32, math::HEIGHT as u32, &screen);
+                    println!("pause: world captured in {:.1} ms", started.elapsed().as_secs_f32() * 1000.0);
+                } else {
+                    println!("pause: no room to capture the world");
+                }
             }
             }
             if photo_request {
@@ -2256,6 +2264,8 @@ impl Stats {
                 self.seconds, in_use >> 20, arena >> 20, free >> 20, chunks, vram.0, vram.1, ram.0, ram.1, slow.0, slow.1, budget.0, budget.1
             );
             crate::alloc::stage(&format!("t={}s", self.seconds));
+            let (user, cdram, phycont) = vita_platform::vita::free_memory();
+            println!("KERNEL free MiB: user {}, cdram {}, phycont {}; largest heap block {} MiB; small region {} MiB used ({} chunks, {} taken), game area {:.1} MB, window area {:.1} MB, C area {:.2} MB", user >> 20, cdram >> 20, phycont >> 20, crate::alloc::largest_free_mib(), crate::alloc::small_region_used() >> 20, crate::alloc::small_chunks().0, crate::alloc::small_chunks().1, crate::alloc::game_area_used() as f64 / 1e6, crate::alloc::window_area_used() as f64 / 1e6, crate::alloc::c_area_used().0 as f64 / 1e6);
         }
         println!(
             "HEAP t={}s in_use={} peak={} small={} returned={} arena=0 anim={}",

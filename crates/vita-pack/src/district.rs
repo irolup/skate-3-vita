@@ -14,7 +14,7 @@
 //!
 //! After the index come the blobs. Offsets are relative to the end of the index. The file is
 //! never read whole: [`DistrictFile::read_range`] seeks and reads.
-use crate::{Kind, Reader, Writer, HEADER_LEN, MAGIC};
+use crate::{Kind, Reader, Source, StreamReader, Writer, HEADER_LEN, MAGIC};
 use skate_data::retail_collision::{ClusterInfo, ClusterParams, ClusterSource};
 use skate_data::skate_map::SkateMap;
 use std::io::{Read, Seek, SeekFrom};
@@ -28,6 +28,8 @@ const MERGE_GAP: u64 = 8 * 1024;
 /// Textures closer than this in the file are read together (`DistrictFile::read_textures`).
 const TEXTURE_GAP: u64 = 32 * 1024;
 const TEXTURE_RUN: u64 = 512 * 1024;
+/// Size of the card reads that bring in the index (the card's small reads are slow).
+const INDEX_CHUNK: usize = 1 << 20;
 
 /// One render tile: its cell and where its levels of detail are (offset, size; size 0 = none).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -257,13 +259,17 @@ pub fn open(path: &Path) -> Result<(District, DistrictFile), String> {
     if index_len + 4 > length {
         return Err(format!("{name}: bad index length"));
     }
-    let mut index = vec![0u8; index_len as usize];
-    file.read_exact(&mut index).map_err(|e| format!("{name}: {e}"))?;
     let data_start = HEADER_LEN as u64 + 4 + index_len;
     let blob_len = file_len - data_start;
 
-    let mut r = Reader::new(&index);
-    let sim = crate::map::decode_sim(r.block()?)?;
+    // Decoded as it is read: the index never sits in memory whole (15.7 MB for DownTown; see `StreamReader`).
+    let mut r = StreamReader::new(std::io::BufReader::with_capacity(INDEX_CHUNK, file), index_len);
+    let sim_len = u64::from(r.u32()?);
+    let sim_start = r.at();
+    let sim = crate::map::read_sim(&mut r).map_err(|e| format!("{name}: {e}"))?;
+    if r.at() - sim_start != sim_len {
+        return Err(format!("{name}: the sim part is {} bytes, its length says {sim_len}", r.at() - sim_start));
+    }
     let authored_spawn = [r.f32()?, r.f32()?, r.f32()?];
     let authored_heading = r.f32()?;
     let limits = (r.f32()?, r.f32()?);
@@ -306,6 +312,7 @@ pub fn open(path: &Path) -> Result<(District, DistrictFile), String> {
         textures.push((offset, size));
     }
     r.done()?;
+    let file = r.into_inner().into_inner();
     Ok((
         District { sim, authored_spawn, authored_heading, limits, clusters, tile_size, tiles, textures },
         DistrictFile { file: Mutex::new(file), path: path.to_path_buf(), data_start, file_len, clusters: located },
@@ -482,6 +489,40 @@ mod tests {
             max: [i as f32 + 1.0, 1.0, 1.0],
             triangles: 10 + i,
             params: ClusterParams { granularity: 0.25, group_width: 1, surface_width: 2, one_sided: i % 2 == 1 },
+        }
+    }
+
+    /// Every district pack in `SKATE_VITA_PACKS`: the sim part read from the card equals the one decoded from the whole
+    /// index, except that its `WMET` holds only the provider's keys, with their values unchanged.
+    #[test]
+    #[ignore = "needs baked packs in SKATE_VITA_PACKS"]
+    fn real_packs_stream_to_the_same_sim() {
+        let folder = std::env::var("SKATE_VITA_PACKS").unwrap();
+        for name in ["Industrial", "University", "DownTown"] {
+            let path = Path::new(&folder).join(format!("district_{name}.pak"));
+            let bytes = std::fs::read(&path).unwrap();
+            let length = u32::from_le_bytes(bytes[HEADER_LEN..HEADER_LEN + 4].try_into().unwrap()) as usize;
+            let index = &bytes[HEADER_LEN + 4..HEADER_LEN + 4 + length];
+            let mut r = Reader::new(index);
+            let mut whole = crate::map::decode_sim(r.block().unwrap()).unwrap();
+            let (district, _) = open(&path).unwrap();
+            let mut streamed = district.sim;
+            let wmet = |m: &mut SkateMap| m.extensions.iter_mut().find(|e| &e.tag == b"WMET").map(|e| std::mem::take(&mut e.payload)).unwrap();
+            let (full, slim) = (wmet(&mut whole), wmet(&mut streamed));
+            println!("{name}: WMET {} -> {} bytes", full.len(), slim.len());
+            assert_eq!(crate::map::encode_sim(&whole), crate::map::encode_sim(&streamed), "{name}");
+            let full: serde_json::Value = serde_json::from_slice(&full).unwrap();
+            let slim: serde_json::Value = serde_json::from_slice(&slim).unwrap();
+            assert_eq!(full["grind_coordinate_policy"], slim["grind_coordinate_policy"]);
+            let (a, b) = (full["grind_splines"].as_array().unwrap(), slim["grind_splines"].as_array().unwrap());
+            assert_eq!(a.len(), b.len());
+            for (a, b) in a.iter().zip(b) {
+                for key in ["stream_file", "asset_id", "section_index", "section_offset", "rail_index", "spline_id", "segment_count", "type_signature", "flags", "trailing_word", "closed"] {
+                    assert!(!a[key].is_null(), "{name} {key}");
+                    assert_eq!(a[key], b[key], "{name} {key}");
+                }
+                assert_eq!(b.as_object().unwrap().len(), 11);
+            }
         }
     }
 

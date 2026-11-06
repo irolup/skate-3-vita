@@ -356,7 +356,7 @@ impl FeMenus {
                 r.hidden = false;
                 r.closing = 0.0;
                 r.stats = Stats::default();
-                println!("FE_MENUS open; heap {} KiB", heap() / 1024);
+                println!("FE_MENUS open; heap {} KiB, largest free block {} MiB", heap() / 1024, crate::alloc::largest_free_mib());
                 r.stage.update_keys(vec![(APT_START, 0)], 0.0);
             }
         }
@@ -829,9 +829,10 @@ impl FeMenus {
             }
             r.named.push(d.texture.clone());
             let Some(skate_ui::fe::retail_menu_movies::MenuImage::Retail { path, width, height }) = r.stage.image(&d.texture) else { continue };
-            match read(&format!("{SET}/{path}")) {
-                Ok(bytes) if bytes.len() == width as usize * height as usize * 4 => apt.add_texture(&d.texture, width, height, &bytes),
-                Ok(bytes) => println!("FE_MENUS image {}: {} bytes, the set says {width} x {height}", d.texture, bytes.len()),
+            let mut bytes = crate::alloc::SCRATCH.lock().unwrap();
+            match skate_data::vfs::read_into(&std::path::Path::new(crate::packs::ROOT).join(format!("{SET}/{path}")), &mut bytes) {
+                Ok(()) if bytes.len() == width as usize * height as usize * 4 => apt.add_texture(&d.texture, width, height, &bytes),
+                Ok(()) => println!("FE_MENUS image {}: {} bytes, the set says {width} x {height}", d.texture, bytes.len()),
                 Err(e) => println!("FE_MENUS image {}: {e}", d.texture),
             }
         }

@@ -146,6 +146,16 @@ fn dominant(positive: f32, negative: f32) -> f32 {
 /// The cursor's farthest reach ahead of the eye, in farthest zooms (NOT RETAIL: ours).
 const REACH: f32 = 1.5;
 
+/// How far the camera stays from what stops it, in metres: the radius of retail's move query (`82886500`, 0x82181B90).
+pub const SWEEP_RADIUS: f32 = 0.4;
+/// A surface whose normal has at least this much height is a floor or a roof, not a wall.
+pub const FLOOR_NORMAL: f32 = 0.7;
+
+/// How low D-pad Down brings the camera over the cursor, in metres (above the sweep's radius, so the ground never stops it
+/// first). Retail's free camera has distance 0 (`82886CC8`, 0x82165A10): it stands at the cursor and flies down to the
+/// ground; ours stands above the cursor, so it comes down as far as this.
+const LOWEST_EYE: f32 = 0.8;
+
 /// The free camera (+0x1660). Angles in radians; `pitch` is where it looks, above (+) or below (-) the horizon.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Camera {
@@ -155,6 +165,8 @@ pub struct Camera {
     pub target_distance: f32,
     /// The eye's angle above the cursor, seen from the cursor (the start pitch's).
     pub elevation: f32,
+    /// The distance D-pad Down brought it in from, which D-pad Up goes back to before it lifts the cursor; 0 when not lowered.
+    pub lowered_from: f32,
 }
 
 impl Camera {
@@ -166,6 +178,7 @@ impl Camera {
             distance: tuning.start_distance,
             target_distance: tuning.start_distance,
             elevation: tuning.start_pitch.abs(),
+            lowered_from: 0.0,
         }
     }
 
@@ -177,8 +190,29 @@ impl Camera {
         self.pitch += invert[1] * mode.pitch_rate * dominant(input.right[UP], input.right[DOWN]);
         self.pitch = self.pitch.clamp(tuning.free_pitch[0], tuning.free_pitch[1]);
         let zoom = dominant(f32::from(u8::from(input.zoom[1])), f32::from(u8::from(input.zoom[0])));
-        self.target_distance = (self.target_distance + mode.zoom_rate * zoom).clamp(tuning.distance[0], tuning.distance[1]);
+        // A camera D-pad Down brought in closer than the zoom goes stays there until it zooms out.
+        self.target_distance = (self.target_distance + mode.zoom_rate * zoom).clamp(tuning.distance[0].min(self.target_distance), tuning.distance[1]);
+        if self.target_distance >= self.lowered_from {
+            self.lowered_from = 0.0;
+        }
         self.distance += (self.target_distance - self.distance) * tuning.smoothing;
+    }
+
+    /// D-pad Down with the cursor already as low as it goes (`metres` negative) brings the eye lower over the cursor; D-pad
+    /// Up (positive) takes it back to where it came from.
+    pub fn move_height(&mut self, metres: f32) {
+        if metres == 0.0 {
+            return;
+        }
+        let sine = self.elevation.sin().max(0.1);
+        if metres < 0.0 && self.lowered_from == 0.0 {
+            self.lowered_from = self.distance;
+        }
+        self.target_distance = (self.target_distance + metres / sine).clamp(LOWEST_EYE / sine, self.lowered_from);
+        self.distance = self.target_distance;
+        if metres > 0.0 && self.target_distance >= self.lowered_from {
+            self.lowered_from = 0.0;
+        }
     }
 
     /// How far the camera is zoomed out, 0 (closest) to 1 (farthest): the speed curve's input.
@@ -229,6 +263,18 @@ impl Camera {
 /// What the cursor stands on: the height of the ground at (x, z) at or below `from` (the world's collision).
 pub trait Ground {
     fn below(&self, x: f32, z: f32, from: f32) -> Option<f32>;
+
+    /// The height of what stops D-pad Down for a cursor over a surface at height `at` at (x, z): by default the next surface
+    /// under that one.
+    fn floor_below(&self, x: f32, z: f32, at: f32) -> Option<f32> {
+        self.below(x, z, at - UNDER)
+    }
+
+    /// Where a camera move `from` -> `to` first meets something that stops it: the fraction of the move and the
+    /// surface's normal; None when nothing does.
+    fn sweep(&self, _from: Vec3, _to: Vec3) -> Option<(f32, Vec3)> {
+        None
+    }
 }
 
 /// The cursor (+0x1450): where the next item goes, the camera's focus.
@@ -242,7 +288,7 @@ pub struct Cursor {
 }
 
 /// How far under the followed surface the next one down is looked for.
-const UNDER: f32 = 0.05;
+pub(super) const UNDER: f32 = 0.05;
 
 /// The elevation ramp's rest value, step per update and cap (8288C310: 0x820D06C0, 0x820994B4, 0x82063B08).
 const RAMP_REST: f32 = 0.3;
@@ -260,6 +306,9 @@ impl Cursor {
     /// NOT RETAIL YET: the move's frame is the camera's ground forward and its right (retail builds it from the
     /// camera's forward in vector code read only in part), the `along_camera` term of `free_cam` is not applied, and
     /// the ground rule below is ours (retail 828883D8 follows the ground under a step of `ground_step` metres).
+    ///
+    /// Returns what of the d-pad's move the cursor did not make, for the camera: Down with nothing lower (negative), and Up
+    /// while the camera is lowered (positive; it goes back first and the cursor stays).
     pub fn update(
         &mut self,
         tuning: &Tuning,
@@ -269,7 +318,7 @@ impl Cursor {
         speed: f32,
         locks: [bool; 3],
         ground: &dyn Ground,
-    ) {
+    ) -> f32 {
         let s = mode.speed_curve.at(camera.zoom_fraction(tuning)) * speed;
         let horizontal = mode.move_scale * s;
         let vertical = mode.elevate_scale * s * self.ramp;
@@ -281,19 +330,34 @@ impl Cursor {
         let right = Vec3::new(-forward.z, 0.0, forward.x);
         let moved = self.position + right * x + forward * z;
         if tuning.follow_ground {
-            // The ground under the cursor, followed while a step is at most `ground_step`; the d-pad lifts above it.
-            let floor = self.position.y - self.lift;
-            let floor = match ground.below(moved.x, moved.z, floor + tuning.ground_step) {
-                Some(h) if (h - floor).abs() <= tuning.ground_step => h,
-                _ => floor,
+            // The ground under the cursor, followed up a step of at most `ground_step` and down any drop (owner, device: off
+            // the edge of something tall the cursor and the camera stayed up there; retail's 828883D8 keeps no such height);
+            // the d-pad lifts above it.
+            let at = self.position.y;
+            let floor = at - self.lift;
+            let floor = ground.below(moved.x, moved.z, floor + tuning.ground_step).unwrap_or(floor);
+            // Below the surface it followed (Down, through a piece) it keeps its height when that surface changes: the old
+            // lift from a lower surface would put it under the ground.
+            if self.lift < 0.0 {
+                self.lift = (at - floor).min(0.0);
+            }
+            // Down goes on to what stops it under that surface (`Ground::floor_below`), never past it, also when the ground
+            // rises under it (owner, device: a piece snapped onto a higher one could not be lowered again; NOT RETAIL YET,
+            // retail's elevate limit is not read). Nothing under it: no lower.
+            let lowest = ground.floor_below(moved.x, moved.z, floor).map_or(self.lift.min(0.0), |h| (h - floor).min(0.0));
+            self.lift = self.lift.max(lowest);
+            let (lift, rest) = if y > 0.0 && camera.lowered_from > 0.0 {
+                (self.lift, y)
+            } else {
+                let lift = (self.lift + y).max(lowest);
+                (lift, (self.lift + y) - lift)
             };
-            // Down goes below the followed surface to the next one under it (owner, device: a piece snapped onto a
-            // higher one could not be lowered again; NOT RETAIL YET, retail's elevate limit is not read).
-            let lowest = ground.below(moved.x, moved.z, floor - UNDER).map_or(0.0, |h| (h - floor).min(0.0));
-            self.lift = (self.lift + y).max(lowest);
+            self.lift = lift;
             self.position = Vec3::new(moved.x, floor + self.lift, moved.z);
+            rest
         } else {
             self.position = moved + Vec3::Y * y;
+            0.0
         }
     }
 }

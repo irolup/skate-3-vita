@@ -43,7 +43,7 @@ pub struct Update {
     /// The player changed a setting (the game's settings were updated).
     pub settings_changed: bool,
     /// Challenge Map locations picked: their map (`packs::WORLDS` name) and locator matrix.
-    pub teleports: Vec<(String, [[f32; 4]; 4])>,
+    pub teleports: Vec<(String, String, [[f32; 4]; 4])>,
     /// Call Skater (FE 62): a character key to call (true) or dismiss (false), in order.
     pub skater_calls: Vec<(String, bool)>,
     /// Text the game asked for and the player typed: (callback, text) (Save Park's name).
@@ -470,6 +470,14 @@ impl FeMenus {
         }
     }
 
+    /// The HUD phone's skate.Park rows: the font and strings (None until the menus have loaded).
+    pub fn phone_text(&self) -> Option<(&skate_ui::fe::apt_text::Font, &str, &str)> {
+        match self {
+            FeMenus::Ready(r) => r.stage.phone_text(),
+            _ => None,
+        }
+    }
+
     /// The Object Dropper's movie is still on the menu stage (open, or playing its outro).
     pub fn object_dropper_loaded(&self) -> bool {
         matches!(self, FeMenus::Ready(r) if r.dropper || r.stage.object_dropper_loaded())
@@ -758,7 +766,7 @@ impl FeMenus {
                 None => println!("FE_MENUS item {item} {sub:?}: nothing on the Vita"),
             }
         }
-        out.teleports.extend(frame.teleports.iter().filter_map(|key| r.stage.teleport(key).cloned()));
+        out.teleports.extend(frame.teleports.iter().filter_map(|key| r.stage.teleport(key).map(|(map, matrix)| (key.clone(), map.clone(), *matrix))));
         out.answers.extend(frame.popup_choices.iter().filter(|(c, _)| c.starts_with("park.")).cloned());
         out.browser.extend(r.stage.take_browser_events());
         out.park_setup.extend(r.stage.take_park_setup_choices());

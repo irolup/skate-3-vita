@@ -109,6 +109,11 @@ impl SharedText {
     pub fn language(&self) -> &Arc<BTreeMap<String, String>> {
         &self.language
     }
+
+    /// A font of the set by its APT name (lower case), its paired foreground with it.
+    pub fn named(&self, name: &str) -> Option<&Font> {
+        self.named.get(name)
+    }
 }
 
 /// Font ids handed to script-named fonts in `TextAssets::fonts` (below every character id).

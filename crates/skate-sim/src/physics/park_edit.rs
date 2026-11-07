@@ -49,6 +49,8 @@ pub(crate) fn compose(first: &Affine, then: &Affine) -> Affine {
 pub(crate) struct ParkPieces {
     /// Each fused piece's rows in the static world.
     ranges: BTreeMap<u32, Range<usize>>,
+    /// The static world's rows before this one are the park's own map; the layout's, then placed terrain, follow.
+    map_rows: usize,
     /// The rows of the pieces edited so far, as the layout made them (a reset puts them back bit for bit).
     originals: BTreeMap<u32, Vec<WorldTriangle>>,
     /// Railed pieces: their template's rails and the layout's placement.
@@ -69,7 +71,7 @@ impl ParkPieces {
             .iter()
             .filter_map(|(id, template, placement)| Some((*id, (baked.templates.get(template)?.clone(), *placement))))
             .collect();
-        Self { ranges, originals: BTreeMap::new(), rails, layout: baked.layout.clone(), name }
+        Self { ranges, map_rows: offset, originals: BTreeMap::new(), rails, layout: baked.layout.clone(), name }
     }
 
     pub(crate) fn ids(&self) -> impl Iterator<Item = u32> + '_ {
@@ -102,6 +104,12 @@ impl GamePhysics {
     /// A baked skate.Park (its pieces can be edited) rather than the open world.
     pub(crate) fn is_park(&self) -> bool {
         self.park.is_some()
+    }
+
+    /// Where a move of the Object Dropper's camera first meets the park's own map and ground (the items placed in it let
+    /// it through): the fraction of the move and the surface's normal; None when clear, or outside a baked park.
+    pub(crate) fn map_sweep(&self, from: [f32; 3], to: [f32; 3], radius: f32) -> Option<(f32, [f32; 3])> {
+        crate::camera::world_query::line_in_rows(&self.world, from, to, self.park.as_ref()?.map_rows, radius)
     }
 
     /// The layout pieces the running world can move (none outside a baked park).

@@ -172,6 +172,29 @@ pub fn lots() -> Vec<Lot> {
         .collect()
 }
 
+/// A Challenge Map row that lays a stock layout on its map (a lot's template, or `park_worlds`: PCU Training - Basic);
+/// None for any other row, or without the catalogue pack.
+pub fn stock_row(world: &str, map: &str) -> Option<Template> {
+    #[derive(serde::Deserialize)]
+    struct Row {
+        world: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct Lot {
+        templates: Vec<Row>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Catalog {
+        park_lots: Vec<Lot>,
+        #[serde(default)]
+        park_worlds: Vec<Row>,
+    }
+    let path = std::path::Path::new(crate::packs::ROOT).join("private/object-catalog/catalog.json");
+    let catalog: Catalog = serde_json::from_slice(&skate_data::vfs::read(&path).ok()?).ok()?;
+    let mut rows = catalog.park_lots.iter().flat_map(|l| &l.templates).chain(&catalog.park_worlds);
+    rows.any(|r| r.world == world).then(|| Template { world: world.to_owned(), name: String::new(), thumb: String::new(), map: map.to_owned() })
+}
+
 /// A save time as the browser's date (year-month-day, UTC).
 pub fn date_text(seconds: u64) -> String {
     // Days to a civil date (Howard Hinnant's algorithm).

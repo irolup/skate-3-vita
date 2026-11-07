@@ -103,6 +103,14 @@ for s in hud2/manualmeter hud2/trickanalyser hud2/hudminimap; do
 done
 ```
 
+The Object Dropper and skate.Park need the game's catalogue of objects, which this exports from your disc:
+
+```sh
+python3 tools/prepare_object_catalog.py --game ../game_data/skate3_x360 --assets $INSTALL/assets
+```
+
+It should end with a line like `object-catalog: 661 items`. One failure, for `SkatePark_Spawner`, is normal: that piece has no model.
+
 ### Step 5 : build vita-bake and bake the packs
 
 `vita-bake` is this repo's own tool. The first line builds it (the first time, Rust downloads what it needs, which takes a few minutes); the `$B` lines then bake each pack. They're independent, so if one fails you can fix it and re-run just that one:
@@ -121,6 +129,7 @@ $B living   $INSTALL $OUT
 $B audio    $INSTALL/assets/private/audio $OUT
 $B ambience $INSTALL/assets/private/audio $OUT
 $B trickguide $INSTALL $OUT
+$B catalog  $INSTALL $OUT
 ```
 
 | Line | What it makes |
@@ -135,12 +144,30 @@ $B trickguide $INSTALL $OUT
 | `audio` | the board's own sounds |
 | `ambience` | the ambient city sounds |
 | `trickguide` | the Trick Guide's 3D demo: its set and the skater's trick animations |
+| `catalog` | the Object Dropper's objects and the skate.Park layouts. Without it the dropper and skate.Park don't work |
 
 When it's done, `../game_data/SKATEVITA` holds about 1 GB of `.pak` files (and matching `.idx` files). That's your complete game data.
 
 ### Step 6 : copy it to your Vita
 
 Copy the whole `../game_data/SKATEVITA` folder onto your console at `ux0:data/SKATEVITA/`. Install the game's VPK if you haven't already.
+
+### Already made your game data with an earlier version?
+
+You don't have to start over. Update the project and rebuild what changed, using the same `INSTALL`, `OUT` and `B` as in steps 3 and 5:
+
+```sh
+git pull
+git -C ../skate-3-rust-engine fetch origin pull/52/head
+git -C ../skate-3-rust-engine checkout 8df32c51
+cargo build --release -p vita-bake
+python3 tools/prepare_object_catalog.py --game ../game_data/skate3_x360 --assets $INSTALL/assets
+$B maps     $INSTALL $OUT
+$B district $INSTALL $OUT DownTown
+$B catalog  $INSTALL $OUT
+```
+
+Then copy `catalog.pak`, `catalog.pak.idx`, `district_DownTown.pak` and every `map_*.pak` to `ux0:data/SKATEVITA/`. The game runs with older packs but without these fixes, and without any error: with old `map_*.pak` files the Object Dropper doesn't recognise skate.Parks, with an old `district_DownTown.pak` DownTown keeps two invisible walls (one at the Kube Tower), and with an old `catalog.pak` PCU Training - Basic doesn't change the park. If you never ran the catalogue step, you didn't have the dropper or skate.Park before: this adds them.
 
 ## Building from source
 

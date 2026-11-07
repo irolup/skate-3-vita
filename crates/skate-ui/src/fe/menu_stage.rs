@@ -259,6 +259,8 @@ pub struct MenuStage {
     movies: RetailMenuMovies,
     pub menus: RetailMenus,
     language: Arc<BTreeMap<String, String>>,
+    /// The set's shadow font, for the HUD phone's rows the Vita lays itself.
+    shadow_font: Option<crate::fe::apt_text::Font>,
     sub_options: Arc<Vec<SubOptionRow>>,
     /// Retail screens in id order (menu tables).
     screens: Vec<FeScreen>,
@@ -532,6 +534,7 @@ impl MenuStage {
         customize(Customize { data: &mut data, sub_options: &mut sub_options, settings_titles: &mut settings_titles });
         let mut menus = RetailMenus::new(data, loaded);
         let language = movies.language();
+        let shadow_font = movies.shadow_font();
         let sub_options = Arc::new(sub_options);
         let mut fe = front_end(&menus, &language, &sub_options, CrossbarState::default());
         let mut stage = Stage::new(&fe)?;
@@ -675,6 +678,7 @@ impl MenuStage {
             movies,
             menus,
             language,
+            shadow_font,
             sub_options,
             screens: tables.as_ref().map(|t| t.screens.clone()).unwrap_or_default(),
             crossbar: CrossbarState::default(),
@@ -2273,6 +2277,12 @@ impl MenuStage {
             });
         }
         draws
+    }
+
+    /// The HUD phone's skate.Park rows: the font and the strings of Edit Park and Reset All Props.
+    pub fn phone_text(&self) -> Option<(&crate::fe::apt_text::Font, &str, &str)> {
+        let text = |key: &str| self.language.get(key).map(String::as_str);
+        Some((self.shadow_font.as_ref()?, text("ID_PHONELIST_EDIT_PARK")?, text("ID_PHONELIST_RESET_ALL_OBJECTS")?))
     }
 
     /// A Challenge Map location's teleport: its map and locator matrix (rows right, up, forward, translation).

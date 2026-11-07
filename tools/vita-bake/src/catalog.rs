@@ -173,6 +173,7 @@ pub fn bake(install: &Path, out: &Path) -> Result<(), String> {
             park_starts.insert(map.to_owned(), start);
         }
     }
+    let park_worlds = park_worlds(install, &catalog)?;
     let slim = serde_json::json!({
         "version": 1,
         "parts": parts,
@@ -184,6 +185,7 @@ pub fn bake(install: &Path, out: &Path) -> Result<(), String> {
         "marker_colours": marker_colours,
         "park_starts": park_starts,
         "park_lots": catalog["park_lots"],
+        "park_worlds": park_worlds,
     });
     // The templates' stock layouts (Park Setup, and the frame a saved park is written in).
     let stock = install.join("assets").join("private/stock/data/skatepark");
@@ -198,6 +200,13 @@ pub fn bake(install: &Path, out: &Path) -> Result<(), String> {
         parks += 1;
     }
     println!("  park templates: {parks} stock layouts");
+    for layout in park_worlds.iter().filter_map(|w| w["layout"].as_str()) {
+        let path = format!("{DIR}/parks/{layout}.park");
+        if !files.iter().any(|f| f.path == path) {
+            let bytes = std::fs::read(stock.join(format!("{layout}.park"))).map_err(|e| format!("{layout}.park: {e}"))?;
+            files.push(File { path, bytes });
+        }
+    }
     files.push(File { path: format!("{DIR}/catalog.json"), bytes: serde_json::to_vec(&slim).map_err(|e| e.to_string())? });
 
     std::fs::create_dir_all(out).map_err(|e| e.to_string())?;
@@ -211,6 +220,33 @@ pub fn bake(install: &Path, out: &Path) -> Result<(), String> {
 
 /// The markers the model-less items name: per indicator row its spline (power-basis segments) and ribbon style; and
 /// the marker colours' textures, added to `files`. Empty without the visual indicators export.
+/// The Challenge Map's skate.Park rows whose stock layout no lot's template lays (PCU Training - Basic).
+fn park_worlds(install: &Path, catalog: &serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let private = install.join("assets").join("private");
+    let read_json = |path: &Path| -> Result<serde_json::Value, String> {
+        serde_json::from_slice(&std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?).map_err(|e| format!("{}: {e}", path.display()))
+    };
+    let (worlds, teleports) = match (read_json(&private.join("park-layouts/worlds.json")), read_json(&private.join("teleports.json"))) {
+        (Ok(worlds), Ok(teleports)) => (worlds, teleports),
+        // An older install: the catalogue bakes without them, and those Challenge Map rows only respawn.
+        (Err(e), _) | (_, Err(e)) => {
+            println!("  (no challenge map layouts: {e})");
+            return Ok(Vec::new());
+        }
+    };
+    let templates: Vec<&str> = catalog["park_lots"].as_array().into_iter().flatten().flat_map(|l| l["templates"].as_array().into_iter().flatten()).filter_map(|t| t["layout"].as_str()).collect();
+    let mut rows = Vec::new();
+    for (world, row) in worlds["worlds"].as_object().into_iter().flatten() {
+        let layout = row["layout"].as_str().unwrap_or_default();
+        let listed = teleports["destinations"].as_array().into_iter().flatten().any(|d| d["world"].as_str() == Some(world));
+        if listed && !templates.contains(&layout) {
+            rows.push(serde_json::json!({ "world": world, "layout": layout }));
+        }
+    }
+    println!("  challenge map's stock layouts: {rows:?}");
+    Ok(rows)
+}
+
 fn markers(install: &Path, items: &[serde_json::Value], files: &mut Vec<File>) -> Result<(serde_json::Value, serde_json::Value), String> {
     let assets = install.join("assets");
     let Ok(bytes) = std::fs::read(assets.join(INDICATORS)) else {

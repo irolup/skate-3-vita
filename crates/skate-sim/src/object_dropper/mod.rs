@@ -30,7 +30,7 @@ pub mod snap;
 pub mod tuning;
 pub mod world;
 
-use glam::{Quat, Vec3};
+use glam::{Quat, Vec2, Vec3};
 
 pub use browse::{Browse, Listing};
 pub use budget::{Limits, Meter, Usage};
@@ -148,6 +148,9 @@ pub struct Editor {
     /// it turns but does not move); None: it follows the cursor (the park editor, or ours with the "free camera"
     /// setting).
     pub fixed_eye: Option<Vec3>,
+    /// Where the eye got to (`82886500` sweeps its moves against the world); None until its first update, and after a
+    /// jump, which is not swept (retail's flag `+0x89`, set by the camera's reset).
+    eye_at: Option<Vec3>,
     /// The catalogue's cursor; its listing comes from `Catalog::listing` ([`Editor::set_listing`]).
     pub browse: Browse,
     /// Fine tune shown on (LT in Manipulate, park editor: `S+0x2CD`).
@@ -208,6 +211,7 @@ impl Editor {
             steps: 0,
             variant: Variant::Park,
             fixed_eye: None,
+            eye_at: None,
             browse: Browse::default(),
             fine_tune: false,
             duplicate: false,
@@ -1185,7 +1189,17 @@ impl Editor {
                 let still = EditorInput { left: [0.0; 4], ..input };
                 self.cursor.update(&self.tuning, &mode, &self.camera, &still, self.cursor_speed, self.locks, ground);
             }
-            _ => self.cursor.update(&self.tuning, &mode, &self.camera, &input, self.cursor_speed, self.locks, ground),
+            _ => {
+                let rest = self.cursor.update(&self.tuning, &mode, &self.camera, &input, self.cursor_speed, self.locks, ground);
+                // With an item in hand the camera keeps its distance (retail's held camera orbits at the zoom).
+                if self.held.is_none() && rest != 0.0 {
+                    // Straight up or down (owner, device: along its line to the cursor it also went forward): the eye keeps
+                    // its place over the ground, and the cursor, where its look meets the ground, comes along under it.
+                    let reach = self.camera.reach(&self.tuning);
+                    self.camera.move_height(rest);
+                    self.cursor.position += self.camera.ground_forward() * (self.camera.reach(&self.tuning) - reach);
+                }
+            }
         }
         if let Some(eye) = self.fixed_eye {
             self.aim(eye, ground);
@@ -1202,7 +1216,67 @@ impl Editor {
             self.was_advanced = input.advanced;
             self.snapped = self.solve_snap(input.advanced, ground);
         }
+        self.sweep_eye(ground);
         events
+    }
+
+    /// Moves the eye to where the camera wants it, as retail's `82886500`: a clear move goes, whatever stands between the
+    /// eye and the cursor. A stopped one with an item in hand comes in along the line to the cursor (retail's camera mode
+    /// `**(+0x1670)`, the cursor's held item); with none it slides along the surface. If neither is clear the eye stays.
+    ///
+    /// NOT RETAIL: a floor or a roof in the way, or anything in the way of a move mostly up or down, does not hold the eye:
+    /// it goes to the spot it wants, or as near as the cursor sees along the line to it (owner, device: above a roof, with
+    /// the cursor down on the ground past it, the camera never came back down). Walls still stop a move along the ground.
+    fn sweep_eye(&mut self, ground: &dyn Ground) {
+        if self.fixed_eye.is_some() {
+            return;
+        }
+        let want = Self::out_of_the_ground(self.camera.eye(&self.tuning, self.cursor.position), ground);
+        // From clear of the surface the cursor stands on: a line starting against it counts as stopped at once.
+        let cursor = self.cursor.position + Vec3::Y * (camera::SWEEP_RADIUS + 0.1);
+        let seen = ground.sweep(cursor, want);
+        let Some(at) = self.eye_at else {
+            // Where it starts is not a move: it starts on this side of whatever stands between the cursor and that spot (a
+            // skater by a wall; NOT RETAIL: retail starts from the game camera's position, ours from the cursor).
+            self.eye_at = Some(seen.map_or(want, |(f, _)| cursor.lerp(want, f)));
+            return;
+        };
+        if (want - at).length_squared() < 1e-8 {
+            return;
+        }
+        let Some((_, normal)) = ground.sweep(at, want) else {
+            self.eye_at = Some(want);
+            return;
+        };
+        let to = want - at;
+        let going_up_or_down = to.y.abs() > Vec2::new(to.x, to.z).length();
+        if normal.y.abs() > camera::FLOOR_NORMAL || going_up_or_down {
+            self.eye_at = Some(seen.map_or(want, |(f, _)| cursor.lerp(want, f)));
+            return;
+        }
+        let instead = if self.held.is_some() {
+            seen.map(|(f, _)| cursor.lerp(want, f))
+        } else {
+            Some(want - normal * (want - at).dot(normal))
+        };
+        // Held sideways by a wall, it still goes straight up or down to the height it wants, where that is clear.
+        let level = Vec3::new(at.x, want.y, at.z);
+        if let Some(instead) = instead.into_iter().chain([level]).find(|i| ground.sweep(at, *i).is_none()) {
+            self.eye_at = Some(instead);
+        }
+    }
+
+    /// The spot the eye wants, on top of the ground if it is inside it: it stands above the cursor's ground, and the ground
+    /// under the eye can be higher (owner, device: lowered beside a slope, the camera went a little underground). Inside the
+    /// ground nothing faces it from below, and the surface is what faces it from above.
+    fn out_of_the_ground(want: Vec3, ground: &dyn Ground) -> Vec3 {
+        // A little only: a surface higher than this over a spot with no floor is a ledge, off the map's ground.
+        const LOOK: f32 = 3.0;
+        if ground.sweep(want, want - Vec3::Y * 100.0).is_some() {
+            return want;
+        }
+        let above = want + Vec3::Y * LOOK;
+        ground.sweep(above, want).map_or(want, |(f, _)| above.lerp(want, f))
     }
 
     /// The held piece's snapped origin pose (`snap`), None when nothing qualifies, snapping is off, or the held item
@@ -1261,7 +1335,7 @@ impl Editor {
 
     /// Where the camera is and a point it looks at.
     pub fn view(&self) -> (Vec3, Vec3) {
-        let eye = self.eye();
+        let eye = self.fixed_eye.or(self.eye_at).unwrap_or_else(|| self.eye());
         (eye, eye + self.camera.look())
     }
 
@@ -1373,6 +1447,126 @@ mod tests {
     }
 
     #[test]
+    fn a_wall_stops_the_cameras_move_and_it_goes_on_when_clear() {
+        /// A wall across x = 0 facing +x, for moves that cross it from its front.
+        struct Wall;
+        impl Ground for Wall {
+            fn below(&self, _: f32, _: f32, _: f32) -> Option<f32> {
+                Some(0.0)
+            }
+            fn sweep(&self, from: Vec3, to: Vec3) -> Option<(f32, Vec3)> {
+                (from.x > 0.0 && to.x <= 0.0).then(|| (from.x / (from.x - to.x), Vec3::X))
+            }
+        }
+        let mut editor = Editor::open(tuning(), catalog(), Scene::default(), Vec3::new(20.0, 0.0, 0.0), std::f32::consts::FRAC_PI_2);
+        editor.update(&[0.0; 24], &Wall);
+        let start = editor.view().0;
+        assert!(start.x > 0.0, "starts in front of the wall: {start}");
+        // The cursor walks through the wall: the eye slides along it, never through.
+        for step in 1..200 {
+            editor.cursor.position = Vec3::new(20.0 - step as f32 * 0.5, 0.0, step as f32 * 0.1);
+            editor.update(&[0.0; 24], &Wall);
+            assert!(editor.view().0.x > 0.0, "the eye stays in front at step {step}");
+        }
+        let slid = editor.view().0;
+        assert!(slid.z > start.z + 1.0, "it slid along the wall: {start} to {slid}");
+        // The cursor comes back: a clear move goes, the eye is back where the camera wants it.
+        editor.cursor.position = Vec3::new(30.0, 0.0, 0.0);
+        editor.update(&[0.0; 24], &Wall);
+        assert!((editor.view().0 - editor.eye()).length() < 1e-4);
+    }
+
+    /// Opened with the camera's spot behind a wall: it starts on the cursor's side.
+    #[test]
+    fn the_camera_starts_on_the_cursors_side_of_a_wall() {
+        struct Wall;
+        impl Ground for Wall {
+            fn below(&self, _: f32, _: f32, _: f32) -> Option<f32> {
+                Some(0.0)
+            }
+            fn sweep(&self, from: Vec3, to: Vec3) -> Option<(f32, Vec3)> {
+                (from.x > 0.0 && to.x <= 0.0).then(|| (from.x / (from.x - to.x), Vec3::X))
+            }
+        }
+        let mut editor = Editor::open(tuning(), catalog(), Scene::default(), Vec3::new(1.0, 0.0, 0.0), -std::f32::consts::FRAC_PI_2);
+        assert!(editor.eye().x < 0.0, "the spot it wants is behind the wall: {}", editor.eye());
+        editor.update(&[0.0; 24], &Wall);
+        assert!(editor.view().0.x >= 0.0, "it starts in front: {}", editor.view().0);
+    }
+
+    /// Off the edge of something taller than a step: the cursor comes down to the ground below, and the camera with it.
+    #[test]
+    fn the_cursor_comes_down_off_something_tall() {
+        struct Tower;
+        impl Ground for Tower {
+            // A tower 30 m high over x < 10, the ground at 0 beyond it.
+            fn below(&self, x: f32, _: f32, from: f32) -> Option<f32> {
+                Some(if x < 10.0 && from >= 30.0 { 30.0 } else { 0.0 })
+            }
+        }
+        let mut editor = Editor::open(tuning(), catalog(), Scene::default(), Vec3::new(9.5, 30.0, 0.0), std::f32::consts::FRAC_PI_2);
+        editor.update(&[0.0; 24], &Tower);
+        let high = editor.view().0.y;
+        assert!((editor.cursor.position.y - 30.0).abs() < 1e-3, "on top");
+        // Off the far side.
+        editor.cursor.position.x = 10.5;
+        editor.update(&[0.0; 24], &Tower);
+        assert!(editor.cursor.position.y.abs() < 1e-3, "on the ground: {}", editor.cursor.position);
+        assert!(editor.view().0.y < high - 20.0, "the camera came down with it");
+    }
+
+    /// Above a roof with the cursor on the ground past its edge: the camera comes down to where it wants to be. A wall in
+    /// the same place holds it (the wall test above).
+    #[test]
+    fn a_roof_does_not_hold_the_camera_when_the_cursor_sees_the_spot() {
+        /// A roof at y 10 and a floor at y 0, met from above.
+        struct Roof(std::cell::Cell<f32>);
+        impl Ground for Roof {
+            fn below(&self, _: f32, _: f32, _: f32) -> Option<f32> {
+                Some(self.0.get())
+            }
+            fn sweep(&self, from: Vec3, to: Vec3) -> Option<(f32, Vec3)> {
+                [10.0, 0.0].into_iter().find(|h| from.y > *h && to.y <= *h).map(|h| ((from.y - h) / (from.y - to.y), Vec3::Y))
+            }
+        }
+        let roof = Roof(std::cell::Cell::new(20.0));
+        let mut editor = Editor::open(tuning(), catalog(), Scene::default(), Vec3::new(0.0, 20.0, 0.0), 0.0);
+        editor.update(&[0.0; 24], &roof);
+        assert!(editor.view().0.y > 10.0);
+        roof.0.set(0.0);
+        editor.update(&[0.0; 24], &roof);
+        assert!(editor.cursor.position.y.abs() < 1e-5);
+        assert!((editor.view().0 - editor.eye()).length() < 1e-3, "down with the cursor: {} wants {}", editor.view().0, editor.eye());
+    }
+
+    /// A clear move goes even with a surface between the eye and the cursor (`82886500` does not pull the eye in for it):
+    /// the camera comes back down from high up with the cursor, the owner's case on the device.
+    #[test]
+    fn a_clear_move_goes_with_a_wall_before_the_cursor() {
+        /// The ground at the height it holds.
+        struct Roof(std::cell::Cell<f32>);
+        impl Ground for Roof {
+            fn below(&self, _: f32, _: f32, _: f32) -> Option<f32> {
+                Some(self.0.get())
+            }
+            // A roof at y 10, met from below by a line from the cursor to the eye; moves above it are clear.
+            fn sweep(&self, from: Vec3, to: Vec3) -> Option<(f32, Vec3)> {
+                (from.y < 10.0 && to.y >= 10.0).then(|| ((10.0 - from.y) / (to.y - from.y), Vec3::NEG_Y))
+            }
+        }
+        let roof = Roof(std::cell::Cell::new(20.0));
+        let mut editor = Editor::open(tuning(), catalog(), Scene::default(), Vec3::new(0.0, 20.0, 0.0), 0.0);
+        editor.update(&[0.0; 24], &roof);
+        let high = editor.view().0;
+        assert!(high.y > 10.0);
+        // The cursor comes down; the eye's move, all of it above the roof, is stopped by nothing.
+        roof.0.set(12.0);
+        editor.update(&[0.0; 24], &roof);
+        assert!((editor.cursor.position.y - 12.0).abs() < 1e-5);
+        assert!((editor.view().0.y - (high.y - 8.0)).abs() < 1e-3, "the camera came down with the cursor: {} from {}", editor.view().0, high);
+    }
+
+    #[test]
     fn stick_moves_the_cursor_on_the_ground_relative_to_the_camera() {
         let mut editor = Editor::open(tuning(), catalog(), Scene::default(), Vec3::new(0.0, 2.0, 0.0), 0.0);
         let forward = slots(|s| s[18] = 1.0);
@@ -1393,6 +1587,131 @@ mod tests {
         fn below(&self, _x: f32, _z: f32, from: f32) -> Option<f32> {
             Some(if from >= 1.5 { 1.5 } else { 0.0 })
         }
+    }
+
+    /// On the ground with the camera above it (owner, device: the camera could not come down): D-pad Down brings the camera
+    /// low over the cursor, which stays on the ground; D-pad Up takes it back, and only then lifts the cursor.
+    #[test]
+    fn down_on_the_ground_lowers_the_camera_and_up_brings_it_back() {
+        let mut editor = Editor::open(tuning(), catalog(), Scene::default(), Vec3::ZERO, 0.0);
+        settle(&mut editor);
+        let high = editor.view().0;
+        let start = high.y;
+        assert!(start > 2.0, "{start}");
+        let down = slots(|s| s[1] = 1.0);
+        for _ in 0..600 {
+            editor.update(&down, &Flat(0.0));
+            let eye = editor.view().0;
+            assert!((eye.x - high.x).abs() < 1e-3 && (eye.z - high.z).abs() < 1e-3, "straight down: {eye} from {high}");
+        }
+        assert!(editor.cursor.position.y.abs() < 1e-5, "the cursor stays on the ground: {}", editor.cursor.position);
+        let low = editor.view().0.y;
+        assert!((low - 0.8).abs() < 0.01, "down to just over the ground: {low}");
+        let (eye, target) = editor.view();
+        assert!((editor.cursor.position - eye).normalize().dot((target - eye).normalize()) > 0.999, "the cursor stays in the middle of the screen");
+        let up = slots(|s| s[0] = 1.0);
+        for _ in 0..600 {
+            editor.update(&up, &Flat(0.0));
+            if editor.camera.lowered_from == 0.0 {
+                break;
+            }
+            assert_eq!(editor.cursor.lift, 0.0, "the camera goes back first");
+        }
+        assert!(editor.camera.lowered_from == 0.0, "it went back");
+        assert!((editor.camera.height() - start).abs() < 1e-3, "to where it was: {} from {start}", editor.camera.height());
+        assert!((editor.view().0 - high).length() < 1e-2, "straight back up: {} from {high}", editor.view().0);
+        for _ in 0..30 {
+            editor.update(&up, &Flat(0.0));
+        }
+        assert!(editor.cursor.lift > 0.0, "then the cursor lifts");
+    }
+
+    /// Pressed down through a piece, then off its edge onto lower ground: the cursor is on the ground, not as far under it as
+    /// it was under the piece (owner, device: a little underground).
+    #[test]
+    fn off_a_piece_with_down_pressed_the_cursor_stays_out_of_the_ground() {
+        struct Piece;
+        impl Ground for Piece {
+            // A piece 6 m high over x < 10, the map's ground at 0.
+            fn below(&self, x: f32, _: f32, from: f32) -> Option<f32> {
+                Some(if x < 10.0 && from >= 6.0 { 6.0 } else { 0.0 })
+            }
+            fn floor_below(&self, _: f32, _: f32, _: f32) -> Option<f32> {
+                Some(0.0)
+            }
+        }
+        let mut editor = Editor::open(tuning(), catalog(), Scene::default(), Vec3::new(9.0, 6.0, 0.0), 0.0);
+        settle(&mut editor);
+        let down = slots(|s| s[1] = 1.0);
+        for _ in 0..600 {
+            editor.update(&down, &Piece);
+        }
+        assert!(editor.cursor.position.y.abs() < 1e-4, "down through the piece to the ground: {}", editor.cursor.position);
+        assert!(editor.cursor.lift < -5.0, "{}", editor.cursor.lift);
+        editor.cursor.position.x = 11.0;
+        for _ in 0..3 {
+            editor.update(&[0.0; 24], &Piece);
+        }
+        assert!(editor.cursor.position.y.abs() < 1e-4, "still on the ground: {}", editor.cursor.position);
+    }
+
+    /// Lowered where the ground under the eye is higher than under the cursor: it stops on top of it.
+    #[test]
+    fn the_lowered_camera_stays_out_of_higher_ground() {
+        /// The cursor's ground at 0; a surface at y 2, facing up, that the eye's spot is under.
+        struct Rise;
+        impl Ground for Rise {
+            fn below(&self, _: f32, _: f32, _: f32) -> Option<f32> {
+                Some(0.0)
+            }
+            fn sweep(&self, from: Vec3, to: Vec3) -> Option<(f32, Vec3)> {
+                (from.y > 2.0 && to.y <= 2.0).then(|| ((from.y - 2.0) / (from.y - to.y), Vec3::Y))
+            }
+        }
+        let mut editor = Editor::open(tuning(), catalog(), Scene::default(), Vec3::ZERO, 0.0);
+        settle(&mut editor);
+        let down = slots(|s| s[1] = 1.0);
+        for _ in 0..600 {
+            editor.update(&down, &Rise);
+        }
+        assert!(editor.camera.height() < 1.0, "lowered: {}", editor.camera.height());
+        assert!(editor.view().0.y >= 2.0 - 1e-3, "on top of it: {}", editor.view().0);
+    }
+
+    /// With an item in hand the camera keeps its distance.
+    #[test]
+    fn down_on_the_ground_with_an_item_leaves_the_camera() {
+        let mut editor = Editor::open(tuning(), catalog(), Scene::default(), Vec3::ZERO, 0.0);
+        settle(&mut editor);
+        editor.held = Some(Held { item: String::new(), template: String::new(), rotation: Quat::IDENTITY, source: None, pivot: Vec3::ZERO, tint: 0, others: Vec::new() });
+        editor.mode = Mode::Manipulate;
+        let height = editor.camera.height();
+        let down = slots(|s| s[1] = 1.0);
+        for _ in 0..120 {
+            editor.update(&down, &Flat(0.0));
+        }
+        assert!((editor.camera.height() - height).abs() < 1e-5);
+    }
+
+    /// Pieces stacked over the map's ground: D-pad Down goes through them to the ground, and no further.
+    #[test]
+    fn down_goes_through_pieces_to_the_map_and_no_further() {
+        struct Stack;
+        impl Ground for Stack {
+            fn below(&self, _: f32, _: f32, from: f32) -> Option<f32> {
+                [20.0, 10.0, 0.0, -4.0].into_iter().find(|h| from >= *h)
+            }
+            fn floor_below(&self, _: f32, _: f32, _: f32) -> Option<f32> {
+                Some(0.0)
+            }
+        }
+        let mut editor = Editor::open(tuning(), catalog(), Scene::default(), Vec3::new(0.0, 20.0, 0.0), 0.0);
+        settle(&mut editor);
+        let down = slots(|s| s[1] = 1.0);
+        for _ in 0..600 {
+            editor.update(&down, &Stack);
+        }
+        assert!(editor.cursor.position.y.abs() < 1e-3, "{}", editor.cursor.position);
     }
 
     #[test]
@@ -1433,9 +1752,9 @@ mod tests {
         assert!(editor.cursor.lift >= lift);
         assert_eq!(editor.cursor.ramp, 0.3);
         let lift = editor.cursor.lift;
-        // A drop of more than 7 m is not followed.
+        // A drop of more than 7 m is followed too, the lift kept (owner, device: the cursor stayed up off a tall edge).
         editor.update(&slots(|s| s[16] = 1.0), &Flat(-10.0));
-        assert!((editor.cursor.position.y - (1.5 + lift)).abs() < 1e-5);
+        assert!((editor.cursor.position.y - (-10.0 + lift)).abs() < 1e-5);
     }
 
     /// The open world's camera (owner, on retail): it stands where it opens and looks around; the left stick and the

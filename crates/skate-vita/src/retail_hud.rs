@@ -266,6 +266,19 @@ impl Hud {
 }
 
 const MARKER: &str = "private/session-marker";
+/// The meshes of the Object Dropper row in the marker panel's `hud.json`: its B icon, its label's two font passes.
+const DROPPER_ROW: [usize; 3] = [6, 9, 10];
+/// The panel's frame in the same list: the bottom corners, and the two sides that stretch between the corners.
+const PANEL_BOTTOM: [usize; 2] = [3, 4];
+const PANEL_SIDES: [usize; 2] = [2, 5];
+/// A panel row's label as the data lays it: the font height, where a row's text starts (the B row's; the foreground pass
+/// one to the right, as native shadow text), the fuller rows' two passes (their colours), and the next row down.
+const ROW_HEIGHT: f32 = 19.301_78;
+const ROW_TEXT: [f32; 2] = [158.0, 141.0];
+const ROW_PASSES: [usize; 2] = [11, 12];
+const ROW_STEP: f32 = 38.0;
+/// The B icon's art in its quad: the centre and side of the Y row's icon, one row down.
+const ICON: [f32; 3] = [122.5, 191.5, 25.0];
 
 #[derive(serde::Deserialize)]
 struct MarkerManifest {
@@ -297,6 +310,10 @@ struct MarkerVertex {
 /// plays while a return is held.
 pub struct Marker {
     draws: Vec<apt_scene::Draw>,
+    /// The panel in a skate.Park (retail `hudphonelist`: Edit Park, then Reset All Props on Y), once the menus' font is in.
+    park_draws: Option<Vec<apt_scene::Draw>>,
+    /// The Object Dropper is installed: the row works.
+    dropper_row: bool,
     noise: skate_sim::DissolveNoise,
     dissolve: vita_render::apt::Dissolve,
     clock: Instant,
@@ -323,24 +340,29 @@ impl Marker {
         }
         apt.add_texture("white", 1, 1, &[255; 4]);
         let linear = |c: f32| c.max(0.0).powf(2.2);
+        // The Object Dropper row (its B icon, then its label's two font passes) is dimmed in the data, which predates
+        // the dropper. Retail's `hudphonelist` lights it when the dropper can open: here, when its catalogue is installed.
+        let dropper_row = screen_present(skate_sim::object_dropper::world::CATALOG);
         let draws = hud
             .meshes
             .iter()
-            .map(|m| {
+            .enumerate()
+            .map(|(i, m)| {
                 let texture = m.texture.and_then(|i| keys.get(i)).map_or_else(|| "white".to_owned(), |(k, _)| k.clone());
+                let alpha = if dropper_row && DROPPER_ROW.contains(&i) { 1.0 } else { m.color[3] };
                 apt_scene::Draw {
                     texture,
                     fill: apt_scene::Fill::TextureClamped,
                     vertices: m.vertices.iter().map(|v| apt_scene::Vertex { position: v.position, uv: v.uv }).collect(),
                     // The reference's ColorMaterial colour is sRGB; the shader works in linear light.
-                    multiply: [linear(m.color[0]), linear(m.color[1]), linear(m.color[2]), m.color[3]],
+                    multiply: [linear(m.color[0]), linear(m.color[1]), linear(m.color[2]), alpha],
                     add: [0.0; 4],
                 }
             })
             .collect();
         let dissolve = vita_render::apt::Dissolve::new(&skate_sim::DissolveNoise::texture());
         println!("session marker overlay: {} meshes, {} textures", hud.meshes.len(), hud.textures.len());
-        Ok(Self { draws, noise: skate_sim::DissolveNoise::default(), dissolve, clock: Instant::now(), ui_time: 0.0 })
+        Ok(Self { draws, park_draws: None, dropper_row, noise: skate_sim::DissolveNoise::default(), dissolve, clock: Instant::now(), ui_time: 0.0 })
     }
 
     /// The noise stream runs on the UI clock, 1/60 s a step, whether shown or not.
@@ -361,11 +383,42 @@ impl Marker {
         }
     }
 
-    /// The prompt panel while LB is held.
-    pub fn draw_panel(&self, apt: &mut Apt, view: &skate_sim::MarkerView) {
+    /// The prompt panel while LB is held; in a skate.Park with the Object Dropper, its park rows when they are laid.
+    pub fn draw_panel(&self, apt: &mut Apt, view: &skate_sim::MarkerView, in_park: bool) {
         if view.visible {
-            apt.draw(&self.draws);
+            match self.park_draws.as_ref().filter(|_| in_park) {
+                Some(park) => apt.draw(park),
+                None => apt.draw(&self.draws),
+            }
         }
+    }
+
+    /// Lays the panel's skate.Park rows from the menus' font and strings, once. NOT RETAIL YET: the panel's rows stand in
+    /// for the phone movie; the Y row's spacing is the rows' own, its icon the Vita's Triangle.
+    pub fn lay_park_rows(&mut self, text: Option<(&skate_ui::fe::apt_text::Font, &str, &str)>) {
+        let (Some((font, edit, reset)), true, None) = (text, self.dropper_row, &self.park_draws) else { return };
+        let Some(foreground) = font.foreground.as_deref() else { return };
+        let mut draws = self.draws.clone();
+        for &i in &PANEL_BOTTOM {
+            draws[i].vertices.iter_mut().for_each(|v| v.position[1] += ROW_STEP);
+        }
+        for &i in &PANEL_SIDES {
+            let bottom = draws[i].vertices.iter().map(|v| v.position[1]).fold(f32::MIN, f32::max);
+            draws[i].vertices.iter_mut().filter(|v| v.position[1] == bottom).for_each(|v| v.position[1] += ROW_STEP);
+        }
+        // The B row says Edit Park, in the fuller rows' look; the row below it is new, with the icon first.
+        let row = |pass: usize, text: &str, y: f32| {
+            let (font, shift) = if pass == 0 { (font, 0.0) } else { (foreground, 1.0) };
+            let mut draw = self.draws[ROW_PASSES[pass]].clone();
+            draw.vertices = apt_scene::label(font, text, ROW_TEXT[0] + shift, y, ROW_HEIGHT);
+            draw
+        };
+        draws[DROPPER_ROW[1]] = row(0, edit, ROW_TEXT[1]);
+        draws[DROPPER_ROW[2]] = row(1, edit, ROW_TEXT[1]);
+        draws.push(crate::button_icons::draw(crate::button_icons::Icon::Triangle, ICON[0], ICON[1], ICON[2]));
+        draws.push(row(0, reset, ROW_TEXT[1] + ROW_STEP));
+        draws.push(row(1, reset, ROW_TEXT[1] + ROW_STEP));
+        self.park_draws = Some(draws);
     }
 }
 

@@ -348,6 +348,11 @@ impl RetailMenuMovies {
     }
 
     /// The shared language table (string id -> text).
+    /// The set's shadow font (`Futura Shadow`, with its futuraheavy foreground), for text the host lays itself.
+    pub fn shadow_font(&self) -> Option<crate::fe::apt_text::Font> {
+        self.text.as_ref()?.named("futura shadow").cloned()
+    }
+
     pub fn language(&self) -> std::sync::Arc<BTreeMap<String, String>> {
         match &self.text {
             Some(text) => std::sync::Arc::clone(text.language()),

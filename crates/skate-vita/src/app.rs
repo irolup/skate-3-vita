@@ -730,7 +730,21 @@ pub fn run() -> ! {
                 // A Challenge Map location: here, or once its world has loaded (the sim thread waits for the load). A
                 // skate.park's location starts the skater at the park's spawner instead (its locator is the empty park's
                 // ground, inside the layout's pieces; owner's retail check).
-                for (map, matrix) in update.teleports {
+                for (key, map, matrix) in update.teleports {
+                    // A skate.Park row is a layout: taken on the map it is on, the layout changes (the map need not
+                    // load, and the skater only going back to the spawner kept the park as it was). Over unsaved edits
+                    // it asks first, as New Park does. A Fullpark is what a freshly loaded park already is.
+                    if let Some(row) = SKATE_PARKS.contains(&map.as_str()).then(|| crate::parks::stock_row(&key, &map)).flatten() {
+                        if s.park_unsaved && s.in_skate_park {
+                            template_to_load = Some(row);
+                            fe_menus.ask_park_dirty();
+                            continue;
+                        }
+                        if WORLDS[s.world_loaded] == map || !key.ends_with("_full") {
+                            left |= load_template(&row, &mut s, &mut menus, &mut screen, &mut settings, &mut fe_menus, &mut changed);
+                            continue;
+                        }
+                    }
                     left = true;
                     fe_menus.close();
                     match WORLDS.iter().position(|w| *w == map) {
@@ -1538,14 +1552,11 @@ pub fn run() -> ! {
                         }
                     }
                 }
-                if let Some(m) = &marker {
-                    m.draw_panel(&mut apt, &marker_view);
-                }
-                // The phone's dropper rows (retail `hudphonelist`: B Object Dropper / Edit Park, Y Reset All Props in a
-                // park). NOT RETAIL YET: plain text under the marker panel until the phone movie runs on the Vita.
-                if marker_view.visible && crate::retail_hud::screen_present(skate_sim::object_dropper::world::CATALOG) {
-                    let rows = if in_skate_park { "B  Edit Park     Y  Reset All Props" } else { "B  Object Dropper" };
-                    gfx.text(12.0, 470.0, 1.0, WHITE, rows);
+                if let Some(m) = &mut marker {
+                    if in_skate_park && marker_view.visible {
+                        m.lay_park_rows(fe_menus.phone_text());
+                    }
+                    m.draw_panel(&mut apt, &marker_view, in_skate_park);
                 }
             }
             // The Object Dropper's status line when its retail screen is not in this install.

@@ -233,8 +233,9 @@ pub struct ClusterLoc {
     one_sided: bool,
 }
 
-/// Walks the archive like `visit_clusters`, but hands out each cluster's location along
-/// with its decoded triangles, so a caller can keep the location and decode it again.
+/// Walks the archive like `visit_clusters` (volumes skipped too: a district's collision is
+/// built from this), but hands out each cluster's location along with its decoded
+/// triangles, so a caller can keep the location and decode it again.
 pub fn locate_clusters(
     data: &[u8],
     mut visit: impl FnMut(ClusterLoc, &[RetailTriangle]) -> Result<(), String>,
@@ -261,6 +262,7 @@ pub fn locate_clusters(
         let n = be32(mesh, 64)? as usize;
         let granularity = f32::from_bits(be32(mesh, 56)?);
         let one_sided = be16(mesh, 60)? & 0x10 != 0;
+        let mut clusters = Vec::with_capacity(n);
         for i in 0..n {
             let offset = be32(mesh, table + i * 4)? as usize;
             let csize = be16(mesh, offset + 8)? as usize;
@@ -272,9 +274,14 @@ pub fn locate_clusters(
                 surface_width: mesh[63],
                 one_sided,
             };
-            let triangles = decode_cluster(span(mesh, offset, csize)?, granularity, mesh[62], mesh[63], one_sided)?;
+            clusters.push((loc, decode_cluster(span(mesh, offset, csize)?, granularity, mesh[62], mesh[63], one_sided)?));
+        }
+        if !clusters.iter().flat_map(|(_, triangles)| triangles).any(|t| t.has_surface) {
+            continue; // volume, not collision (see visit_clusters)
+        }
+        for (loc, triangles) in &clusters {
             total += triangles.len();
-            visit(loc, &triangles)?;
+            visit(*loc, triangles)?;
         }
     }
     Ok(total)

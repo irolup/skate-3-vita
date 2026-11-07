@@ -22,6 +22,23 @@ impl Ground for PhysicsGround<'_> {
     fn below(&self, x: f32, z: f32, from: f32) -> Option<f32> {
         self.0.ground_below(x, z, from)
     }
+
+    /// In a park, the first of the map's own surfaces at or under the surface the cursor is over: it goes through what is
+    /// placed, whose bases are sunk below the ground, but not through the map (which has layers under its ground too; owner,
+    /// device).
+    fn floor_below(&self, x: f32, z: f32, at: f32) -> Option<f32> {
+        const REACH: f32 = 100.0;
+        if self.0.is_park() {
+            let from = at + super::camera::UNDER;
+            self.0.map_sweep([x, from, z], [x, from - REACH, z], 0.0).map(|(f, _)| from - REACH * f)
+        } else {
+            self.0.ground_below(x, z, at - super::camera::UNDER)
+        }
+    }
+
+    fn sweep(&self, from: Vec3, to: Vec3) -> Option<(f32, Vec3)> {
+        self.0.map_sweep(from.to_array(), to.to_array(), super::camera::SWEEP_RADIUS).map(|(f, n)| (f, Vec3::from(n)))
+    }
 }
 
 fn to_glam(t: &[f32; 12]) -> Affine3A {
@@ -110,6 +127,9 @@ pub struct Dropper {
     baseline: Vec<(u32, String, [f32; 12])>,
     /// Park Setup's lots and templates (`catalog.json` `park_lots`).
     pub lots: Vec<ParkLot>,
+    /// Stock layouts the Challenge Map names beyond the lots' templates: {world row: layout} (`catalog.json` `park_worlds`,
+    /// PCU Training - Basic).
+    pub stock_worlds: BTreeMap<String, String>,
     /// The template world the park started from (a `.park` header's origin): the map's Fullpark, or the layout laid
     /// over it last.
     pub origin: u64,
@@ -203,6 +223,12 @@ impl Dropper {
         }
         let scene = Scene::from_layout(pieces.clone());
         let lots = park_lots(&json["park_lots"]);
+        let stock_worlds = json["park_worlds"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|w| Some((w["world"].as_str()?.to_owned(), w["layout"].as_str()?.to_owned())))
+            .collect();
         // The map's Fullpark (Phase 2 bakes it in): its template's origin.
         let fullpark = physics.park_layout_name();
         let origin = lots
@@ -223,6 +249,7 @@ impl Dropper {
             checked: Vec::new(),
             baseline: pieces,
             lots,
+            stock_worlds,
             origin,
         })
     }
@@ -598,6 +625,9 @@ impl Dropper {
     /// A Park Setup template (`world`, its row's key) as `.park` bytes: its stock layout, or for a bare lot (an Empty
     /// without a file, retail lays nothing) no pieces, with the start and tail of its lot's Full layout.
     pub(crate) fn template_park(&self, world: &str, asset_root: &Path) -> Result<Vec<u8>, String> {
+        if let Some(layout) = self.stock_worlds.get(world) {
+            return skate_data::vfs::read(&asset_root.join(PARKS).join(format!("{layout}.park"))).map_err(|e| format!("{layout}: {e}"));
+        }
         let lot = self.lots.iter().find(|l| l.templates.iter().any(|t| t.world == world)).ok_or(format!("no template {world}"))?;
         let template = lot.templates.iter().find(|t| t.world == world).ok_or(format!("no template {world}"))?;
         if let Some(layout) = &template.layout {
@@ -1179,6 +1209,131 @@ mod tests {
             count.values().map(|(a, b)| a.min(b)).sum()
         };
         assert_eq!(kept, shared);
+    }
+
+    /// The Challenge Map's PCU Training - Basic over the Fullpark a StartPark pack holds, by its world row.
+    /// Data-gated: `SKATE3_ASSET_ROOT` and `SKATE3_CATALOG_PAK`.
+    #[test]
+    #[ignore = "needs the private install data and a baked catalogue"]
+    fn the_challenge_maps_basic_row_lays_its_layout() {
+        let assets = std::path::PathBuf::from(std::env::var_os("SKATE3_ASSET_ROOT").expect("SKATE3_ASSET_ROOT"));
+        crate::physics::dropped::mount_catalog(std::path::Path::new(&std::env::var_os("SKATE3_CATALOG_PAK").expect("SKATE3_CATALOG_PAK")), &assets);
+        let mut map = skate_data::skate_map::SkateMap::load(&assets.join("../maps/StartPark.skate")).unwrap();
+        map.extensions.push(crate::park_bake::bake(&assets, "Starter_Fullpark").unwrap().0);
+        let mut session = crate::live::Session::load_map(&assets, "Normal", Some(map)).unwrap();
+        let (kept, dropped, refused) = session.load_template("dist_startpark_progression").unwrap();
+        println!("Basic: kept {kept}, dropped {dropped}, refused {refused}");
+        assert!(kept > 0 && refused == 0);
+        let basic = session.dropper.as_ref().unwrap().scene().items.len();
+        let (kept, _, refused) = session.load_template("dist_startpark_full").unwrap();
+        println!("back to Full: kept {kept}, refused {refused}");
+        assert!(refused == 0);
+        assert_ne!(session.dropper.as_ref().unwrap().scene().items.len(), basic, "the two rows are different parks");
+    }
+
+    /// The park editor's camera stops at the map and ground, and passes the layout's pieces and what is placed: a line of
+    /// sight straight down over a Fullpark's pieces, and through a Mega ramp placed on open ground.
+    /// Data-gated: `SKATE3_ASSET_ROOT` and `SKATE3_CATALOG_PAK`.
+    #[test]
+    #[ignore = "needs the private install data and a baked catalogue"]
+    fn the_camera_stops_at_the_map_and_passes_what_is_placed() {
+        let assets = std::path::PathBuf::from(std::env::var_os("SKATE3_ASSET_ROOT").expect("SKATE3_ASSET_ROOT"));
+        crate::physics::dropped::mount_catalog(std::path::Path::new(&std::env::var_os("SKATE3_CATALOG_PAK").expect("SKATE3_CATALOG_PAK")), &assets);
+        let mut map = skate_data::skate_map::SkateMap::load(&assets.join("../maps/DownTownSkatePark.skate")).unwrap();
+        map.extensions.push(crate::park_bake::bake(&assets, "Downtown_Fullpark").unwrap().0);
+        let session = crate::live::Session::load_map(&assets, "Normal", Some(map)).unwrap();
+        let (mut stood_on, mut through) = (0, 0);
+        for (_, _, placement) in session.physics.park_layout() {
+            let (x, z) = (placement[9], placement[11]);
+            let top = placement[10] + 40.0;
+            // The whole world: the highest thing under the point, a piece where one stands.
+            let Some(highest) = session.physics.ground_below(x, z, top) else { continue };
+            // The map only: the ground, however high the piece.
+            let Some(fraction) = session.physics.map_sweep([x, top, z], [x, top - 60.0, z], 0.0).map(|h| h.0) else { continue };
+            let map_ground = top - 60.0 * fraction;
+            assert!(map_ground <= highest + 0.01, "the map's ground is not above the whole world's at ({x}, {z})");
+            if highest > map_ground + 0.5 {
+                through += 1;
+            } else {
+                stood_on += 1;
+            }
+        }
+        println!("pieces passed {through}, none over the ground {stood_on}");
+        assert!(through > 20, "the line of sight passes the layout's pieces ({through})");
+        // A surface met from behind does not stop it: from under the ground, going up.
+        let spawn = session.physics.park_layout()[0].2;
+        let (x, z) = (spawn[9], spawn[11]);
+        let top = spawn[10] + 40.0;
+        let ground = top - 60.0 * session.physics.map_sweep([x, top, z], [x, top - 60.0, z], 0.0).map(|h| h.0).unwrap();
+        assert_eq!(session.physics.map_sweep([x, ground - 1.0, z], [x, ground + 0.5, z], 0.0).map(|h| h.0), None);
+    }
+
+    /// Opened on top of something with lower ground ahead, driven off it, D-pad Down held: on all four parks' real maps the
+    /// cursor reaches the ground and the camera comes down to it, all but 1% at most (owner, device: it stayed up). A 40 x 40 grid of
+    /// starts.
+    /// Data-gated: `SKATE3_ASSET_ROOT` and `SKATE3_CATALOG_PAK`.
+    #[test]
+    #[ignore = "needs the private install data and a baked catalogue"]
+    fn the_camera_comes_down_off_what_it_opened_on() {
+        let assets = std::path::PathBuf::from(std::env::var_os("SKATE3_ASSET_ROOT").expect("SKATE3_ASSET_ROOT"));
+        crate::physics::dropped::mount_catalog(std::path::Path::new(&std::env::var_os("SKATE3_CATALOG_PAK").expect("SKATE3_CATALOG_PAK")), &assets);
+        for (name, layout) in [("DownTownSkatePark", "Downtown_Fullpark"), ("StartPark", "Starter_Fullpark"), ("MegaPark", "MegaPark_Fullpark"), ("IndustrialSkatePark", "Industrial_Fullpark")] {
+            let mut map = skate_data::skate_map::SkateMap::load(&assets.join(format!("../maps/{name}.skate"))).unwrap();
+            map.extensions.push(crate::park_bake::bake(&assets, layout).unwrap().0);
+            let mut session = crate::live::Session::load_map(&assets, "Normal", Some(map)).unwrap();
+            session.open_editor().unwrap();
+            session.close_editor();
+            let layout: Vec<[f32; 3]> = session.physics.park_layout().iter().map(|(_, _, p)| [p[9], p[10], p[11]]).collect();
+            let (lo, hi) = layout.iter().fold(([f32::MAX; 2], [f32::MIN; 2]), |(l, h), p| ([l[0].min(p[0]), l[1].min(p[2])], [h[0].max(p[0]), h[1].max(p[2])]));
+            let (mut runs, mut cursor_up, mut eye_up, mut walled, mut underground) = (0, 0, 0, 0, 0);
+            for ix in 0..40 {
+                for iz in 0..40 {
+                    let (x, z) = (lo[0] + (hi[0] - lo[0]) * ix as f32 / 39.0, lo[1] + (hi[1] - lo[1]) * iz as f32 / 39.0);
+                    let Some(top) = session.physics.ground_below(x, z, 60.0) else { continue };
+                    let yaw = (ix * 7 + iz * 3) as f32 * 0.9;
+                    let forward = glam::Vec3::new(-yaw.sin(), 0.0, -yaw.cos());
+                    let ahead = (1..8).filter_map(|k| { let p = glam::Vec3::new(x, 0.0, z) + forward * (k as f32 * 3.0); session.physics.ground_below(p.x, p.z, top + 7.0) }).fold(f32::MAX, f32::min);
+                    if ahead == f32::MAX || top - ahead < 2.0 {
+                        continue;
+                    }
+                    let (dropper, physics) = (session.dropper.as_mut().unwrap(), &mut session.physics);
+                    dropper.open(glam::Vec3::new(x, top, z), yaw, crate::object_dropper::Variant::Park, Default::default(), false);
+                    let mut slots = [0.0; 24];
+                    slots[18] = 1.0;
+                    for _ in 0..80 {
+                        dropper.update(&slots, physics, &assets);
+                    }
+                    let mut down = [0.0; 24];
+                    down[1] = 1.0;
+                    for _ in 0..400 {
+                        dropper.update(&down, physics, &assets);
+                    }
+                    for _ in 0..240 {
+                        dropper.update(&[0.0; 24], physics, &assets);
+                    }
+                    let editor = dropper.editor().unwrap();
+                    let (c, eye, want) = (editor.cursor.position, editor.view().0, editor.eye());
+                    runs += 1;
+                    cursor_up += usize::from(physics.ground_below(c.x, c.z, c.y + 0.5).is_some_and(|g| c.y - g > 0.5));
+                    // A wall may hold it back along the ground, a little above the spot; only well above the spot is up there.
+                    // Inside the ground: a surface met coming down to it from above, and none under it.
+                    let probe = |from: glam::Vec3, to: glam::Vec3| physics.map_sweep(from.to_array(), to.to_array(), 0.0);
+                    let under_something = probe(eye + glam::Vec3::Y * 10.0, eye).is_some();
+                    underground += usize::from(under_something && probe(eye, eye - glam::Vec3::Y * 100.0).is_none());
+                    let high = eye.y - want.y;
+                    eye_up += usize::from(high > 5.0);
+                    walled += usize::from(high > 0.5 && high <= 5.0);
+                    dropper.close(physics, &assets);
+                }
+            }
+            println!("{name}: {runs} runs, cursor left up {cursor_up}, camera left up {eye_up}, held by a wall {walled}, underground {underground}");
+            assert_eq!(underground, 0, "{name}: the camera ended inside the ground");
+            assert!(runs > 50, "{name}: {runs} runs");
+            assert_eq!(cursor_up, 0, "{name}");
+            // Left: a few on Industrial's rooftops, a wall beside the camera and a roof under it (4 of 559): through either
+            // it could end inside a building.
+            assert!(eye_up * 100 <= runs, "{name}: camera left up in {eye_up} of {runs}");
+        }
     }
 
     /// Closing the park editor puts the skater at the spawner: DownTown's layout start where it stands by default.

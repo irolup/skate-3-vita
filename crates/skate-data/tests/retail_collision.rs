@@ -1,4 +1,4 @@
-use skate_data::retail_collision::visit_clusters;
+use skate_data::retail_collision::{locate_clusters, visit_clusters};
 
 const FIXTURE: &[u8] = include_bytes!("fixtures/retail-collision.rwcmset");
 
@@ -99,6 +99,22 @@ fn skips_meshes_without_any_surface_ids() {
     })
     .unwrap();
     assert_eq!(names, ["compression-0", "compression-2"]);
+    assert_eq!(total, 2);
+}
+
+/// A district's collision is built from `locate_clusters`: a volume must not come back as a wall through it.
+#[test]
+fn locating_skips_the_same_meshes_as_visiting() {
+    let mut bytes = FIXTURE.to_vec();
+    strip_surface(&mut bytes, 1);
+    let mut located = 0;
+    let total = locate_clusters(&bytes, |_, triangles| {
+        assert!(triangles.iter().all(|t| t.has_surface));
+        located += 1;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(located, 2);
     assert_eq!(total, 2);
 }
 

@@ -70,6 +70,7 @@ impl ShapeSource for Shapes {
         self.get(&character).map(Vec::as_slice)
     }
 }
+#[derive(Clone)]
 pub struct Draw {
     /// Texture key ("" for solid units: draw the colour only).
     pub texture: String,
@@ -392,6 +393,26 @@ fn last_digits(name: &str) -> Option<usize> {
     name[start..end].parse().ok()
 }
 
+/// One line of text as its glyphs' quads, as a text field lays them (`x`, `y`: where the field's text starts; `uv` in the
+/// font's atlas), for text a host lays beside a retail panel.
+pub fn label(font: &crate::fe::apt_text::Font, text: &str, x: f32, y: f32, height: f32) -> Vec<Vertex> {
+    let (sx, sy) = (font.scale[0] * height, font.scale[1] * height);
+    let (mut x, y) = (x + font.offset[0] * sx, y + font.offset[1] * sy);
+    let mut vertices = Vec::with_capacity(text.len() * 6);
+    for c in text.chars() {
+        let Some(g) = font.glyph(c) else { continue };
+        let (x0, y0) = (x + g.x_offset * sx, y + (font.ascent - g.y_offset) * sy);
+        let (x1, y1) = (x0 + g.width * sx, y0 + g.height * sy);
+        let [u0, v0, u1, v1] = g.atlas_bounds;
+        let (w, h) = (font.size[0] as f32, font.size[1] as f32);
+        for ([px, py], [u, v]) in [([x0, y0], [u0, v0]), ([x1, y0], [u1, v0]), ([x1, y1], [u1, v1]), ([x0, y0], [u0, v0]), ([x1, y1], [u1, v1]), ([x0, y1], [u0, v1])] {
+            vertices.push(Vertex { position: [px, py], uv: [u / w, v / h] });
+        }
+        x = g.x_advance.mul_add(sx, x);
+    }
+    vertices
+}
+
 /// A text value's parts: text, and the inline buttons of the language strings (`<B:A_hud> Place`).
 #[derive(Debug, PartialEq)]
 enum Inline<'a> {
@@ -432,4 +453,27 @@ pub(crate) const MAP_MARKERS: &str = "map-markers/";
 pub(crate) const FENG_SHUI_TERRAIN: &str = "feng-shui-terrain/";
 pub(crate) const FENG_SHUI_PROPS: &str = "feng-shui-props/";
 /// The replay editor timeline placeholder (`CustomTimeline`), expanded by the stage from the replay screen's feed.
-pub(crate) const REPLAY_TIMELINE: &str = "replay-timeline/";
+pub(crate) const REPLAY_TIMELINE: &str = "replay-timeline/";    /// `label` lays a line as the session marker panel's data has it: its Object Dropper row, both font passes.
+    /// Data-gated: `SKATE3_MENU_MOVIES` (the set, beside `session-marker`).
+    #[test]
+    #[ignore = "needs the private menu set"]
+    fn label_matches_the_marker_panels_row() {
+        let set = std::path::PathBuf::from(std::env::var_os("SKATE3_MENU_MOVIES").expect("SKATE3_MENU_MOVIES"));
+        let json = |path: std::path::PathBuf| -> serde_json::Value { serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap() };
+        let text = crate::fe::apt_text::SharedText::from_json(&json(set.join("shared.json"))).unwrap();
+        let hud = json(set.join("../session-marker/hud.json"));
+        let shadow = text.named("futura shadow").unwrap();
+        for (font, x, mesh) in [(shadow, 158.0, 9), (shadow.foreground.as_deref().unwrap(), 159.0, 10)] {
+            let laid = label(font, "Object Dropper", x, 141.0, 19.301_78);
+            let authored = hud["meshes"][mesh]["vertices"].as_array().unwrap();
+            assert_eq!(laid.len(), authored.len());
+            for (a, b) in laid.iter().zip(authored) {
+                for k in 0..2 {
+                    assert!((a.position[k] - b["position"][k].as_f64().unwrap() as f32).abs() < 0.1, "mesh {mesh}: {:?} against {}", a.position, b["position"]);
+                    assert!((a.uv[k] - b["uv"][k].as_f64().unwrap() as f32).abs() < 0.001, "mesh {mesh}: {:?} against {}", a.uv, b["uv"]);
+                }
+            }
+        }
+    }
+
+

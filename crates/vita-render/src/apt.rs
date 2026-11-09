@@ -104,6 +104,42 @@ impl Apt {
         }
     }
 
+    /// Uploads a DXT1 or DXT5 texture as stored (each level through `glCompressedTexImage2D`) under the movie's key,
+    /// clamped like [`Apt::add_texture`]: Slappy's thumbnails stay compressed on the GPU.
+    pub fn add_compressed_texture(&mut self, key: &str, t: &vita_pack::texture::Texture) {
+        use vita_pack::texture::Format;
+        let format = match t.format {
+            Format::Dxt1 => GL_COMPRESSED_RGBA_S3TC_DXT1_EXT,
+            Format::Dxt5 => GL_COMPRESSED_RGBA_S3TC_DXT5_EXT,
+            Format::Rgba8 => {
+                if let Some(level) = t.mips.first() {
+                    self.add_texture(key, u32::from(t.width), u32::from(t.height), level);
+                }
+                return;
+            }
+        };
+        unsafe {
+            let mut id = 0;
+            glGenTextures(1, &mut id);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, id);
+            let mipmapped = t.mips.len() > 1;
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, if mipmapped { GL_LINEAR_MIPMAP_LINEAR } else { GL_LINEAR });
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            let (mut w, mut h) = (GLsizei::from(t.width), GLsizei::from(t.height));
+            for (level, data) in t.mips.iter().enumerate() {
+                glCompressedTexImage2D(GL_TEXTURE_2D, level as GLint, format, w, h, 0, data.len() as GLsizei, data.as_ptr().cast());
+                w = (w / 2).max(1);
+                h = (h / 2).max(1);
+            }
+            if let Some(old) = self.textures.insert(key.to_owned(), id) {
+                glDeleteTextures(1, &old);
+            }
+        }
+    }
+
     /// Frees an uploaded texture.
     pub fn remove_texture(&mut self, key: &str) {
         if let Some(id) = self.textures.remove(key) {

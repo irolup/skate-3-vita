@@ -28,6 +28,12 @@ const WORLD_FRAG: &CStr = cstr(concat!(include_str!("../../../shaders/world.frag
 const SKIN_VERT: &CStr = cstr(concat!(include_str!("../../../shaders/skin.vert.cg"), "\0"));
 const SKIN_FRAG: &CStr = cstr(concat!(include_str!("../../../shaders/skin.frag.cg"), "\0"));
 const SKIN_MASK_FRAG: &CStr = cstr(concat!(include_str!("../../../shaders/skin_mask.frag.cg"), "\0"));
+const SKIN_HAIR_VERT: &CStr = cstr(concat!(include_str!("../../../shaders/skin_hair.vert.cg"), "\0"));
+const SKIN_BLEND_FRAG: &CStr = cstr(concat!(include_str!("../../../shaders/skin_blend.frag.cg"), "\0"));
+const SKIN_DECAL_FRAG: &CStr = cstr(concat!(include_str!("../../../shaders/skin_decal.frag.cg"), "\0"));
+const SKIN_HAIR_FRAG: &CStr = cstr(concat!(include_str!("../../../shaders/skin_hair.frag.cg"), "\0"));
+/// Retail's scene exposure on characters (upstream `retail_character.rs`: the light's w, 2.5).
+const CHARACTER_EXPOSURE: f32 = 2.5;
 const SKIN_FADE_FRAG: &CStr = cstr(concat!(include_str!("../../../shaders/skin_fade.frag.cg"), "\0"));
 const PED_FRAG: &CStr = cstr(concat!(include_str!("../../../shaders/ped.frag.cg"), "\0"));
 const PARK_VERT: &CStr = cstr(concat!(include_str!("../../../shaders/park.vert.cg"), "\0"));
@@ -134,6 +140,15 @@ struct SkinProgram {
     cutoff: Option<GLint>,
     /// The cars' paint pair (`red` = secondary, `blue` = chassis).
     paint: Option<(GLint, GLint)>,
+    /// Retail's character shading (`rows`, `mode`, `sh`, `eye`, `tone`; -1 in a program without them).
+    rows: GLint,
+    mode: GLint,
+    sh: GLint,
+    eye: GLint,
+    tone: GLint,
+    decal_u: GLint,
+    decal_v: GLint,
+    decal_mode: GLint,
 }
 
 impl SkinProgram {
@@ -142,12 +157,42 @@ impl SkinProgram {
     }
 
     fn with_paint(name: &str, fragment: &CStr, masked: bool, painted: bool) -> Self {
-        let program = Program::new(
-            name,
-            SKIN_VERT,
-            fragment,
-            &[c"aPosition", c"aNormal", c"aTexcoord", c"aJoints", c"aWeights"],
+        Self::with_program(
+            Program::new(name, SKIN_VERT, fragment, &[c"aPosition", c"aNormal", c"aTexcoord", c"aJoints", c"aWeights"]),
+            masked,
+            painted,
+        )
+    }
+
+    /// Hair: the skin with the second UV set (attribute 5) and the opacity map (texture unit 1).
+    fn hair() -> Self {
+        let s = Self::with_program(
+            Program::new("skin_hair", SKIN_HAIR_VERT, SKIN_HAIR_FRAG, &[c"aPosition", c"aNormal", c"aTexcoord", c"aJoints", c"aWeights", c"aTexcoord1"]),
+            true,
+            false,
         );
+        unsafe {
+            glUseProgram(s.program.id);
+            glUniform1i(s.program.uniform(c"opacity"), 1);
+        }
+        s
+    }
+
+    /// Tattoos: the skin with the second UV set (attribute 5) and the decal (texture unit 1).
+    fn decal() -> Self {
+        let s = Self::with_program(
+            Program::new("skin_decal", SKIN_HAIR_VERT, SKIN_DECAL_FRAG, &[c"aPosition", c"aNormal", c"aTexcoord", c"aJoints", c"aWeights", c"aTexcoord1"]),
+            false,
+            false,
+        );
+        unsafe {
+            glUseProgram(s.program.id);
+            glUniform1i(s.program.uniform(c"decal"), 1);
+        }
+        s
+    }
+
+    fn with_program(program: Program, masked: bool, painted: bool) -> Self {
         let s = Self {
             viewproj: program.uniform(c"viewproj"),
             bones: program.uniform(c"bones"),
@@ -156,6 +201,14 @@ impl SkinProgram {
             tint: program.uniform(c"tint"),
             cutoff: masked.then(|| program.uniform(c"cutoff")),
             paint: painted.then(|| (program.uniform(c"red"), program.uniform(c"blue"))),
+            rows: program.uniform(c"rows"),
+            mode: program.uniform(c"mode"),
+            sh: program.uniform(c"sh"),
+            eye: program.uniform(c"eye"),
+            tone: program.uniform(c"tone"),
+            decal_u: program.uniform(c"decalU"),
+            decal_v: program.uniform(c"decalV"),
+            decal_mode: program.uniform(c"decalMode"),
             program,
         };
         unsafe {
@@ -176,18 +229,36 @@ struct Draw {
     tint: [f32; 4],
     cutoff: Option<f32>,
     double_sided: bool,
+    /// Hair's opacity map (`Scene::load_look`).
+    opacity: Option<GLuint>,
+    /// The tattoo slot this material takes (1 upper, 2 lower, 0 none).
+    decal: u8,
+    /// Alpha-blended (a created look's glasses), drawn last.
+    blend: bool,
+    /// Retail's character shading (a created look's material).
+    lighting: Option<vita_pack::cas::Lighting>,
 }
 
 struct SkaterGpu {
     vbo: GLuint,
+    /// The second UV set, one pair per vertex, for hair's opacity map.
+    uv1_vbo: Option<GLuint>,
     ibo: GLuint,
     draws: Vec<Draw>,
+    /// Every texture it uploaded (base colours and opacity maps), freed with it.
+    textures: Vec<GLuint>,
+    /// The tattoos' pictures and their two rows each (`Scene::set_decal_rows`).
+    decal_textures: [Option<GLuint>; 5],
+    decal_rows: [[[f32; 3]; 2]; 5],
 }
 
 pub struct Scene {
     world: WorldProgram,
     skin: SkinProgram,
     skin_mask: SkinProgram,
+    skin_hair: SkinProgram,
+    skin_decal: SkinProgram,
+    skin_blend: SkinProgram,
     park: ParkProgram,
     park_mask: ParkProgram,
     course_vbo: GLuint,
@@ -222,6 +293,9 @@ pub struct Scene {
     /// NPC skaters fading in or out (the skin program with an opacity).
     skin_fade: SkinProgram,
     skin_fade_alpha: GLint,
+    /// Retail's character shading: the ambient light and the eye of the frame being drawn.
+    character_sh: [[f32; 3]; 9],
+    skin_eye: Vec3,
     /// The ped models (by `Session::ped_models` index) and their program (paint, fade).
     peds: Vec<Option<PedGpu>>,
     /// The ped hand prop models (by `Session::hand_prop_models` index; rigid, one joint), drawn
@@ -498,6 +572,9 @@ impl Scene {
         };
         let skin = SkinProgram::new("skin", SKIN_FRAG, false);
         let skin_mask = SkinProgram::new("skin_mask", SKIN_MASK_FRAG, true);
+        let skin_hair = SkinProgram::hair();
+        let skin_decal = SkinProgram::decal();
+        let skin_blend = SkinProgram::new("skin_blend", SKIN_BLEND_FRAG, false);
         let park = ParkProgram::new("park", PARK_FRAG, false);
         let park_mask = ParkProgram::new("park_mask", PARK_MASK_FRAG, true);
         let prop = ParkProgram::with_vertex("prop", PROP_VERT, PARK_FRAG, false, true);
@@ -522,6 +599,9 @@ impl Scene {
                 world,
                 skin,
                 skin_mask,
+                skin_hair,
+                skin_decal,
+                skin_blend,
                 park,
                 park_mask,
                 course_vbo,
@@ -546,6 +626,8 @@ impl Scene {
                 car_glass,
                 skin_fade,
                 skin_fade_alpha,
+                character_sh: [[0.0; 3]; 9],
+                skin_eye: Vec3::ZERO,
                 peds: Vec::new(),
                 hand_props: Vec::new(),
                 ped,
@@ -561,8 +643,21 @@ impl Scene {
 
     /// Uploads the skater pack's mesh and textures.
     pub fn load_skater(&mut self, s: &Skater) {
+        self.load_look(s, &[], &[], &[], &vita_pack::cas::Decals::default());
+    }
+
+    /// [`Self::load_skater`] with what a created look's hair needs: the second UV set (per vertex) and each material's
+    /// opacity map.
+    /// A loaded skater is replaced (the customisation rebuilds it at every change).
+    pub fn load_look(&mut self, s: &Skater, uv1: &[[f32; 2]], opacity: &[Option<Texture>], lighting: &[Option<vita_pack::cas::Lighting>], decals: &vita_pack::cas::Decals) {
+        self.unload_skater();
         unsafe {
             let vbo = buffer(GL_ARRAY_BUFFER, &s.vertex_data);
+            let uv1_vbo = (opacity.iter().any(Option::is_some) || decals.target.iter().any(|&t| t != 0)).then(|| {
+                let bytes: Vec<u8> = uv1.iter().flatten().flat_map(|v| v.to_le_bytes()).collect();
+                buffer(GL_ARRAY_BUFFER, &bytes)
+            });
+            let opacity: Vec<Option<GLuint>> = opacity.iter().map(|t| t.as_ref().map(|t| upload_texture(t))).collect();
             let index_bytes: Vec<u8> = s.indices.iter().flat_map(|i| i.to_le_bytes()).collect();
             let ibo = buffer(GL_ELEMENT_ARRAY_BUFFER, &index_bytes);
             let textures: Vec<GLuint> = s.textures.iter().map(|t| upload_texture(t)).collect();
@@ -578,17 +673,70 @@ impl Scene {
                         index_count: p.index_count,
                         texture: m.texture.map_or(self.white, |t| textures[usize::from(t)]),
                         tint: m.base_color,
+                        // A created look's blended material (its lighting rows are given) blends; any other skater's
+                        // is drawn as masked at 0.5.
                         cutoff: match m.alpha_mode {
                             AlphaMode::Opaque => None,
                             AlphaMode::Mask => Some(m.alpha_cutoff),
-                            AlphaMode::Blend => Some(0.5),
+                            AlphaMode::Blend => (lighting.is_empty()).then_some(0.5),
                         },
-                        double_sided: m.double_sided,
+                        blend: m.alpha_mode == AlphaMode::Blend && !lighting.is_empty(),
+                        double_sided: m.double_sided || (m.alpha_mode == AlphaMode::Blend && !lighting.is_empty()),
+                        opacity: opacity.get(usize::from(p.material)).copied().flatten(),
+                        decal: decals.target.get(usize::from(p.material)).copied().unwrap_or(0),
+                        lighting: lighting.get(usize::from(p.material)).copied().flatten(),
                     }
                 })
                 .collect();
-            draws.sort_by_key(|d| d.cutoff.is_some());
-            self.skater = Some(SkaterGpu { vbo, ibo, draws });
+            draws.sort_by_key(|d| (d.blend, d.cutoff.is_some(), d.opacity.is_some()));
+            let decal_textures = [0, 1, 2, 3, 4].map(|i| decals.textures[i].as_ref().map(|t| upload_texture(t)));
+            let owned = textures.iter().copied().chain(opacity.iter().flatten().copied()).chain(decal_textures.iter().flatten().copied()).collect();
+            println!("CAC decals: {} draws, textures {:?}, uv1 {}", draws.iter().filter(|d| d.decal != 0).count(), decal_textures, uv1_vbo.is_some());
+            self.skater = Some(SkaterGpu { vbo, uv1_vbo, ibo, draws, textures: owned, decal_textures, decal_rows: [[[0.0; 3]; 2]; 5] });
+        }
+    }
+
+    /// The tattoos' two rows per slot (`Placement::custom_graphic`), set each frame while the placement moves.
+    pub fn set_decal_rows(&mut self, rows: [[[f32; 3]; 2]; 5]) {
+        if self.skater.as_ref().is_some_and(|g| g.decal_rows != rows) {
+            println!("CAC decal rows {rows:?}");
+        }
+        if let Some(g) = self.skater.as_mut() {
+            g.decal_rows = rows;
+        }
+    }
+
+    fn unload_skater(&mut self) {
+        if let Some(g) = self.skater.take() {
+            unsafe {
+                glDeleteBuffers(1, &g.vbo);
+                glDeleteBuffers(1, &g.ibo);
+                if let Some(b) = g.uv1_vbo {
+                    glDeleteBuffers(1, &b);
+                }
+                glDeleteTextures(g.textures.len() as GLsizei, g.textures.as_ptr());
+            }
+        }
+    }
+
+    /// Clears to `background` and draws the skater alone (`frame.palette`): the customisation's preview.
+    pub fn draw_skater_only(&mut self, frame: &Frame, background: [f32; 3]) {
+        self.upload_grade();
+        unsafe {
+            glClearColor(background[0], background[1], background[2], 1.0);
+            glClearDepthf(1.0);
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+            glEnable(GL_DEPTH_TEST);
+            glDepthFunc(GL_LEQUAL);
+            glDepthMask(GL_TRUE);
+            glDisable(GL_BLEND);
+            glFrontFace(GL_CCW);
+            glCullFace(GL_BACK);
+            let vp = frame.view_proj.to_cols_array();
+            if self.skater.is_some() {
+                self.skin_eye = frame.eye;
+                self.draw_skin(frame.palette, 1.0, &vp);
+            }
         }
     }
 
@@ -618,6 +766,10 @@ impl Scene {
                                 tint: m.base_color,
                                 cutoff: None,
                                 double_sided: m.double_sided,
+                                opacity: None,
+                                decal: 0,
+                                blend: false,
+                                lighting: None,
                             };
                             (draw, m.alpha_mode == AlphaMode::Blend)
                         })
@@ -804,6 +956,7 @@ impl Scene {
             let vp = frame.view_proj.to_cols_array();
             self.last_draws = draw_park(set, self.white, &self.park, &self.park_mask, frame, &vp);
             if self.skater.is_some() {
+                self.skin_eye = frame.eye;
                 self.draw_skin(frame.palette, 1.0, &vp);
             }
         }
@@ -1155,6 +1308,9 @@ impl Scene {
             &self.world.program,
             &self.skin.program,
             &self.skin_mask.program,
+            &self.skin_hair.program,
+            &self.skin_decal.program,
+            &self.skin_blend.program,
             &self.park.program,
             &self.park_mask.program,
             &self.prop.program,
@@ -1277,6 +1433,7 @@ impl Scene {
 
             // Skater and board, then the NPC skaters (the same mesh, their own palettes).
             if self.skater.is_some() {
+                self.skin_eye = frame.eye;
                 self.draw_skin(frame.palette, 1.0, &vp);
                 let planes = frustum(&frame.view_proj);
                 for npc in frame.npcs {
@@ -1312,6 +1469,11 @@ impl Scene {
 
     /// The skater mesh with one palette: opaque materials first, masked last; below
     /// opacity 1 (an NPC fading) every material blends at that opacity.
+    /// The characters' ambient light for retail's shading (nine SH coefficients; upstream `default_sh`).
+    pub fn set_character_ambient(&mut self, sh: [[f32; 3]; 9]) {
+        self.character_sh = sh;
+    }
+
     fn draw_skin(&self, skin_palette: &[Mat4], alpha: f32, vp: &[f32; 16]) {
         let Some(sk) = &self.skater else { return };
         if skin_palette.is_empty() || alpha <= 0.0 {
@@ -1343,20 +1505,112 @@ impl Scene {
                 glUniformMatrix4fv(p.bones, MAX_JOINTS as GLsizei, GL_FALSE, palette.as_ptr());
                 glUniform1f(self.skin_fade_alpha, alpha);
             }
-            let mut current: Option<bool> = None;
+            // (masked, hair), the order of the draws.
+            let mut current: Option<(bool, bool, bool)> = None;
+            // The second UV set is bound for hair and tattoo draws (attribute 5).
+            let mut uv_bound = false;
+            let mut decal_now: Option<u8> = None;
+            let mut blend_on = false;
             for d in &sk.draws {
+                // An NPC fading in or out shows no hair for that moment: its coverage is not in the fade program.
+                if fading && d.opacity.is_some() {
+                    continue;
+                }
                 let masked = d.cutoff.is_some();
-                let p = if fading { &self.skin_fade } else if masked { &self.skin_mask } else { &self.skin };
-                if !fading && current != Some(masked) {
+                let hair = d.opacity.is_some();
+                let blend = !fading && d.blend;
+                let tattoo = !fading && !blend && !masked && !hair && d.decal != 0 && sk.decal_textures[usize::from(d.decal) - 1].is_some() && sk.uv1_vbo.is_some();
+                let p = if fading {
+                    &self.skin_fade
+                } else if blend {
+                    &self.skin_blend
+                } else if tattoo {
+                    &self.skin_decal
+                } else if hair {
+                    &self.skin_hair
+                } else if masked {
+                    &self.skin_mask
+                } else {
+                    &self.skin
+                };
+                let kind = (masked, hair || tattoo, blend);
+                if blend && !blend_on {
+                    glEnable(GL_BLEND);
+                    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                    glDepthMask(GL_FALSE);
+                    blend_on = true;
+                }
+                if !fading && (current != Some(kind) || (tattoo && decal_now.is_none()) || (!tattoo && decal_now.is_some())) {
+                    decal_now = None;
                     glUseProgram(p.program.id);
                     glUniformMatrix4fv(p.viewproj, 1, GL_FALSE, vp.as_ptr());
                     glUniformMatrix4fv(p.bones, MAX_JOINTS as GLsizei, GL_FALSE, palette.as_ptr());
-                    current = Some(masked);
+                    if p.sh >= 0 {
+                        glUniform3fv(p.sh, 9, self.character_sh.as_flattened().as_ptr());
+                    }
+                    if p.eye >= 0 {
+                        glUniform3f(p.eye, self.skin_eye.x, self.skin_eye.y, self.skin_eye.z);
+                    }
+                    if (hair || tattoo) && !uv_bound {
+                        if let Some(uv1) = sk.uv1_vbo {
+                            glBindBuffer(GL_ARRAY_BUFFER, uv1);
+                            glEnableVertexAttribArray(5);
+                            glVertexAttribPointer(5, 2, GL_FLOAT, GL_FALSE, 8, std::ptr::null());
+                            glBindBuffer(GL_ARRAY_BUFFER, sk.vbo);
+                            uv_bound = true;
+                        }
+                    }
+                    current = Some(kind);
+                }
+                if tattoo {
+                    // The slot's picture on unit 1 and its two rows (a draw of the other slot comes after).
+                    let slot = usize::from(d.decal) - 1;
+                    if decal_now != Some(d.decal) {
+                        if let Some(tex) = sk.decal_textures[slot] {
+                            glActiveTexture(GL_TEXTURE1);
+                            glBindTexture(GL_TEXTURE_2D, tex);
+                            glActiveTexture(GL_TEXTURE0);
+                        }
+                        glUniform3fv(p.decal_u, 1, sk.decal_rows[slot][0].as_ptr());
+                        glUniform3fv(p.decal_v, 1, sk.decal_rows[slot][1].as_ptr());
+                        // A tattoo darkens the skin; a logo lies over the cloth, board or hat.
+                        glUniform1f(p.decal_mode, if slot == 1 || slot == 2 { 0.0 } else { 1.0 });
+                        decal_now = Some(d.decal);
+                    }
+                }
+                if let Some(opacity) = d.opacity {
+                    glActiveTexture(GL_TEXTURE1);
+                    glBindTexture(GL_TEXTURE_2D, opacity);
+                    glActiveTexture(GL_TEXTURE0);
                 }
                 if let Some(location) = p.cutoff {
                     glUniform1f(location, d.cutoff.unwrap_or(if fading { -1.0 } else { 0.0 }));
                 }
-                glUniform4f(p.tint, d.tint[0], d.tint[1], d.tint[2], d.tint[3]);
+                // Retail's shading: the tint goes in as the root of its linear value (the fragment squares the
+                // texture times the tint), the gain and the scene's exposure into `tone`.
+                match d.lighting.filter(|_| p.mode >= 0) {
+                    Some(l) => {
+                        // Hair's colours are linear already: the vault's main hair colours are their swatches in
+                        // linear (medium brown 0.02 for a 0.17 swatch), so they are not converted again (the second
+                        // conversion made dark hair black). A clothes colour layer is a linear factor too (retail's
+                        // cloth shaders multiply by it as given, values above 1 included). The other colours are taken
+                        // as sRGB, as the reference.
+                        let linear = |c: f32| if l.hair || l.linear_tint { c } else if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) };
+                        let t = d.tint.map(|c| linear(c).sqrt());
+                        glUniform4f(p.tint, t[0], t[1], t[2], d.tint[3]);
+                        glUniform4fv(p.rows, 9, l.rows.as_flattened().as_ptr());
+                        glUniform4f(p.mode, 1.0, if l.hair { 1.0 } else { 0.0 }, 0.0, 0.0);
+                        let gain = if l.hair { 1.0 } else { l.rows[0][1] };
+                        glUniform2f(p.tone, 2.0 * gain * CHARACTER_EXPOSURE, 1.0);
+                    }
+                    None => {
+                        glUniform4f(p.tint, d.tint[0], d.tint[1], d.tint[2], d.tint[3]);
+                        if p.mode >= 0 {
+                            glUniform4f(p.mode, 0.0, 0.0, 0.0, 0.0);
+                            glUniform2f(p.tone, 0.0, 0.0);
+                        }
+                    }
+                }
                 if d.double_sided {
                     glDisable(GL_CULL_FACE);
                 } else {
@@ -1372,6 +1626,13 @@ impl Scene {
             }
             if fading {
                 glDisable(GL_BLEND);
+            }
+            if uv_bound {
+                glDisableVertexAttribArray(5);
+            }
+            if blend_on {
+                glDisable(GL_BLEND);
+                glDepthMask(GL_TRUE);
             }
             glDisable(GL_CULL_FACE);
             glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
@@ -1814,6 +2075,10 @@ fn ped_gpu(white: GLuint, s: &Skater) -> PedGpu {
                         AlphaMode::Blend => Some(0.5),
                     },
                     double_sided: m.double_sided,
+                    opacity: None,
+                    decal: 0,
+                    blend: false,
+                    lighting: None,
                 };
                 (draw, lod, name.starts_with("TINT:"))
             })

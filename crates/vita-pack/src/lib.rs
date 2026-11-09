@@ -3,6 +3,7 @@
 //! A pack is one container: a 56-byte header (magic, kind, kind version, payload
 //! length, blake3 hash of the payload) and a little-endian payload whose layout the
 //! kind's module defines. Packs hold retail-derived data and are never committed.
+pub mod cas;
 pub mod catalog;
 pub mod district;
 pub mod files;
@@ -29,6 +30,10 @@ pub enum Kind {
     CatalogItem,
     /// A texture of the catalogue's shared tables (`catalog::texture_to_pack`).
     CatalogTexture,
+    /// A character customisation part model (`cas::Part`).
+    CasPart,
+    /// A character customisation texture (`cas::texture_to_pack`).
+    CasTexture,
 }
 impl Kind {
     fn code(self) -> u32 {
@@ -40,6 +45,8 @@ impl Kind {
             Kind::Props => 5,
             Kind::CatalogItem => 6,
             Kind::CatalogTexture => 7,
+            Kind::CasPart => 8,
+            Kind::CasTexture => 9,
         }
     }
     fn from_code(code: u32) -> Option<Self> {
@@ -51,6 +58,8 @@ impl Kind {
             5 => Some(Kind::Props),
             6 => Some(Kind::CatalogItem),
             7 => Some(Kind::CatalogTexture),
+            8 => Some(Kind::CasPart),
+            9 => Some(Kind::CasTexture),
             _ => None,
         }
     }

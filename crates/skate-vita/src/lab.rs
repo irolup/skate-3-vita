@@ -230,6 +230,19 @@ pub(crate) struct Shared {
     /// change, the main thread writes them when `career_changed`).
     pub career: skate_core::career_stats::CareerStats,
     pub career_changed: bool,
+    /// The unlock store and the team brand (loaded by the main thread at boot; written by it when
+    /// `progression_changed`).
+    pub progression: crate::progression::Progression,
+    pub progression_changed: bool,
+    /// The created skaters (loaded by the main thread at boot; written by it when `skaters_changed`).
+    pub skaters: crate::skaters::Skaters,
+    pub skaters_changed: bool,
+    /// The player's record, as the main thread built the look from it and the customisation edits it.
+    pub player: Option<skate_core::skater_record::SkaterRecord>,
+    /// The record's values for the simulation (`skaters::sim_profile`), taken by each session; new when
+    /// `skater_profile_new`.
+    pub skater_profile: Option<serde_json::Value>,
+    pub skater_profile_new: bool,
     pub state_id: u32,
     /// The session marker overlay's state.
     pub marker: skate_sim::MarkerView,
@@ -340,6 +353,9 @@ pub(crate) fn sim_thread(shared: &Mutex<Shared>) {
         let mut session = match session {
             Ok(mut session) => {
                 crate::alloc::stage(&format!("{name}: session loaded (before the living world)"));
+                if let Some(profile) = shared.lock().unwrap().skater_profile.clone() {
+                    session.set_profile(profile);
+                }
                 if let Some((props, awake)) = session.prop_counts() {
                     println!("props: {props} placed, {awake} streamed in");
                 }
@@ -552,6 +568,11 @@ fn run_session(shared: &Mutex<Shared>, input: &Input, session: &mut Session, mut
                 iterations = s.solver_iterations;
                 session.set_solver_iterations(iterations);
                 println!("physics: {iterations} solver iterations (live)");
+            }
+            if std::mem::take(&mut s.skater_profile_new) {
+                if let Some(profile) = s.skater_profile.clone() {
+                    session.set_profile(profile);
+                }
             }
             if std::mem::take(&mut s.living_changed) {
                 session.set_living_settings(s.living.clone());

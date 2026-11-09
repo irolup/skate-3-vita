@@ -215,6 +215,10 @@ pub struct FrontEnd<'a> {
     pub browser: crate::fe::browser_host::BrowserHost,
     /// Park Setup, FE 0x3A (park_setup_host).
     pub park_setup: crate::fe::park_setup_host::ParkSetupHost,
+    /// The character customisation, FE 15 (cac_host).
+    pub cac: crate::fe::cac_host::CacHost,
+    /// The team screen, FE 67 (team_host), under the customisation when it opens it.
+    pub team: crate::fe::team_host::TeamHost,
     /// The action overlay's teleporter title (`SignUpPoster.GetTeleportTitle`, 825C1020).
     pub signup_title: Option<String>,
     /// The image slots (`Game.ImageRenderer_*`, one global manager across screens).
@@ -259,6 +263,8 @@ impl<'a> FrontEnd<'a> {
             object_dropper: Default::default(),
             browser: Default::default(),
             park_setup: Default::default(),
+            cac: Default::default(),
+            team: Default::default(),
             signup_title: None,
             image_slots: Default::default(),
             popup: Default::default(),
@@ -274,7 +280,7 @@ impl<'a> FrontEnd<'a> {
 
 impl crate::fe::apt_stage::StageNatives for FrontEnd<'_> {
     fn objects(&self) -> Vec<String> {
-        ["Game", "CoreMenu", "Audio", "FELanguage", "FETrickTutorial", "FEChallengeMap", "FEReplayMenu", "HUDComponents", "Popup", "Progression", "Stats", "SignUpPoster", "tos", "SkaterSpawner", "FreeSkateOption", "TipsLoader", "SkatePark", "CommonBrowser"]
+        ["Game", "CoreMenu", "Audio", "FELanguage", "FETrickTutorial", "FEChallengeMap", "FEReplayMenu", "HUDComponents", "Popup", "Progression", "Stats", "SignUpPoster", "tos", "SkaterSpawner", "FreeSkateOption", "TipsLoader", "SkatePark", "CommonBrowser", "TeamManagement"]
             .map(String::from)
             .to_vec()
     }
@@ -295,6 +301,12 @@ impl crate::fe::apt_stage::StageNatives for FrontEnd<'_> {
         }
         if let Some(value) = self.image_slots.call(object, method, &args) {
             return Ok(value);
+        }
+        if let Some(value) = self.cac.call(vm, self.language, object, method, &args) {
+            return value;
+        }
+        if let Some(value) = self.team.call(vm, object, method, &args) {
+            return value;
         }
         if let Some(value) = self.challenge_map.call(vm, self.registry, self.context, self.language, object, method, &args)? {
             return Ok(value);

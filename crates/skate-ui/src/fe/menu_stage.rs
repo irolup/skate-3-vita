@@ -53,6 +53,17 @@ const VIDEO_CALIBRATION: &str = "VideoCalibration";
 const VIDEO_CALIBRATION_PATH: &str = "options/videocal.swf";
 /// The callback id of its "finished" popup (0x8260EA48).
 const VIDEO_CALIBRATION_POPUP: &str = "video_calibration.finished";
+/// skate_vita: the customisation's gender switch question (825FE3C0 item 0x38).
+const CAC_GENDER_POPUP: &str = "cac.gender";
+/// The texture keys of Slappy's thumbnails (`CAC_GetThumbnailFileName` names loaded through `ImageRenderer_Load`):
+/// drawn although the menu set lacks them, the game supplies the pictures.
+pub const CAS_THUMB_PREFIX: &str = "image/fe/cas/";
+/// The customisation's exit question (82603290: `ID_CAC_EXIT_CAC_CONFIRMATION`, Yes / No; answered by 82604748).
+const CAC_EXIT_POPUP: &str = "cac.exit";
+/// The tattoo regions' change questions (825FE3C0 menus 4 and 5: `ID_CAC_UPPER_TATTOO_CHANGE_CONFIRMATION`, answered by
+/// 82604618; `ID_CAC_LOWER_TATTOO_CHANGE_CONFIRMATION`, 82604658).
+const CAC_TATTOO_UPPER_POPUP: &str = "cac.tattoo.upper";
+const CAC_TATTOO_LOWER_POPUP: &str = "cac.tattoo.lower";
 /// The settings row that pushes it (sub_8260D290 row 25).
 const VIDEO_CALIBRATION_ROW: &str = "ID_GAMESETTINGS_VIDEO_CALIBRATION";
 /// The fader bit screen changes hold (sub_825E6B30 / sub_825E6BF8 bit 0).
@@ -102,6 +113,18 @@ const BROWSER_SCREEN: &str = "f34a9fae51e2b903";
 const PARK_SETUP: &str = "ParkSetup";
 const PARK_SETUP_PATH: &str = "skatepark/parksetup.swf";
 const PARK_SETUP_SCREEN: &str = "d2dfe72ee96887b1";
+/// The character customisation (retail FE 15, template 92; `MenuStage::open_cac`).
+const CAC: &str = "CreateASkater";
+const CAC_PATH: &str = "cas/createskater.swf";
+const CAC_SCREEN: &str = "e0e6f052f6724f7d";
+/// The team screen (retail FE 67, template 104; `MenuStage::open_team`): My Career Team's page.
+const TEAM: &str = "TeamManagement";
+const TEAM_PATH: &str = "TeamSkater_Selection/team_management.swf";
+const TEAM_SCREEN: &str = "3823e2a9a554d38a";
+/// skate_vita: the team screen's empty-name warning (82651A48, popup 0x12E).
+const TEAM_NAME_POPUP: &str = "team.empty_name";
+/// The Apt key AptOption (Y; AptMisc, X, is below).
+const APT_OPTION: u32 = 4;
 /// The browser's tab keys (retail key codes: RB 6, LB 9 the top tabs; RT 7, LT 10 the bottom ones).
 const KEY_RB: u32 = 6;
 const KEY_RT: u32 = 7;
@@ -163,7 +186,7 @@ const POPUP_KINDS: [PopupKind; 3] = [PopupKind::Standard, PopupKind::Small, Popu
 /// Game Settings, Video Calibration, the Trick Guide, the Challenge Map, the instant replay screen and its help, the
 /// action overlay (the teleporter prompt), Extras, the text viewer, the Skate Profile, SpawnSkater, the Free Play
 /// options, the loading screen, the popups and the Object Dropper and its Quick Menu. Not the HUD movies.
-pub const PAUSE_ROOTS: [&str; 30] = [
+pub const PAUSE_ROOTS: [&str; 32] = [
     "source/screens/main",
     "source/screens/main/FE_root",
     "source/screens/main/chyron",
@@ -194,6 +217,8 @@ pub const PAUSE_ROOTS: [&str; 30] = [
     "source/screens/objectdropper/objectquickmenu",
     "source/screens/browser/browser",
     "source/screens/skatepark/parksetup",
+    "source/screens/cas/createskater",
+    "source/screens/TeamSkater_Selection/team_management",
 ];
 
 /// What runs when the screen is black (the fade hold's callback).
@@ -243,11 +268,15 @@ pub struct Frame {
     /// Choices made in the game's popups ([`MenuStage::push_popup`]): the request's callback and the option index
     /// (B on a cancelable one: -1 from the movie, or `skate_core::fe_popup::CHOICE_CANCEL`).
     pub popup_choices: Vec<(String, i32)>,
+    /// skate_vita: what the team screen asks the game for (the customisation, a keyboard).
+    pub team_effects: Vec<skate_core::team::Effect>,
     /// skate_vita: the text entry (FE 46) asks for text: the title as text and the request. The game opens the
     /// system keyboard and answers with [`MenuStage::text_entered`] (retail: `XamShowKeyboardUI`, b305).
     pub text_entry: Option<(String, skate_core::text_entry::TextEntryRequest)>,
     /// Cheats turned on or off (`skate_core::cheats` ids), for the game to apply.
     pub cheats: Vec<(String, bool)>,
+    /// Unlocks granted (Extras rows 1-3), for the game's unlock store (`skate_core::unlocks`).
+    pub unlocks: Vec<(skate_core::unlocks::UnlockKind, String)>,
     /// What FE 62 asked of the game: skaters called or dismissed, the player's skater picked.
     pub spawn_skater: Vec<skate_core::spawn_skater::Action>,
     /// FE 34 closed with these Free Play values (flow 0x8B): the game applies them.
@@ -310,6 +339,18 @@ pub struct MenuStage {
     park_setup_id: Option<i32>,
     park_setup: crate::fe::park_setup_host::ParkSetupHost,
     park_setup_open: Option<Vec<crate::fe::park_setup_host::ParkSetupLot>>,
+    cac_id: Option<i32>,
+    cac: crate::fe::cac_host::CacHost,
+    cac_open: Option<(skate_core::cac::Cac, u32)>,
+    team_id: Option<i32>,
+    team: crate::fe::team_host::TeamHost,
+    team_open: Option<skate_core::team::Team>,
+    /// The left stick or d-pad across, -1 to 1, this frame.
+    cac_axis: f32,
+    /// LT minus RT this frame.
+    cac_turn: f32,
+    /// The placement page's inputs: the turn, the scale, the offsets (825FBAE8).
+    cac_adjust: [f32; 4],
     object_quick_menu_id: Option<i32>,
     object_dropper: crate::fe::object_dropper_host::ObjectDropperHost,
     object_dropper_feed: Option<crate::fe::object_dropper_host::ObjectDropperFeed>,
@@ -665,6 +706,8 @@ impl MenuStage {
         let object_dropper_id = has(OBJECT_DROPPER, OBJECT_DROPPER_PATH).then(|| as_id(OBJECT_DROPPER));
         let browser_id = has(BROWSER, BROWSER_PATH).then(|| as_id(BROWSER));
         let park_setup_id = has(PARK_SETUP, PARK_SETUP_PATH).then(|| as_id(PARK_SETUP));
+        let cac_id = has(CAC, CAC_PATH).then(|| as_id(CAC));
+        let team_id = has(TEAM, TEAM_PATH).then(|| as_id(TEAM));
         let object_quick_menu_id = has(OBJECT_QUICK_MENU, OBJECT_QUICK_MENU_PATH).then(|| as_id(OBJECT_QUICK_MENU));
         // The loading screen's lines; without them its panels have nothing to say (Coach Frank and the hint).
         let tips_lines: skate_data::tips_loader::TipsLines =
@@ -707,6 +750,15 @@ impl MenuStage {
             park_setup_id,
             park_setup: Default::default(),
             park_setup_open: None,
+            cac_id,
+            cac: Default::default(),
+            cac_open: None,
+            team_id,
+            team: Default::default(),
+            team_open: None,
+            cac_axis: 0.0,
+            cac_turn: 0.0,
+            cac_adjust: [0.0; 4],
             object_quick_menu_id,
             object_dropper: Default::default(),
             object_dropper_feed: None,
@@ -850,6 +902,16 @@ impl MenuStage {
 
     /// One frame of `seconds` (real time: the menus run while gameplay is suspended) with the pads' values.
     pub fn update(&mut self, pads: &[[f32; 24]], seconds: f32) -> Frame {
+        // The customisation's sliders move while the left stick or the d-pad is held (825FBAE8).
+        self.cac_axis = pads.first().map_or(0.0, |p| {
+            let dpad = p[3] - p[2];
+            if dpad != 0.0 { dpad } else { p[16] }
+        });
+        // And the triggers turn the skater (LT one way, RT the other).
+        self.cac_turn = pads.first().map_or(0.0, |p| p[10] - p[11]);
+        // The tattoo placement page: the bumpers turn (TopLeftShoulderHeld minus TopRightShoulderHeld), the left stick's
+        // up minus down scales, the right stick moves across and up (ManualRStickX, ManualRStickY; config/input.cfg).
+        self.cac_adjust = pads.first().map_or([0.0; 4], |p| [p[8] - p[9], p[18] - p[19], p[20] - p[21], p[22] - p[23]]);
         let keys = self.poll_keys(pads, seconds);
         self.update_keys(keys, seconds)
     }
@@ -884,6 +946,10 @@ impl MenuStage {
         let browser_id = self.browser_id.unwrap_or(0);
         let park_setup = self.index(PARK_SETUP_SCREEN).filter(|_| self.park_setup_id.is_some());
         let park_setup_id = self.park_setup_id.unwrap_or(0);
+        let cac = self.index(CAC_SCREEN).filter(|_| self.cac_id.is_some());
+        let cac_id = self.cac_id.unwrap_or(0);
+        let team = self.index(TEAM_SCREEN).filter(|_| self.team_id.is_some());
+        let team_id = self.team_id.unwrap_or(0);
         let (spawn_id, free_id) = (self.spawn_skater_id, self.free_skate_id);
         let loader = self.index(LOADING_SCREEN).filter(|_| self.tips_loader_id.is_some());
         let loader_id = self.tips_loader_id.unwrap_or(0);
@@ -918,6 +984,16 @@ impl MenuStage {
             fe.park_setup = crate::fe::park_setup_host::ParkSetupHost::open(lots);
             self.stack.request(Layer::Main, Request::push(p));
         }
+        fe.cac = std::mem::take(&mut self.cac);
+        fe.team = std::mem::take(&mut self.team);
+        if let (Some(t), Some(i)) = (self.team_open.take(), team) {
+            fe.team = crate::fe::team_host::TeamHost { screen: Some(t), ..Default::default() };
+            self.stack.request(Layer::Main, Request::push(i));
+        }
+        if let (Some((screen, cash)), Some(c)) = (self.cac_open.take(), cac) {
+            fe.cac = crate::fe::cac_host::CacHost { screen: Some(screen), cash, ..Default::default() };
+            self.stack.request(Layer::Main, Request::push(c));
+        }
         fe.signup_title = self.signup_shown.clone();
         fe.extras = std::mem::take(&mut self.extras);
         fe.extras.open = extras.is_some() && self.stack.top(Layer::Main) == extras;
@@ -945,7 +1021,9 @@ impl MenuStage {
         let sounds = &mut out.sounds;
         let log = &mut out.log;
         let popup_choices = &mut out.popup_choices;
+        let team_effects = &mut out.team_effects;
         let cheats_out = &mut out.cheats;
+        let unlocks_out = &mut out.unlocks;
         let text_entry = &mut out.text_entry;
         let spawn_out = &mut out.spawn_skater;
         let free_play_out = &mut out.free_play;
@@ -993,7 +1071,7 @@ impl MenuStage {
                     }
                 }
                 let target = stack.input_target();
-                let Some(screen) = target.filter(|t| [pause, options, cal, trick, map, extras, viewer, profile, spawn, free, browser, park_setup].contains(&Some(*t))) else { continue };
+                let Some(screen) = target.filter(|t| [pause, options, cal, trick, map, extras, viewer, profile, spawn, free, browser, park_setup, cac, team].contains(&Some(*t))) else { continue };
                 // sub_825EC0E8: the screen's C++ handler first, then the movie's UpdateInput when the handler did
                 // not consume the key and the screen's record says so (+12).
                 let mut consumed = false;
@@ -1019,6 +1097,10 @@ impl MenuStage {
                     browser_id
                 } else if Some(screen) == park_setup {
                     park_setup_id
+                } else if Some(screen) == cac {
+                    cac_id
+                } else if Some(screen) == team {
+                    team_id
                 } else {
                     trick_id
                 };
@@ -1057,6 +1139,49 @@ impl MenuStage {
                         }
                         None if !fe.browser.shown => consumed = true,
                         None => {}
+                    }
+                } else if Some(screen) == cac {
+                    // FE 15's C++ keys (825FC7E8): Left, Right and Back; the movie moves the selection and takes A.
+                    use skate_core::cac::Key;
+                    let k = match key {
+                        APT_PREVIOUS => Some(Key::Back),
+                        // The placement pages' own: A goes back to Pete's, X starts over, Y puts the top on and off.
+                        APT_NEXT => Some(Key::Accept),
+                        APT_OPTION => Some(Key::Reset),
+                        APT_MISC => Some(Key::Toggle),
+                        // Only the pad's own codes (0xE, 0xF, as 825FC7E8): a d-pad press also sends its AptD* twin.
+                        k if k == KEYS_LEFT[0] => Some(Key::Left),
+                        k if k == KEYS_RIGHT[0] => Some(Key::Right),
+                        _ => None,
+                    };
+                    if !fe.cac.shown {
+                        consumed = true;
+                    } else if let (Some(k), Some(c)) = (k, fe.cac.screen.as_mut()) {
+                        // Retail's handler returns whether it took the key; the movie gets the others.
+                        consumed = c.key(k);
+                        sounds.extend(c.sounds.drain(..).map(String::from));
+                        if std::mem::take(&mut c.closed) {
+                            stack.request(Layer::Main, Request::Close { screen });
+                        }
+                    }
+                } else if Some(screen) == team {
+                    // FE 67's C++ keys (82651EE0): B, Y and X; the movie moves the cards and the options and takes A.
+                    use skate_core::team::Key;
+                    let k = match key {
+                        APT_PREVIOUS => Some(Key::Back),
+                        APT_OPTION => Some(Key::Logos),
+                        APT_MISC => Some(Key::TeamName),
+                        _ => None,
+                    };
+                    if !fe.team.shown {
+                        consumed = true;
+                    } else if let (Some(k), Some(t)) = (k, fe.team.screen.as_mut()) {
+                        consumed = t.key(k);
+                        sounds.extend(t.sounds.drain(..).map(String::from));
+                        if std::mem::take(&mut t.closed) {
+                            fe.team.leaving = true;
+                            stack.request(Layer::Main, Request::Close { screen });
+                        }
                     }
                 } else if Some(screen) == park_setup {
                     // Park Setup's C++ keys (825D28C0): the movie takes none.
@@ -1324,6 +1449,30 @@ impl MenuStage {
                         fe.browser.open = false;
                         fe.browser.shown = false;
                         close(stage, browser_id, &mut fe)?;
+                    }
+                    Effect::Open(i) if Some(i) == team => {
+                        log.push(format!("open the team screen (FE {i})"));
+                        fe.team.shown = false;
+                        open_screen(stage, TEAM_PATH, TEAM, &mut fe)?;
+                    }
+                    Effect::Close(i) if Some(i) == team => {
+                        log.push(format!("close the team screen (FE {i})"));
+                        fe.team.shown = false;
+                        if std::mem::take(&mut fe.team.leaving) {
+                            fe.team.screen = None;
+                        }
+                        close(stage, team_id, &mut fe)?;
+                    }
+                    Effect::Open(i) if Some(i) == cac => {
+                        log.push(format!("open the customisation (FE {i})"));
+                        fe.cac.shown = false;
+                        open_screen(stage, CAC_PATH, CAC, &mut fe)?;
+                    }
+                    Effect::Close(i) if Some(i) == cac => {
+                        log.push(format!("close the customisation (FE {i})"));
+                        fe.cac.shown = false;
+                        fe.cac.finished = fe.cac.screen.take().map(|c| c.record);
+                        close(stage, cac_id, &mut fe)?;
                     }
                     Effect::Open(i) if Some(i) == park_setup => {
                         log.push(format!("open park setup (FE {i})"));
@@ -1645,6 +1794,99 @@ impl MenuStage {
                     }
                 }
             }
+            // The customisation: shown after its intro (ready: keys), then the movie's states and the row sounds.
+            if let Some(c) = cac.filter(|_| fe.cac.screen.is_some()) {
+                take_call(&mut fe, &format!("Game.OnScreenLoaded({cac_id})"));
+                if !fe.cac.shown && take_call(&mut fe, &format!("Game.OnScreenIntroComplete({cac_id})")) {
+                    fe.cac.shown = true;
+                    stack.ready(c);
+                    show_screen(stage, cac_id, true, &mut fe)?;
+                }
+                if fe.cac.shown {
+                    let states = fe.cac.screen.as_mut().map(|s| std::mem::take(&mut s.states)).unwrap_or_default();
+                    for state in states {
+                        set_state(stage, cac_id, state, &mut fe)?;
+                    }
+                }
+                if let Some(s) = fe.cac.screen.as_mut().filter(|_| fe.cac.shown) {
+                    if !self.popups.shown().is_some() {
+                        s.hold(self.cac_axis, seconds);
+                        s.turn_by(self.cac_turn, seconds);
+                        s.adjust_by(self.cac_adjust, seconds);
+                        s.tick(seconds);
+                    }
+                    if let Some(lower) = s.ask_tattoo.take() {
+                        self.popups.push(skate_core::fe_popup::PopupRequest {
+                            title: "ID_COMMON_WARNING_TITLE".into(),
+                            description: if lower { "ID_CAC_LOWER_TATTOO_CHANGE_CONFIRMATION" } else { "ID_CAC_UPPER_TATTOO_CHANGE_CONFIRMATION" }.into(),
+                            options: vec!["ID_COMMON_YES".into(), "ID_COMMON_NO".into()],
+                            callback: if lower { CAC_TATTOO_LOWER_POPUP } else { CAC_TATTOO_UPPER_POPUP }.into(),
+                            ..Default::default()
+                        });
+                        self.popup_dirty = true;
+                    }
+                    if std::mem::take(&mut s.ask_exit) {
+                        self.popups.push(skate_core::fe_popup::PopupRequest {
+                            title: "ID_COMMON_WARNING_TITLE".into(),
+                            description: "ID_CAC_EXIT_CAC_CONFIRMATION".into(),
+                            options: vec!["ID_COMMON_YES".into(), "ID_COMMON_NO".into()],
+                            callback: CAC_EXIT_POPUP.into(),
+                            ..Default::default()
+                        });
+                        self.popup_dirty = true;
+                    }
+                    if std::mem::take(&mut s.ask_gender) {
+                        self.popups.push(skate_core::fe_popup::PopupRequest {
+                            title: "ID_COMMON_WARNING_TITLE".into(),
+                            description: "ID_CAC_GENDERSWITCH_CONFIRMATION".into(),
+                            options: vec!["ID_COMMON_YES".into(), "ID_COMMON_NO".into()],
+                            callback: CAC_GENDER_POPUP.into(),
+                            ..Default::default()
+                        });
+                        self.popup_dirty = true;
+                    }
+                }
+                if let Some(s) = fe.cac.screen.as_mut() {
+                    sounds.extend(s.sounds.drain(..).map(String::from));
+                }
+            }
+            // The team screen: shown after its intro (82651A48), then its states; the empty-name warning is the game's
+            // popup, the other asks go to the game.
+            if let Some(t) = team.filter(|_| fe.team.screen.is_some()) {
+                take_call(&mut fe, &format!("Game.OnScreenLoaded({team_id})"));
+                if !fe.team.shown && take_call(&mut fe, &format!("Game.OnScreenIntroComplete({team_id})")) {
+                    fe.team.shown = true;
+                    stack.ready(t);
+                    show_screen(stage, team_id, true, &mut fe)?;
+                    if let Some(s) = fe.team.screen.as_mut() {
+                        s.shown();
+                    }
+                }
+                let (states, effects, team_sounds) = match fe.team.screen.as_mut().filter(|_| fe.team.shown) {
+                    Some(s) => (std::mem::take(&mut s.states), std::mem::take(&mut s.effects), std::mem::take(&mut s.sounds)),
+                    None => Default::default(),
+                };
+                for state in states {
+                    set_state(stage, team_id, state, &mut fe)?;
+                }
+                sounds.extend(team_sounds.into_iter().map(String::from));
+                {
+                    for effect in effects {
+                        if effect == skate_core::team::Effect::EmptyTeamName {
+                            self.popups.push(skate_core::fe_popup::PopupRequest {
+                                title: "ID_COMMON_WARNING_TITLE".into(),
+                                description: "ID_TEAM_MANAGEMENT_EMPTY_TEAM_NAME".into(),
+                                options: vec!["ID_COMMON_OK".into()],
+                                callback: TEAM_NAME_POPUP.into(),
+                                ..Default::default()
+                            });
+                            self.popup_dirty = true;
+                        } else {
+                            team_effects.push(effect);
+                        }
+                    }
+                }
+            }
             // Park Setup: shown after its intro (ready: keys), then its refreshes.
             if let Some(p) = park_setup.filter(|_| fe.park_setup.open) {
                 take_call(&mut fe, &format!("Game.OnScreenLoaded({park_setup_id})"));
@@ -1755,6 +1997,25 @@ impl MenuStage {
                     if let Some(c) = cal.filter(|c| stack.active(*c)) {
                         let action = self.video_cal.popup_result(event.choice as u32, &self.video_cal_rules);
                         run_calibration(stage, stack, &mut self.popups, &mut self.popup_dirty, &self.video_cal_rules, cal_id, action, c, &mut fe, log)?;
+                    }
+                } else if event.callback == TEAM_NAME_POPUP {
+                    team_effects.push(skate_core::team::Effect::RenameTeam);
+                } else if event.callback == CAC_GENDER_POPUP {
+                    if let Some(c) = fe.cac.screen.as_mut().filter(|_| event.choice == 0) {
+                        c.switch_gender();
+                    }
+                } else if event.callback == CAC_TATTOO_UPPER_POPUP || event.callback == CAC_TATTOO_LOWER_POPUP {
+                    if let Some(c) = fe.cac.screen.as_mut() {
+                        c.tattoo_answer(event.callback == CAC_TATTOO_LOWER_POPUP, event.choice == 0);
+                    }
+                } else if event.callback == CAC_EXIT_POPUP {
+                    if let Some(c) = fe.cac.screen.as_mut() {
+                        c.exit_answer(event.choice == 0);
+                        if std::mem::take(&mut c.closed) {
+                            if let Some(screen) = cac {
+                                stack.request(Layer::Main, Request::Close { screen });
+                            }
+                        }
                     }
                 } else {
                     popup_choices.push((event.callback, event.choice));
@@ -1926,11 +2187,16 @@ impl MenuStage {
                             stack.request(Layer::Main, Request::push(e));
                         }
                     }
-                    // Rows 1-3 (upstream: unlock directly): the grants go to the unlock store (none on the Vita either:
-                    // nothing is locked), the popup says it worked.
+                    // Rows 1-3 (upstream: unlock directly): the grants go to the game's unlock store, the popup says it
+                    // worked.
                     ExtrasAction::Grant { redeem, grants } => {
                         for unlock in std::iter::once(redeem).chain(grants) {
                             log.push(format!("unlock {} {}", unlock.kind, unlock.name));
+                            match skate_core::unlocks::UnlockKind::from_extras(&unlock.kind) {
+                                Some(kind) => unlocks_out.push((kind, unlock.name)),
+                                // Challenges go to the progression manager in retail (not ported yet).
+                                None => log.push(format!("unlock {} not for the unlock store", unlock.kind)),
+                            }
                         }
                         self.popups.push(PopupRequest {
                             title: "ID_VALID_CODE_TITLE".into(),
@@ -2048,6 +2314,8 @@ impl MenuStage {
         self.object_dropper = std::mem::take(&mut fe.object_dropper);
         self.browser = std::mem::take(&mut fe.browser);
         self.park_setup = std::mem::take(&mut fe.park_setup);
+        self.cac = std::mem::take(&mut fe.cac);
+        self.team = std::mem::take(&mut fe.team);
         self.extras = std::mem::take(&mut fe.extras);
         self.tos = std::mem::take(&mut fe.tos);
         self.offline_profile = std::mem::take(&mut fe.offline_profile);
@@ -2262,7 +2530,8 @@ impl MenuStage {
             let named = [SLOT_TEXTURE_PREFIX, ASSET_TEXTURE_PREFIX, crate::fe::retail_menu_movies::NAMED_IMAGE_PREFIX]
                 .iter()
                 .any(|p| d.texture.starts_with(p));
-            !named || self.movies.image(&d.texture).is_some()
+            // Slappy's thumbnails are not in the menu set: the game supplies them (skate_vita: `cas.pak`).
+            !named || d.texture.starts_with(CAS_THUMB_PREFIX) || self.movies.image(&d.texture).is_some()
         });
         // The FE fader over everything (alpha 1 = black), past the stage edges for any aspect ratio.
         if self.fade.alpha > 0.0 {
@@ -2433,6 +2702,65 @@ impl MenuStage {
         }
         self.park_setup_open = Some(lots);
         true
+    }
+
+    /// skate_vita: opens the character customisation (FE 15) on a skater; false without its movie.
+    pub fn open_cac(&mut self, screen: skate_core::cac::Cac, cash: u32) -> bool {
+        if self.cac_id.is_none() || self.index(CAC_SCREEN).is_none() {
+            return false;
+        }
+        self.cac_open = Some((screen, cash));
+        true
+    }
+
+    /// skate_vita: the customisation's skater when its mesh is out of date (once per change), to build and show.
+    pub fn cac_look(&mut self) -> Option<(skate_core::skater_record::SkaterRecord, skate_core::cac::LookChange)> {
+        let c = self.cac.screen.as_mut()?;
+        let change = c.look.take()?;
+        Some((c.shown_record().into_owned(), change))
+    }
+
+    /// skate_vita: the tattoos' shader rows of the customisation's skater (the placement moves without a rebuild).
+    pub fn cac_decal_rows(&self) -> Option<[[[f32; 3]; 2]; 5]> {
+        self.cac.screen.as_ref().map(|c| c.decal_rows())
+    }
+
+    /// skate_vita: the customisation's mesh is built: its keys go on.
+    pub fn cac_look_done(&mut self) {
+        if let Some(c) = self.cac.screen.as_mut() {
+            c.look_done();
+        }
+    }
+
+    /// skate_vita: what the customisation's preview draws, while it is open.
+    pub fn cac_preview(&self) -> Option<skate_core::cac::Preview> {
+        self.cac.screen.as_ref().filter(|_| self.cac.shown)?.preview()
+    }
+
+    /// skate_vita: opens the team screen (FE 67) on the career team; false without its movie.
+    pub fn open_team(&mut self, team: skate_core::team::Team) -> bool {
+        if self.team_id.is_none() || self.index(TEAM_SCREEN).is_none() {
+            return false;
+        }
+        self.team_open = Some(team);
+        true
+    }
+
+    /// skate_vita: a name typed for the team screen (`member` None: the team's).
+    pub fn team_named(&mut self, member: Option<usize>, text: &str) {
+        if let Some(t) = self.team.screen.as_mut() {
+            t.named(member, text);
+        }
+    }
+
+    /// skate_vita: the team screen's names (the team's, the members'), while it is open.
+    pub fn team(&self) -> Option<&skate_core::team::Team> {
+        self.team.screen.as_ref()
+    }
+
+    /// skate_vita: the skater the player left the customisation with, once.
+    pub fn take_cac(&mut self) -> Option<skate_core::skater_record::SkaterRecord> {
+        self.cac.finished.take()
     }
 
     /// skate_vita: the lot and template the player took in Park Setup since the last call.
@@ -3167,6 +3495,461 @@ mod replay_tests {
         let log = run(&mut ms, vec![APT_PREVIOUS], 60);
         assert!(log.iter().any(|l| l.starts_with("close park setup")), "{log:?}");
         assert!(ms.open(), "B returns to the pause menu");
+    }
+
+    /// The character customisation on the lean set: opened on a skater, shown after its intro, every `CAC_*` native
+    /// it asks answered; the movie moves the rows, Left and Right step them, A enters and leaves Edit Style, B exits.
+    /// Data-gated like the pause test.
+    #[test]
+    fn the_customisation_opens_edits_a_skater_and_closes() {
+        use skate_core::cac::{Cac, MENU_EDIT_SKATER, MENU_EDIT_STYLE};
+        use skate_core::skater_record::SkaterRecord;
+        let Some(root) = crate::fe::apt_imports::test_menu_set() else { return };
+        let assets = crate::fe::apt_imports::main_checkout().join("assets");
+        let read_set = |p: &str| std::fs::read(root.join(p)).map_err(|e| format!("{p}: {e}"));
+        let read = |p: &str| std::fs::read(assets.join(p)).map_err(|e| format!("{p}: {e}"));
+        if read(TABLES).is_err() {
+            eprintln!("skipped: no menu tables");
+            return;
+        }
+        let movies = RetailMenuMovies::read_lean(&read_set, Some(&PAUSE_ROOTS)).unwrap();
+        let mut ms = MenuStage::boot(movies, &read).unwrap();
+        let run = |ms: &mut MenuStage, keys: Vec<u32>, frames: usize| {
+            let mut log = Vec::new();
+            for frame in 0..frames {
+                let keys = if frame == 0 { keys.iter().map(|&k| (k, 0)).collect() } else { Vec::new() };
+                log.append(&mut ms.update_keys(keys, 1.0 / 60.0).log);
+            }
+            assert!(!ms.failed, "{log:?}");
+            log
+        };
+        run(&mut ms, vec![APT_START], 90);
+        let mut record = SkaterRecord::cleared();
+        (record.trucks, record.wheels) = (0.7, 0.7);
+        if !ms.open_cac(Cac::open(record, &skate_core::unlocks::UnlockStore::fresh_profile(), None), 1234) {
+            eprintln!("skipped: no customisation movie in this set");
+            return;
+        }
+        let log = run(&mut ms, Vec::new(), 180);
+        assert!(log.iter().any(|l| l.starts_with("open the customisation")), "{log:?}");
+        assert!(ms.cac.shown, "shown after its intro: {log:?}");
+        let draws = ms.draw();
+        let unhandled = ms.stage.unhandled();
+        eprintln!("customisation: {} draws, unhandled {unhandled:?}", draws.len());
+        assert!(!unhandled.iter().any(|n| n.contains("CAC_")), "{unhandled:?}");
+        assert!(draws.len() > 20, "the screen draws");
+        let c = |ms: &MenuStage| ms.cac.screen.clone().unwrap();
+        assert_eq!((c(&ms).menu(), c(&ms).cursor().0), (MENU_EDIT_SKATER, 0));
+        // Three rows down to the trucks, as the Vita sends a press: the pad's code and its d-pad twin.
+        for _ in 0..3 {
+            run(&mut ms, vec![KEYS_DOWN[0], KEYS_DOWN[1]], 12);
+        }
+        assert_eq!(c(&ms).cursor().0, 3, "the movie moved the row");
+        run(&mut ms, vec![KEYS_RIGHT[0], KEYS_RIGHT[1]], 6);
+        assert!((c(&ms).record.trucks - 0.8).abs() < 1e-5, "{}", c(&ms).record.trucks);
+        // Up to Edit Style; A enters it, the selection on its first row.
+        run(&mut ms, vec![KEYS_UP[0], KEYS_UP[1]], 12);
+        run(&mut ms, vec![APT_NEXT], 30);
+        assert_eq!((c(&ms).menu(), c(&ms).cursor().0), (MENU_EDIT_STYLE, 0));
+        // The style row (6th): Right turns Aggressive to Standard.
+        for _ in 0..5 {
+            run(&mut ms, vec![KEYS_DOWN[0], KEYS_DOWN[1]], 12);
+        }
+        assert_eq!(c(&ms).cursor().0, 5);
+        assert_eq!(c(&ms).record.style, 3);
+        run(&mut ms, vec![KEYS_RIGHT[0], KEYS_RIGHT[1]], 6);
+        assert_eq!(c(&ms).record.style, 0);
+        // A accepts, back on Edit Skater; B asks first (82603290), Yes exits with the record, back on the pause menu.
+        run(&mut ms, vec![APT_NEXT], 30);
+        assert_eq!(c(&ms).menu(), MENU_EDIT_SKATER);
+        let log = run(&mut ms, vec![APT_PREVIOUS], 60);
+        assert!(ms.popup_shown() && log.iter().any(|l| l.contains("cac.exit")), "{log:?}");
+        let log = run(&mut ms, vec![APT_NEXT], 60);
+        assert!(log.iter().any(|l| l.starts_with("close the customisation")), "{log:?}");
+        let finished = ms.take_cac().expect("the record comes back");
+        assert_eq!(finished.style, 0);
+        assert!((finished.trucks - 0.8).abs() < 1e-5);
+        assert!(ms.take_cac().is_none());
+        assert!(ms.open(), "B returns to the pause menu");
+    }
+
+    /// Slappy's on the real movie with a small catalog: Edit Skater > Slappy's > T-shirts opens the thumbnails, the
+    /// tiles load their pictures through the image slots, a highlight tries the tee on after half a second, A wears it
+    /// and goes back to Slappy's, B leaves. Data-gated like the pause test.
+    #[test]
+    fn slappys_lists_thumbnails_tries_on_and_wears() {
+        use skate_core::cac::{Cac, CacData, MENU_SLAPPYS, MENU_THUMBNAILS};
+        use skate_core::cas_rules::{Catalog, Vault};
+        use skate_core::skater_record::{Item, SkaterRecord, Slot};
+        use std::collections::BTreeMap;
+        let Some(root) = crate::fe::apt_imports::test_menu_set() else { return };
+        let assets = crate::fe::apt_imports::main_checkout().join("assets");
+        let read_set = |p: &str| std::fs::read(root.join(p)).map_err(|e| format!("{p}: {e}"));
+        let read = |p: &str| std::fs::read(assets.join(p)).map_err(|e| format!("{p}: {e}"));
+        if read(TABLES).is_err() {
+            eprintln!("skipped: no menu tables");
+            return;
+        }
+        let movies = RetailMenuMovies::read_lean(&read_set, Some(&PAUSE_ROOTS)).unwrap();
+        let mut ms = MenuStage::boot(movies, &read).unwrap();
+        let run = |ms: &mut MenuStage, keys: Vec<u32>, frames: usize| {
+            let mut log = Vec::new();
+            for frame in 0..frames {
+                let keys = if frame == 0 { keys.iter().map(|&k| (k, 0)).collect() } else { Vec::new() };
+                log.append(&mut ms.update_keys(keys, 1.0 / 60.0).log);
+            }
+            assert!(!ms.failed, "{log:?}");
+            log
+        };
+        run(&mut ms, vec![APT_START], 90);
+        let tee = |n: u64| Item { model: 0x70 + n, material: 1 };
+        let row = |n: u64, brand: &str| {
+            let fields: BTreeMap<String, String> = [("Gender", "male"), ("TopType", "tshirt"), ("ManufacturerID", brand), ("ModelName", "tee"), ("MaterialVariantName", &format!("v{n}"))]
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            (Slot::OuterTorso, tee(n), fields)
+        };
+        let catalog = Catalog::build(&[row(0, "zoo"), row(1, "alien"), row(2, "volcom")], &[]);
+        let data = std::sync::Arc::new(CacData { catalog, vault: Vault::default(), fallback: [SkaterRecord::cleared(), SkaterRecord::cleared()] });
+        let mut record = SkaterRecord::cleared();
+        record.worn[Slot::OuterTorso as usize] = tee(0);
+        if !ms.open_cac(Cac::open(record, &skate_core::unlocks::UnlockStore::fresh_profile(), Some(data)), 0) {
+            eprintln!("skipped: no customisation movie in this set");
+            return;
+        }
+        run(&mut ms, Vec::new(), 180);
+        let c = |ms: &MenuStage| ms.cac.screen.clone().unwrap();
+        // Slappy's (row 1), then T-shirts (its row 1).
+        run(&mut ms, vec![KEYS_DOWN[0], KEYS_DOWN[1]], 12);
+        run(&mut ms, vec![APT_NEXT], 30);
+        assert_eq!(c(&ms).menu(), MENU_SLAPPYS);
+        run(&mut ms, vec![KEYS_DOWN[0], KEYS_DOWN[1]], 12);
+        run(&mut ms, vec![APT_NEXT], 30);
+        assert_eq!((c(&ms).menu(), c(&ms).row_count()), (MENU_THUMBNAILS, 4), "remove, the worn tee, then by brand");
+        let unhandled = ms.stage.unhandled();
+        assert!(!unhandled.iter().any(|n| n.contains("CAC_")), "{unhandled:?}");
+        // The 3 x 3 grid loads its four tiles' pictures (LoadRX2Texture > ImageRenderer_Load).
+        let images: Vec<String> = ms.image_slots.slots.iter().filter_map(|s| s.image.clone()).collect();
+        assert!(images.iter().any(|i| i.ends_with("fe/cas/general/remove")), "{images:?}");
+        assert!(images.iter().any(|i| i.ends_with("fe/cas/male/outertorso/tee_v1")), "{images:?}");
+        // The tiles are drawn with those keys (the menu set has no such images; the game supplies them).
+        let drawn: Vec<String> = ms.draw().into_iter().map(|d| d.texture).filter(|t| t.starts_with(CAS_THUMB_PREFIX)).collect();
+        assert!(drawn.iter().any(|t| t.ends_with("fe/cas/general/remove")) && drawn.iter().any(|t| t.ends_with("tee_v1")), "{drawn:?}");
+        // Right to the alien tee (row 2): tried on after half a second, the record unchanged.
+        run(&mut ms, vec![KEYS_RIGHT[0], KEYS_RIGHT[1]], 6);
+        run(&mut ms, vec![KEYS_RIGHT[0], KEYS_RIGHT[1]], 40);
+        assert_eq!(c(&ms).trying, Some((Slot::OuterTorso, tee(1))));
+        assert_eq!(ms.cac_look().map(|(r, _)| r.worn[Slot::OuterTorso as usize]), Some(tee(1)));
+        assert_eq!(c(&ms).record.worn[Slot::OuterTorso as usize], tee(0));
+        ms.cac_look_done();
+        // A wears it and goes back to Slappy's.
+        run(&mut ms, vec![APT_NEXT], 30);
+        ms.cac_look_done();
+        assert_eq!((c(&ms).menu(), c(&ms).record.worn[Slot::OuterTorso as usize], c(&ms).trying), (MENU_SLAPPYS, tee(1), None));
+        // B to Edit Skater, B asks, Yes closes.
+        run(&mut ms, vec![APT_PREVIOUS], 30);
+        run(&mut ms, vec![APT_PREVIOUS], 30);
+        let log = run(&mut ms, vec![APT_NEXT], 60);
+        assert!(log.iter().any(|l| l.starts_with("close the customisation")), "{log:?}");
+        assert_eq!(ms.take_cac().map(|r| r.worn[Slot::OuterTorso as usize]), Some(tee(1)));
+    }
+
+    /// The tattoo pages on the real movie: Edit Skater > Back Alley Pete's > Upper Body Tattoo > Front > the first
+    /// category > a stamp opens the placement page; the movie asks for nothing the host lacks, the keys and the sticks
+    /// move the placement, A goes back to Pete's. Data-gated like the pause test.
+    #[test]
+    fn the_tattoo_pages_open_on_the_real_movie_and_place_a_stamp() {
+        use skate_core::cac::{Cac, CacData, MENU_BACK_ALLEY, MENU_TATTOO_ADJUST_UPPER, MENU_TATTOO_CATEGORIES, MENU_TATTOO_STAMPS, MENU_TATTOO_UPPER};
+        use skate_core::cas_rules::{Catalog, TattooCategory, Vault};
+        use skate_core::skater_record::{Item, SkaterRecord, Slot};
+        use std::collections::BTreeMap;
+        let Some(root) = crate::fe::apt_imports::test_menu_set() else { return };
+        let assets = crate::fe::apt_imports::main_checkout().join("assets");
+        let read_set = |p: &str| std::fs::read(root.join(p)).map_err(|e| format!("{p}: {e}"));
+        let read = |p: &str| std::fs::read(assets.join(p)).map_err(|e| format!("{p}: {e}"));
+        if read(TABLES).is_err() {
+            eprintln!("skipped: no menu tables");
+            return;
+        }
+        let movies = RetailMenuMovies::read_lean(&read_set, Some(&PAUSE_ROOTS)).unwrap();
+        let mut ms = MenuStage::boot(movies, &read).unwrap();
+        let run = |ms: &mut MenuStage, keys: Vec<u32>, frames: usize| {
+            let mut log = Vec::new();
+            for frame in 0..frames {
+                let keys = if frame == 0 { keys.iter().map(|&k| (k, 0)).collect() } else { Vec::new() };
+                log.append(&mut ms.update_keys(keys, 1.0 / 60.0).log);
+            }
+            assert!(!ms.failed, "{log:?}");
+            log
+        };
+        run(&mut ms, vec![APT_START], 90);
+        let stamp = |n: u64, category: &str| {
+            let mut fields: BTreeMap<String, String> =
+                [("ModelName", "logo_object"), ("MaterialVariantName", &format!("tattoo_{n}_mat"))].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+            if !category.is_empty() {
+                fields.insert("TattooCategory".into(), category.into());
+            }
+            (Slot::Misc, Item { model: 0xC0 + n, material: 1 }, fields)
+        };
+        let catalog = Catalog::build(&[stamp(1, "1"), stamp(2, "1"), stamp(3, "2")], &[]);
+        let vault = Vault {
+            tattoo_categories: vec![TattooCategory { text: "1".into(), untagged: false }, TattooCategory { text: "2".into(), untagged: false }],
+            ..Vault::default()
+        };
+        let data = std::sync::Arc::new(CacData { catalog, vault, fallback: [SkaterRecord::cleared(), SkaterRecord::cleared()] });
+        if !ms.open_cac(Cac::open(SkaterRecord::cleared(), &skate_core::unlocks::UnlockStore::fresh_profile(), Some(data)), 0) {
+            eprintln!("skipped: no customisation movie in this set");
+            return;
+        }
+        run(&mut ms, Vec::new(), 180);
+        let c = |ms: &MenuStage| ms.cac.screen.clone().unwrap();
+        let down = |ms: &mut MenuStage, n: usize| {
+            for _ in 0..n {
+                run(ms, vec![KEYS_DOWN[0], KEYS_DOWN[1]], 12);
+            }
+        };
+        // Pete's (row 0); the upper tattoo is its row 7.
+        run(&mut ms, vec![APT_NEXT], 30);
+        assert_eq!(c(&ms).menu(), MENU_BACK_ALLEY);
+        down(&mut ms, 7);
+        run(&mut ms, vec![APT_NEXT], 30);
+        assert_eq!((c(&ms).menu(), c(&ms).row_count()), (MENU_TATTOO_UPPER, 4));
+        // The front: no tattoo yet, so the categories open.
+        run(&mut ms, vec![APT_NEXT], 30);
+        ms.cac_look_done();
+        assert_eq!((c(&ms).menu(), c(&ms).row_count()), (MENU_TATTOO_CATEGORIES, 2));
+        run(&mut ms, vec![APT_NEXT], 30);
+        assert_eq!((c(&ms).menu(), c(&ms).row_count()), (MENU_TATTOO_STAMPS, 3), "remove and the category's two stamps");
+        let images: Vec<String> = ms.image_slots.slots.iter().filter_map(|s| s.image.clone()).collect();
+        assert!(images.iter().any(|i| i.ends_with("fe/cas/general/remove")) && images.iter().any(|i| i.ends_with("logo_object_tattoo_2_mat")), "{images:?}");
+        // The second stamp (row 2), then A opens the placement page.
+        run(&mut ms, vec![KEYS_RIGHT[0], KEYS_RIGHT[1]], 12);
+        run(&mut ms, vec![KEYS_RIGHT[0], KEYS_RIGHT[1]], 12);
+        run(&mut ms, vec![APT_NEXT], 30);
+        assert_eq!(c(&ms).menu(), MENU_TATTOO_ADJUST_UPPER);
+        assert!(ms.cac_look().is_some(), "the stamp asks for the mesh");
+        ms.cac_look_done();
+        let unhandled = ms.stage.unhandled();
+        assert!(!unhandled.iter().any(|n| n.contains("CAC_")), "{unhandled:?}");
+        // The sticks move it, X starts over, A goes back to Pete's.
+        let start = c(&ms).record.adjust.values[1];
+        let mut pad = [0.0f32; 24];
+        pad[20] = 1.0;
+        for _ in 0..10 {
+            ms.update(&[pad], 1.0 / 60.0);
+        }
+        assert_ne!(c(&ms).record.adjust.values[1], start);
+        ms.update(&[[0.0f32; 24]], 1.0 / 60.0);
+        run(&mut ms, vec![APT_OPTION], 4);
+        assert_eq!(c(&ms).record.adjust.values[1], start);
+        run(&mut ms, vec![APT_NEXT], 30);
+        ms.cac_look_done();
+        assert_eq!(c(&ms).menu(), MENU_BACK_ALLEY);
+        assert_eq!(c(&ms).record.graphics.len(), 1);
+    }
+
+    /// A deck's graphic on the real movie: Slappy's > Skateboards > Boards > a logoable deck > Add Graphic > Brand > a
+    /// logo opens the board's placement page; the movie asks for nothing the host lacks. Data-gated like the others.
+    #[test]
+    fn a_decks_graphic_pages_open_on_the_real_movie() {
+        use skate_core::cac::{Cac, CacData, MENU_ADJUST_BOARD, MENU_GRAPHIC_BRAND, MENU_GRAPHIC_CATEGORIES, MENU_SLAPPYS, MENU_THUMBNAILS, MENU_WEAR_STYLES};
+        use skate_core::cas_rules::{Catalog, Vault};
+        use skate_core::skater_record::{Item, SkaterRecord, Slot};
+        use std::collections::BTreeMap;
+        let Some(root) = crate::fe::apt_imports::test_menu_set() else { return };
+        let assets = crate::fe::apt_imports::main_checkout().join("assets");
+        let read_set = |p: &str| std::fs::read(root.join(p)).map_err(|e| format!("{p}: {e}"));
+        let read = |p: &str| std::fs::read(assets.join(p)).map_err(|e| format!("{p}: {e}"));
+        if read(TABLES).is_err() {
+            eprintln!("skipped: no menu tables");
+            return;
+        }
+        let movies = RetailMenuMovies::read_lean(&read_set, Some(&PAUSE_ROOTS)).unwrap();
+        let mut ms = MenuStage::boot(movies, &read).unwrap();
+        let run = |ms: &mut MenuStage, keys: Vec<u32>, frames: usize| {
+            for frame in 0..frames {
+                let keys = if frame == 0 { keys.iter().map(|&k| (k, 0)).collect() } else { Vec::new() };
+                ms.update_keys(keys, 1.0 / 60.0);
+            }
+            assert!(!ms.failed);
+        };
+        run(&mut ms, vec![APT_START], 90);
+        let fields = |pairs: &[(&str, &str)]| pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<BTreeMap<_, _>>();
+        let deck = Item { model: 0xB1, material: 1 };
+        let logo = Item { model: 0xC0, material: 1 };
+        let rows = vec![
+            (Slot::SkateBoard, deck, fields(&[("IsLogoable", "1")])),
+            // A text the catalog lacks reads as the empty field (82DDD7D8), so the genders must be held.
+            (Slot::Misc, logo, fields(&[("ModelName", "logo_object"), ("MaterialVariantName", "logo_thing"), ("Gender", "female")])),
+        ];
+        let data = std::sync::Arc::new(CacData { catalog: Catalog::build(&rows, &[]), vault: Vault::default(), fallback: [SkaterRecord::cleared(), SkaterRecord::cleared()] });
+        if !ms.open_cac(Cac::open(SkaterRecord::cleared(), &skate_core::unlocks::UnlockStore::fresh_profile(), Some(data)), 0) {
+            eprintln!("skipped: no customisation movie in this set");
+            return;
+        }
+        run(&mut ms, Vec::new(), 180);
+        let c = |ms: &MenuStage| ms.cac.screen.clone().unwrap();
+        let down = |ms: &mut MenuStage, n: usize| {
+            for _ in 0..n {
+                run(ms, vec![KEYS_DOWN[0], KEYS_DOWN[1]], 12);
+            }
+        };
+        // Slappy's (row 1), Skateboards (its row 10 = the last), Boards (row 0).
+        down(&mut ms, 1);
+        run(&mut ms, vec![APT_NEXT], 30);
+        assert_eq!(c(&ms).menu(), MENU_SLAPPYS);
+        down(&mut ms, 10);
+        run(&mut ms, vec![APT_NEXT], 30);
+        run(&mut ms, vec![APT_NEXT], 30);
+        assert_eq!((c(&ms).menu(), c(&ms).title(), c(&ms).row_count()), (MENU_THUMBNAILS, "ID_CAC_BOARDS_TITLE", 1));
+        run(&mut ms, vec![APT_NEXT], 30);
+        ms.cac_look_done();
+        assert_eq!((c(&ms).menu(), c(&ms).title(), c(&ms).busy), (MENU_WEAR_STYLES, "ID_CUSTOM_EDITDECK", false));
+        // Add Graphic (row 0), Brand (row 0), the logo.
+        run(&mut ms, vec![APT_NEXT], 30);
+        assert_eq!(c(&ms).menu(), MENU_GRAPHIC_CATEGORIES);
+        run(&mut ms, vec![APT_NEXT], 30);
+        assert_eq!((c(&ms).menu(), c(&ms).row_count()), (MENU_GRAPHIC_BRAND, 1));
+        run(&mut ms, vec![APT_NEXT], 30);
+        assert_eq!(c(&ms).menu(), MENU_ADJUST_BOARD);
+        assert!(ms.cac_look().is_some());
+        ms.cac_look_done();
+        let unhandled = ms.stage.unhandled();
+        assert!(!unhandled.iter().any(|n| n.contains("CAC_")), "{unhandled:?}");
+        // A goes back to Slappy's.
+        run(&mut ms, vec![APT_NEXT], 30);
+        assert_eq!(c(&ms).menu(), MENU_SLAPPYS);
+        assert_eq!(c(&ms).record.graphics.len(), 1);
+    }
+
+    /// Wear Styles on the real movie: a colourisable tee picked on the thumbnails opens the morph page with its colour
+    /// row (swatches from the outer torso's zone); Right steps the colour onto the tee, A accepts back to Slappy's.
+    #[test]
+    fn wear_styles_opens_on_a_colourisable_item_and_its_colour_row_tints_it() {
+        use skate_core::cac::{Cac, CacData, MENU_SLAPPYS, MENU_WEAR_STYLES};
+        use skate_core::cas_rules::{Catalog, Colour, Vault, Zone};
+        use skate_core::skater_record::{Item, SkaterRecord, Slot};
+        use std::collections::BTreeMap;
+        let Some(root) = crate::fe::apt_imports::test_menu_set() else { return };
+        let assets = crate::fe::apt_imports::main_checkout().join("assets");
+        let read_set = |p: &str| std::fs::read(root.join(p)).map_err(|e| format!("{p}: {e}"));
+        let read = |p: &str| std::fs::read(assets.join(p)).map_err(|e| format!("{p}: {e}"));
+        if read(TABLES).is_err() {
+            eprintln!("skipped: no menu tables");
+            return;
+        }
+        let movies = RetailMenuMovies::read_lean(&read_set, Some(&PAUSE_ROOTS)).unwrap();
+        let mut ms = MenuStage::boot(movies, &read).unwrap();
+        let run = |ms: &mut MenuStage, keys: Vec<u32>, frames: usize| {
+            let mut log = Vec::new();
+            for frame in 0..frames {
+                let keys = if frame == 0 { keys.iter().map(|&k| (k, 0)).collect() } else { Vec::new() };
+                log.append(&mut ms.update_keys(keys, 1.0 / 60.0).log);
+            }
+            assert!(!ms.failed, "{log:?}");
+            log
+        };
+        run(&mut ms, vec![APT_START], 90);
+        let tee = Item { model: 0x70, material: 1 };
+        let fields: BTreeMap<String, String> =
+            [("Gender", "male"), ("TopType", "tshirt"), ("IsColourizable", "1"), ("ModelName", "tee"), ("MaterialVariantName", "plain")].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let catalog = Catalog::build(&[(Slot::OuterTorso, tee, fields)], &[]);
+        let colour = |key: u64, tag: &str, v: f32| Colour { key, primary: [v; 3], swatch: [v; 3], secondary: [0.0; 3], tag: tag.into() };
+        let vault = Vault { zones: vec![Zone { key: 9, slot: 9, colours: vec![colour(1, "red", 0.7), colour(2, "blue", 0.2)] }], ..Vault::default() };
+        let data = std::sync::Arc::new(CacData { catalog, vault, fallback: [SkaterRecord::cleared(), SkaterRecord::cleared()] });
+        if !ms.open_cac(Cac::open(SkaterRecord::cleared(), &skate_core::unlocks::UnlockStore::fresh_profile(), Some(data)), 0) {
+            eprintln!("skipped: no customisation movie in this set");
+            return;
+        }
+        run(&mut ms, Vec::new(), 180);
+        let c = |ms: &MenuStage| ms.cac.screen.clone().unwrap();
+        run(&mut ms, vec![KEYS_DOWN[0], KEYS_DOWN[1]], 12);
+        run(&mut ms, vec![APT_NEXT], 30);
+        run(&mut ms, vec![KEYS_DOWN[0], KEYS_DOWN[1]], 12);
+        run(&mut ms, vec![APT_NEXT], 30);
+        // Tiles: remove, the tee. Right to the tee, A.
+        run(&mut ms, vec![KEYS_RIGHT[0], KEYS_RIGHT[1]], 12);
+        run(&mut ms, vec![APT_NEXT], 30);
+        ms.cac_look_done();
+        assert_eq!((c(&ms).menu(), c(&ms).row_count(), c(&ms).record.worn[Slot::OuterTorso as usize]), (MENU_WEAR_STYLES, 1, tee));
+        let unhandled = ms.stage.unhandled();
+        assert!(!unhandled.iter().any(|n| n.contains("CAC_")), "{unhandled:?}");
+        // Right on the colour row: the second colour on the tee's layer.
+        run(&mut ms, vec![KEYS_RIGHT[0], KEYS_RIGHT[1]], 12);
+        ms.cac_look_done();
+        assert!(c(&ms).record.colours.iter().any(|l| l.index == 9 && l.part == tee && l.primary == [0.2; 3]), "{:?}", c(&ms).record.colours);
+        run(&mut ms, vec![APT_NEXT], 30);
+        assert_eq!(c(&ms).menu(), MENU_SLAPPYS);
+    }
+
+    /// The team screen (FE 67) on the real movie: shown after its intro with the team's data, every TeamManagement
+    /// native answered, the empty-name warning raised; Y opens the logos, B comes back then closes. Data-gated.
+    #[test]
+    fn the_team_screen_opens_shows_the_team_and_closes() {
+        use skate_core::team::{Team, STATE_LOGOS};
+        let Some(root) = crate::fe::apt_imports::test_menu_set() else { return };
+        let assets = crate::fe::apt_imports::main_checkout().join("assets");
+        let read_set = |p: &str| std::fs::read(root.join(p)).map_err(|e| format!("{p}: {e}"));
+        let read = |p: &str| std::fs::read(assets.join(p)).map_err(|e| format!("{p}: {e}"));
+        if read(TABLES).is_err() {
+            eprintln!("skipped: no menu tables");
+            return;
+        }
+        let movies = RetailMenuMovies::read_lean(&read_set, Some(&PAUSE_ROOTS)).unwrap();
+        let mut ms = MenuStage::boot(movies, &read).unwrap();
+        let run = |ms: &mut MenuStage, keys: Vec<u32>, frames: usize| {
+            let mut log = Vec::new();
+            let mut popups = Vec::new();
+            for frame in 0..frames {
+                let keys = if frame == 0 { keys.iter().map(|&k| (k, 0)).collect() } else { Vec::new() };
+                let f = ms.update_keys(keys, 1.0 / 60.0);
+                log.extend(f.log);
+                popups.extend(f.team_effects);
+            }
+            assert!(!ms.failed, "{log:?}");
+            (log, popups)
+        };
+        run(&mut ms, vec![APT_START], 90);
+        if !ms.open_team(Team::open(String::new(), vec!["Me".into()])) {
+            eprintln!("skipped: no team movie in this set");
+            return;
+        }
+        let (log, _) = run(&mut ms, Vec::new(), 180);
+        assert!(log.iter().any(|l| l.starts_with("open the team screen")), "{log:?}");
+        assert!(ms.team.shown, "shown after its intro: {log:?}");
+        let draws = ms.draw().len();
+        let unhandled = ms.stage.unhandled();
+        eprintln!("team screen: {draws} draws, unhandled {unhandled:?}");
+        assert!(!unhandled.iter().any(|n| n.contains("TeamManagement")), "{unhandled:?}");
+        assert!(ms.popup_shown(), "the empty-name warning");
+        assert!(ms.team.asked > 0, "the movie read the team's data");
+        // OK on the warning asks for the team's name.
+        let (_, effects) = run(&mut ms, vec![APT_NEXT], 60);
+        assert_eq!(effects, [skate_core::team::Effect::RenameTeam]);
+        ms.team_named(None, "Rippers");
+        assert_eq!(ms.team().unwrap().name, "Rippers");
+        run(&mut ms, Vec::new(), 30);
+        // A on the first option: Edit Skater on the player.
+        let (_, effects) = run(&mut ms, vec![APT_NEXT], 30);
+        assert_eq!(effects, [skate_core::team::Effect::EditSkater(0)]);
+        // The customisation over it, then B: the stack opens the team screen again, with its team, shown and keyed.
+        assert!(ms.open_cac(skate_core::cac::Cac::open(skate_core::skater_record::SkaterRecord::cleared(), &skate_core::unlocks::UnlockStore::fresh_profile(), None), 0));
+        let (log, _) = run(&mut ms, Vec::new(), 120);
+        assert!(log.iter().any(|l| l.starts_with("open the customisation")), "{log:?}");
+        run(&mut ms, vec![APT_PREVIOUS], 60);
+        assert!(ms.popup_shown(), "the exit question");
+        let (log, _) = run(&mut ms, vec![APT_NEXT], 180);
+        assert!(log.iter().any(|l| l.starts_with("open the team screen")), "{log:?}");
+        assert!(ms.team.shown && ms.team().is_some_and(|t| t.name == "Rippers"), "{log:?}");
+        // Y: the logos; B: back on the members; B: closed.
+        run(&mut ms, vec![APT_OPTION], 30);
+        assert!(ms.team().unwrap().options().is_empty(), "no options on the logos");
+        run(&mut ms, vec![APT_PREVIOUS], 30);
+        assert_eq!(ms.team().unwrap().options().len(), 3);
+        let (log, _) = run(&mut ms, vec![APT_PREVIOUS], 60);
+        assert!(log.iter().any(|l| l.starts_with("close the team screen")), "{log:?}");
+        let _ = STATE_LOGOS;
     }
 
     /// The browser on parks (My Parks) on the lean set: opened with saved parks, shown after its intro, every

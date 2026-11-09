@@ -1188,6 +1188,87 @@ Checks: the browser stage test turns the wheel on and off; device-checked by the
 
 Checks: `vita-bake sim` on the prepared install verifies 6849 collections and writes sim.pak and anim.pak.
 
+## CAC step 0a: the unlock store and the team brand (2026-11-02)
+
+| Files | Change | Kind |
+|---|---|---|
+| skate-core `unlocks.rs` (new) | Retail's `UnlockablesBackEnd` (`[0x83067074]`): the 13 kinds, the FNV-1 name hash, the granted and content tables (500 each), grant `82503C30` / `82503BD8`, has `82503AE0` (unlock-all byte, `both`), new `82503B60`, the CAC exit's clear `82603358`, the fresh profile `825046B0` (7 characters, 37 gestures), the `.unlock` content files `82505220`, load `82505000` | ours (retail behaviour; NOT RETAIL: a full table refuses a grant, retail writes past the end) |
+| skate-core `team_brand.rs` (new) | Retail's `Progression::TeamBrandManagerData`: the four board-sales counters and their sum, cash and cash earned, earn `827CED48` (stats row 62 takes the running total), spend `827CEE00` (never below 0; row 63 takes the price) | ours (NOT RETAIL YET: the stats gate `8250EB08` and the manager's vt+8 check are not modelled) |
+| skate-core `extras.rs`, skate-ui `fe/menu_stage.rs` | The Extras grants go out in `Frame::unlocks` (kinds 8, 6, 0); its challenge grants are logged, not stored (retail gives them to the progression manager) | ours |
+| skate-vita `progression.rs` (new), `app.rs`, `fe_menus.rs`, `lab.rs` | `ux0:data/SKATEVITA/progression.json` (our format: the granted table and the team brand), loaded at boot over a fresh profile, written by the main thread when changed and on quit; the Extras codes now unlock into it | ours |
+
+Checks: skate-core `unlocks` and `team_brand` tests, skate-vita `progression` tests, the Vita build.
+
+## CAC step 0b: the skater record (2026-11-02)
+
+| Files | Change | Kind |
+|---|---|---|
+| skate-core `skater_record.rs` (new) | Retail's CAC character (0x5D60 bytes, `CACBackEnd::Data` save `825199B8` / load `82519878`, writer `82DE0738`): the 26 component slots in retail's order (table `0x82FCA0A0`), worn items as (model, material) asset ids, the closet per slot, Edit Skater values (trucks, wheels, stance, style, posture, gestures; labels `825FFE08`), gender, body shape, the 13 colour layers and their keys, the 5 graphics and their adjustments, the 19 morphs; the cleared record (`82DDEBF8` / `82DDE700` / `824FA730`); wear `82DDEEF8`, take `82DDF150`, put away `82DDEF68`, wear new `82DDEDB0`, owns `82DDF060` | ours (retail behaviour; not kept yet: the thumbnail +0x2080, the composed block +0x0000, the per-gender snapshots +0x5CE0) |
+| skate-vita `skaters.rs` (new), `app.rs`, `lab.rs` | `ux0:data/SKATEVITA/skaters.json` (our format, 5 records as retail), loaded at boot, written by the main thread when changed; in use = a head worn | ours |
+
+Checks: skate-core `skater_record` tests, skate-vita `skaters` tests, the Vita build.
+
+## CAC step 1: cas.pak (2026-11-02)
+
+| Files | Change | Kind |
+|---|---|---|
+| vita-pack `cas.rs` (new), `lib.rs` | `cas.pak` layout: kinds `CasPart` (a part's skinned mesh, second UV set, sparse morph targets) and `CasTexture` | ours |
+| vita-bake `cas.rs` (new), `main.rs` | `vita-bake cas INSTALL OUT`: from upstream's customiser setup output (`private/customisation`, `tools/asset_pipeline/customiser_setup.py` at `8df32c51`, run on the install): each library model's GLB as a part (480, the skater bake's reader; morph deltas kept only where they move), each base colour and hair opacity image at most 256 x 256 (DXT1, DXT5 for cut-out materials), the 170 tattoos, `cas/library.json` (models, materials with their retail flags, defaults, colours, morph names); every entry read back before writing | ours (NOT RETAIL YET: textures resampled from upstream's full-size PNG decodes, not the retail mips; the 270 logo stamps of `logo_object` not baked; upstream's male default outfit is its own, retail's comes from the `IsDefault` records, `82DDBBB8`) |
+
+Checks: vita-pack `part_and_texture_round_trip`; `vita-bake cas` on the b110 install: 480 parts, 348,896 vertices, 396,201 morph deltas, 2,138 textures (84 MB of texels), cas.pak 112 MB; every LOD0 material of the retail catalog is in it except the 270 logos.
+
+## CAC step 2a: the look without a screen (2026-11-03)
+
+| Files | Change | Kind |
+|---|---|---|
+| skate-core `skater_record.rs` | `from_retail`: a saved character in the console's layout (`82DE0408`; the disc's `data\cacrecipes`); `Item::NONE` is retail's empty value `0x01678C4862139059` (not (0, 0): `0x830CAB18` is set at run time); colour layers name the item they tint | ours (from the code, checked on all 18 disc recipes) |
+| vita-pack `cas.rs` | `merge`: an outfit as one skater mesh (parts in one buffer, morphs applied, one draw per part) | ours |
+| vita-bake `cas.rs` | The disc's recipes in `cas/recipes/`, each read before writing; `morph_order` (the vault's target order from upstream's `native.json`) | ours |
+| skate-vita `cas_look.rs` (new), `app.rs` | The player's mesh from `cas.pak` at boot: the first saved skater in use, else retail's `SavedRecipeFallbackMale`; `skater.pak` when the pack is absent. `cas.pak` is mounted without the boot hash pass, each entry checked when read | ours (NOT RETAIL YET: the second colour, skin / face / cloth stamps, the hair opacity image, the skin lighting; NPC skaters share the mesh; the neck bind of `9cbfd58c26aeef32` Dynamite Windbreaker differs from the other 479 parts, the first part's binds are kept) |
+
+Checks: skate-core `a_retail_record_reads_field_by_field`, vita-pack `merge_offsets_the_parts_and_applies_morphs`, skate-vita `cas_look` tests; `the_fallback_characters_assemble_from_the_real_pack` (11 parts, about 9,500 vertices, 408 KiB of textures); the Vita build.
+
+## CAC step 2b: retail's composition (2026-11-03)
+
+| Files | Change | Kind |
+|---|---|---|
+| skate-core `cas_rules.rs` (new) | `Catalog` (the rows' fields, retail's sort and search `82DDB710`, colour tags) and `compose` (`8253F648`): hair by hat state `82540538` / `82DDC250`, the head's material `825406E0` / `82DDCA28`, torso, inner layer and arm skin `82540828` / `82540AE0` / `82540BF8` / `82DDCBA0` / `82DDBE88`, necklace `82540430`, wrist item, leg skin `82DDCCB8`, socks `82540D28` / `82DDCF10`, clean or worn-in shoes, deck and wheels `82DDC350` / `82DDBAD0` / `82540E20`, `RequiresRemovalOfComponents` `8253FD40` | ours (from the code; NOT RETAIL YET: `default_of` without `82DDBBB8`'s filter over several defaults; `82DDCA28`'s stack flag is not read, the rows decide; a blank `SupportsWristItem` is treated as yes from the data; the colour side effects `82DDFBB0` and stamp moves are left to the look's next step) |
+| vita-bake `cas.rs`; skate-vita `cas_look.rs` | `cas/rules.bin` (LOD 0 rows and colour tags); the player's mesh draws the composition with the worn-in materials, not the worn slots (device: the inner torso showed under the tank top) | ours |
+
+Checks: skate-core `cas_rules` tests; `the_composition_matches_every_recipe_on_the_disc`: all 18 recipes against retail's own composed blocks, every slot, the 5 demo recipes' decks excepted (clean under worn-in shoes and wheels).
+
+## CAC step 2c: hair's coverage (2026-11-03)
+
+| Files | Change | Kind |
+|---|---|---|
+| `shaders/skin_hair.vert.cg`, `shaders/skin_hair.frag.cg` (new), vita-render `scene.rs` | `Scene::load_look`: hair drawn with its opacity map's red on the second UV set, cut at 0.5, double-sided, after the masked draws (`cac_hair_defaultPS`, from upstream `customiser_material.rs`); the base colour's alpha is specular data and cut nearly all the hair away (99-100% of its texels are below 0.5) | ours (NOT RETAIL YET: the retail hair shader's lighting; an NPC fading shows no hair) |
+| vita-pack `cas.rs` (`Look`), vita-bake `cas.rs`, skate-vita `cas_look.rs`, `app.rs` | The second UV set and opacity maps reach the renderer; hair's base colour baked DXT1 | ours (glasses: retail's `cac_alpha` blends; cut at 0.5 here, which hides them, until the Accessories menu) |
+
+Checks: vita-pack `merge_offsets_the_parts_and_applies_morphs`; `the_fallback_characters_assemble_from_the_real_pack` (hair has its opacity map); the Vita build.
+
+## CAC step 3, slice 1: the customisation screen, Edit Skater and Edit Style (2026-11-03)
+
+| Files | Change | Kind |
+|---|---|---|
+| skate-core `cac.rs` (new) | FE 15's logic: retail's 115 items (constructor `825F4B98`) and 37 menus (`0x8302FA10`, lists `0x83026778`), the menu stack and cursors, the natives' answers, Left / Right / Back (`825FC7E8`), select (`825FE3C0`), leave (`825FC768`, `826008C0`: Edit Style's gestures reach the record there; its A accepts on any row, it has no B); sliders step 0.1 in 0 to 1, bands at 0.35 and 0.75, selectors wrap, gestures cycle the unlocked ones | ours, from the code (NOT RETAIL YET: the shops' rows do nothing; the gesture preview and camera moves; the fade around the screen; row sounds are stand-ins) |
+| skate-ui `fe/cac_host.rs` (new), `fe/menu_stage.rs`, `fe/crossbar_host.rs` | The `CAC_*` natives, FE 15 (`e0e6f052f6724f7d`, movie `cas/createskater`) opened, keyed and closed; `MenuStage::open_cac` / `take_cac` | ours |
+| `tools/prepare_menu_screens.py` | The movie exported with the Vita's roots | ours |
+| skate-vita `vita_menus.rs`, `fe_menus.rs`, `app.rs` | `My Career Team` in Free Play's Single Player tab opens FE 15 on the player's record (owner, 3 Nov; retail reaches it through the career's team screens, FE 67) | ours (NOT RETAIL: the row in this mode, no team screen) |
+| skate-vita `skaters.rs`, `lab.rs`, `app.rs`; skate-sim `physics/live.rs` | The record's Edit Skater values reach the simulation as the customiser's profile (`sim_profile`, `Session::set_profile`), from boot and when the screen closes; the record is saved in `skaters.json`. So a new skater now rides retail's defaults: goofy, style 3 (Aggressive), posture Default, trucks and wheels 0.7 | ours (changes the Vita's skating from the stock skater's regular and Standard, as retail; the oracle is unaffected, it sets no profile) |
+
+Checks: skate-core `cac` tests; skate-ui `the_customisation_opens_edits_a_skater_and_closes` (the real movie: every `CAC_*` native answered, rows, sliders, selectors, Edit Style, exit); skate-vita `the_sim_reads_the_records_style_values`, `the_vita_layout_and_settings_round_trip`; the Vita build. Data: menu set re-exported at `8df32c51` (58 movies), ui.pak 50 MB (`ui.pak.pre-cac` kept).
+
+## CAC step 3, slice 2: Back Alley Pete's (2026-11-03)
+
+| Files | Change | Kind |
+|---|---|---|
+| skate-core `cac.rs` | Menus 17 to 29: page groups (`+0x177C`: info panel and banner, `SetState(51)`, the undo point `82538E78`), Pete's rows (facial hair for a male skater only), each row's camera (`825F4B98` +0x60) and morph (+0x58); the hair, facial hair and brow lists (`82603480` with the filters `825F3CD0`, `825F3F38`, `825F3DA8`, brows sorted `82630DF8`, the row without hair first for a male skater, `82604188`) stepped by Left / Right and worn at once (`825375C0`, `825377E0`), their labels (`825FFE08`); colour rows (`82603E98` zones, `82600530` no wrap, `82538060`: hair also on layers 7 and 8, skin on layers 2 to 5, eyes wear the eyes of the colour's tag `82DDC078`), `CAC_GetColours` (`825A77D8`); morph sliders held (`825FBAE8`: dead zone 0.1, 0.01 a tick), shown 0 to 122 (`825FFB18`), body size as fat and thin (`825FB490`, `825FB5B8`), weights through the row's limits (`8253CD18`, `82536B10`); presets (`825FC7E8` item 0x5F, `82604208`, custom is the group's undo point, picking a skin or eye colour leaves the preset); undo rows (`825FE3C0` 0x60, 0x61); A accepts any page (`825FE3C0`'s last switch); the gender row asks (`82604698`) and switches; the keys wait for the mesh (`+0x1800`) | ours, from the code (NOT RETAIL YET: a gender switch takes the disc's fallback character instead of building one from the defaults (`8253D470`), and each gender's character is kept only while the screen is open; the step is per 1/30 s of real time; the preview poses) |
+| skate-core `cas_rules.rs` | `EyeColour` field; the page lists, `full_hair_of`, `eyes_of_colour`, `row_text`; `Vault` (zones, colours, morph limits, presets, cameras) | ours |
+| vita-bake `cas.rs` | `cas/vault.json` from the install's `native.json`: zones with their colours in order (`cac_colour_zone`, `cac_colour`), `cac_morph_params` (record index +8), `cac_presets`, `cac_camera` | ours, data |
+| skate-vita `cas_look.rs`, `app.rs`, `fe_menus.rs`; skate-ui `fe/menu_stage.rs`, `fe/cac_host.rs`, `fe/crossbar_host.rs`; vita-render `scene.rs` | `Builder` keeps the parts and textures it read; the screen's skater is rebuilt at each change (clean materials) and once more in the game's when it closes; the old mesh is freed; the preview draws the skater alone through the row's `cac_camera` (eye, target, field of view) placed on the skater; the stick or d-pad holds a slider; the gender popup | ours (NOT RETAIL YET: plain backdrop, the paused game's pose, the camera turned to face the skater from the game camera's side) |
+
+Checks: skate-core `cac` tests (lists, colours, sliders, presets, undo, gender); skate-vita `the_screen_data_reads_from_the_real_pack` (data-gated: 10 zones, 19 morphs, 20 presets, the head camera); the existing customisation tests; the Vita build. Data: `cas.pak` rebaked (114 MB, with `cas/vault.json`).
+
 ## Small fixes: phone rows, park editor camera, Challenge Map layouts, volume boxes (2026-11-06)
 
 | Files | Change | Kind |
@@ -1199,3 +1280,142 @@ Checks: `vita-bake sim` on the prepared install verifies 6849 collections and wr
 | skate-sim `object_dropper/world.rs`; skate-vita `app.rs`, `parks.rs`; vita-bake `catalog.rs` | A Challenge Map skate.Park row lays its layout when taken on the map it is on (Basic and Full of PCU Training only respawned), asking first over unsaved edits as New Park does. The bake adds `park_worlds` and their stock layouts to catalog.pak (`startpark_progression`); without them those rows respawn as before. | Ours |
 
 Checks: dropper tests pass (44), with data tests on all four parks: `the_camera_comes_down_off_what_it_opened_on` (1,269 starts: cursor and camera not left up, not underground; 14 underground on the first park before the fix), `the_camera_stops_at_the_map_and_passes_what_is_placed`, `the_challenge_maps_basic_row_lays_its_layout`, `label_matches_the_marker_panels_row`. Device-checked by the owner 2026-11-06. `embedded_static_rwcm_hits_distinct_actor_query_ids` still fails, as recorded before this work (mesh metadata; not re-run on main here because the data files it needs are not in a clean checkout).
+
+## CAC step 3, slice 2b: the preview's set, stand and turn; the colour swatches (2026-11-07)
+
+| Files | Change | Kind |
+|---|---|---|
+| `tools/cas_set.py` (new) | Exports retail's customisation set `DIST_CreateSakter` (`miscload.big`: concrete floor and wall, floor at y 200) with the reference checkout's `scene_clips.export_set`, decal and alpha-tested meshes kept, as `private/customisation/CreateSakter.skate` | ours, run on the user's disc |
+| vita-bake `cas.rs`, `map.rs` | `cas/set.map` (the set as a map pack, `map::set_pack` shared with the Trick Guide's), `cas/anim/cac_edit_<gender>.abin` (the stands), the vault's `cac_body` and `cac_posture` rows | ours, data |
+| skate-data `scene_clip.rs` | A bank's clip by name (`parse_named`): the stands share one bank | ours |
+| skate-core `cac.rs`, `cas_rules.rs` | `Preview`: the page's camera row, the skater's spot and heading (`cac_body` standing: (-1, 0, -7.05), 260 degrees, 82532800), the posture's stand (82539688, `cac_posture`); the triggers turn it (825FBAE8 dead zone 0.02, 8253B618: 0.1 rad a tick per unit), the turn starts over at each page group (82536818); `Camera::STAGE` (the set's floor, y 200) | ours, from the code and data (NOT RETAIL YET: cameras cut between rows; no blend between stands; no gesture demos) |
+| skate-vita `cac_preview.rs` (new), `app.rs`, `fe_menus.rs`, `trick_demo.rs`; skate-ui `fe/menu_stage.rs` | The set in the demo slot while the screen is open, the stand playing (its TRAJECTORY bone's quarter turn taken out: the character's own transform places it), drawn through the camera row; the pause capture held while the preview draws; a held slider rebuilds the skater at most every 150 ms | ours (NOT RETAIL YET: the set's sky, sun and fog) |
+| skate-ui `fe/object_dropper_host.rs` | `Game.SwatchRenderer_*` (825A5FE8, 825A6038, 825A6178) answered on every screen, colours 0 to 1 as given (825A6038 reads integers or numbers): the customisation's colour rows had no swatches | ours |
+| skate-vita `audio.rs` | `start_audio` is Vita-only again (the host tests did not build) | ours |
+
+Checks: skate-core `the_preview_stands_on_the_body_row_and_the_triggers_turn_it`; skate-vita `the_skater_stands_on_the_set_in_front_of_the_camera` (data-gated: on the floor, standing, 2.8 m ahead of the standing camera, facing it); all crate tests; the Vita build. Data: `cas.pak` rebaked (120 MB, with the set and the stands).
+
+## CAC step 3, slice 2c: the team screen (2026-11-07)
+
+| Files | Change | Kind |
+|---|---|---|
+| skate-core `team.rs` (new) | FE 67's logic: the career team's cards (82651E50: the selection wraps over the members), a member's options (825C39E8, labels 0x83025ECC: Edit Skater, Change Name, Import Skater, none on a locked card or the logos), B / Y / X (82651EE0: back or close, the logos, the team's name), select (82651C70), the empty-name warning when shown (82651A48, popup 0x12E), names to 16 characters (826397D8) | ours, from the code (NOT RETAIL YET: no logos listed, their textures not baked; no member photos; Import Skater does nothing) |
+| skate-ui `fe/team_host.rs` (new), `fe/menu_stage.rs`, `fe/crossbar_host.rs`, `fe/mod.rs` | The `TeamManagement` natives (registrar 825C3498: GetTeamData, GetSelectedTeammateData, GetEditSkaterOptions, the logo calls) and `Game.OnMenu*`; FE 67 (`3823e2a9a554d38a`, movie `TeamSkater_Selection/team_management`) opened, keyed (AptOption 4 = Y, AptMisc 5 = X), closed; the warning as the game's popup; `MenuStage::open_team` / `team_named` | ours |
+| `tools/prepare_menu_screens.py` | The team movie exported with the Vita's roots | ours |
+| skate-vita `vita_menus.rs`, `app.rs`, `fe_menus.rs`, `progression.rs` | My Career Team opens the team screen (retail's route; the 3 Nov stand-in opened the customisation directly); its Edit Skater opens the customisation over it; X and Change Name open the system keyboard; the team's and the player's names saved in `progression.json` | ours (NOT RETAIL: the player's name starts as "Player", retail's is the profile's) |
+
+Checks: skate-core `team` tests; skate-ui `the_team_screen_opens_shows_the_team_and_closes` (the real movie, data-gated: every TeamManagement native answered, the warning, its OK asks for the name, Y and B); FE_HASH unchanged `3bc34026d85cc590`; the Vita build. Data: menu set re-exported (59 movies), ui.pak 51 MB (`ui.pak.pre-team` kept; baked with `../game_data/ui-screens-fad`).
+
+## CAC: retail's character shading on the created skater (2026-11-07)
+
+| Files | Change | Kind |
+|---|---|---|
+| vita-bake `cas.rs` | The library keeps each material's shader family and the family's nine `m_params` rows once (`shaders`; upstream `customiser_lighting.py`, from the vault), and the characters' ambient light (`default_sh`, upstream `character-lighting.json`) | ours, data |
+| vita-pack `cas.rs`; skate-vita `cas_look.rs`, `app.rs` | `Lighting` per material of a look; the ambient light set on the scene | ours |
+| `shaders/skin*.cg`; vita-render `scene.rs` | Retail's character shading on a created look's materials (upstream `retail_character_common.wgsl` `shade_character`): the light's colour x N.L, the SH ambient light by its weight, the rim; hair with its own response; the gain and the scene's exposure (2.5), the colour linear (texture and tint squared, the tint from sRGB) through the parks' retail tone curve. Per vertex, as the old N.L; other skins (stock skater, cars) keep the old lighting | ours, port of the reference's (NOT RETAIL YET: no specular; one light direction, the scene's, not each place's; the ambient light is the default, not the place's probes) |
+
+Checks: skate-vita `the_fallback_characters_assemble_from_the_real_pack` (every part shaded, hair as hair, the ambient light present); the Vita build. Data: `cas.pak` rebaked (121 MB, library.json 994 KiB).
+
+## CAC step 3, slice 3a: Slappy's (2026-11-07)
+
+Research of 7 Nov 2026 in the TU3 code (docs/customization-survey.md, "Slappy's"). TU3's shop has no cash: the cart, the
+Receipt screen (FE 16) and the wallet are unused leftovers (owner checked retail), so items are gated by the locks only.
+
+| Files | Change | Kind |
+|---|---|---|
+| skate-core `cac.rs` | Slappy's menus 1 to 3 (page group 0) and the thumbnails page (menu 10, movie state 1): each category's class (825F4B98 +0x14: hats 0x12, T-shirts by `TopType` tshirt / ls_tshirt 825F3AC8, button shirts / hoodies / jackets / sweaters 825F3A58, pants 0xF, shoes 5, socks 0x11 without `tiny` 825F3D78, glasses, wrist, boards, trucks, wheels, necklaces, rings), camera (+0x28) and pose (+0x30: wrist, wheels, rings); the title (825A7190, +0x1788); the list (82603480): the packs' inventories and the vault's hidden unlocks left out until granted (825F33A0, 825F35A8, 825F3960), the worn row first and the remove tile on the slots that can be empty (82600AF8, 82541008); the tiles' natives: state and icon (825FF5E8, 825FF4C8: owned, locked 825F46C8, dlc, none), the name (825FF160 with 82605528), the unlock text (825FF3E0), new (825F4160), the thumbnail (825FF7D0); a highlight tries the tile on after 500 ms (825FEDB8, 825FBAE8, 825FEEA0) without touching the record, leaving the page shows the record again (826008C0); picking (825FD9F0): locked sounds `core_error`, else worn and kept in the closet (825375C0) unless a variant is worn, state 53, back to Slappy's; the remove tile takes the item off (825377E0: the outer torso shows the arms' bare top, 82DDBE88); B on Edit Skater asks `ID_CAC_EXIT_CAC_CONFIRMATION` first (825FC768, 82603290, 82604748); the key handler returns whether it took the key (825FC7E8), the movie gets the rest | ours, from the code (NOT RETAIL YET: Wear Styles (menu 30), the filters (31, 32) and the brand logos (825FFA38) come in slice 3b, an item that would open Wear Styles is worn as it is; the first-visit tips (825FAA48); the DLC packs: none installed, so DLC rows are hidden) |
+| skate-core `cas_rules.rs` | The shop's fields (`IsColourizable`, `IsDefaultWearStyle`, `IsLogoable`, `DlcID`, `ManufacturerID`, `SponsorUnlock`, `StyleSubcategory`, `TopType`, `Unlock`); `shop_rows` (825368A8), one row per style (82539188), the brand order (826035F0: colourisable or logoable first, by brand, then `skate`, then `no_brand`), `variants` (82538D38 with 822FE954), `same_style` (82DDB908), `part_names` (82605528), `thumbnail` (82604958), `removable` (82541008's table), `bare_top`; `Vault` hidden unlocks | ours, from the code |
+| skate-core `eastl_sort.rs` (new) | The executable's sort (EASTL introsort: 82630CF0, 82631A60, 82631C38, 82632810, 82632EE8): not stable, so equal brands come out in retail's order only through the same procedure | ours, from the code |
+| `tools/cas_thumbs.py` (new); vita-bake `cas.rs` | The shop's thumbnails from `fedynamic.big` (`data/fe/cas/`, the part folders and `general`): retail's DXT5 128 x 128 blocks, untiled and byte-swapped with the reference checkout's RX2 parser, not compressed again; packed as `cas/thumbs/<name>.tex` (1,652, 26 MB); `cas/vault.json` gets `cac_hidden_unlocks` (the two promo inventories) | ours, run on the user's disc |
+| skate-ui `fe/cac_host.rs`, `fe/crossbar_host.rs`, `fe/menu_stage.rs` | `CAC_GetThumbnailFileName`, `CAC_IsPartNew`, `CAC_GetItemUnlockHALID`, `CAC_OnThumbnailSelect`, `OnMenuHilight`, `CAC_GetInfoPanelType` by row, `CAC_GetDescriptionText` naming parts through the string table, `CAC_GetReceiptBalance` empty (825A7BF0); the try-on wait ticks per frame; the exit question as the game's popup; the screen's look is the record with the try-on | ours (NOT RETAIL YET: `CAC_GetSponsorLogoFileName` answers `no_image`) |
+| vita-render `apt.rs`; skate-vita `fe_menus.rs` | A tile's picture is read from cas.pak when drawn (at most three a frame) and uploaded compressed, then freed as soon as no tile draws it | ours |
+| skate-vita `settings.rs` (version 14), `vita_menus.rs`, `app.rs` | World > Customisation: unlock all (retail's unlock-all byte +0x24, owner decision 2 Nov); closing the customisation clears the clothing unlocks' new marks (82603358) and saves the progression | ours |
+
+Checks: skate-core `cac` tests (brand order, locks and new marks, hidden promo, try-on, wearing, the bare top, socks
+and shoes, the wrist pose) and `eastl_sort` tests; skate-ui `slappys_lists_thumbnails_tries_on_and_wears` (the real
+movie, data-gated: the list, the tiles' pictures requested, the try-on after half a second, A wears, the exit question)
+and the updated customisation and team tests; skate-vita `slappys_pages_list_rows_whose_thumbnails_are_in_the_pack`
+(the real cas.pak, both genders, with and without unlock-all: every page lists rows, each tile's picture is in the pack);
+FE_HASH unchanged `3bc34026d85cc590`; the Vita build. Data: `cas.pak` rebaked (147 MB with the thumbnails;
+`cas.pak.pre-slappys` kept).
+
+Device run 1 (8 Nov): the tiles were empty, the stage dropped named images the menu set lacks; fixed (`CAS_THUMB_PREFIX`
+kept, the real-movie test checks the tiles are drawn). Run 2: a jacket named "Stripes" without picture and drawn wrong:
+vita-bake made a row of every material group of a model, and a later group is a fixed material of another part of the
+mesh (`defaultShadingGroup1`, and `lambert1` on a female head). Retail's (model, material) table in the disc's `.recipe`
+holds all 4,593 first-group variants and neither of those two [data]: `rules.bin` now has the first group's rows only.
+
+## CAC step 3, slice 3b: Slappy's Wear Styles, retail's clothes colour (2026-11-08)
+
+Research of 8 Nov 2026 in the TU3 code and the disc's shaders (docs/customization-survey.md; notes "Slappy's 3b survey").
+TU3 never opens Slappy's filters (menus 31, 32: no row or call enters them, the chosen filter +0x1794 is only stored,
+`CAC_GetFilterText` is "#") and never fills the brand list +0x17F0, so a sponsor logo is always `no_image`
+(825FFA38 > 82604070): neither is ported, the logo answer was already retail's.
+
+| Files | Change | Kind |
+|---|---|---|
+| skate-core `cac.rs` | Wear Styles (menu 0x1E): a pick of an item with colours, a logo or several variants opens it (825FD9F0) and wears the item there (nothing when a variant is worn; a deck of the worn deck's style keeps the worn one); its rows (82600AF8 0x1E): colour (`IsColourizable`), style (more than one variant, not decks: the variants by `ModelName`, 82603CB0, on the worn one 82604188), Add Graphic (the top's 0x64, else 0x67) and Remove Graphic (logoable); the deck's title `ID_CUSTOM_EDITDECK` (825A7190); the style row's text `ID_CAC_WEAR_STYLE_OPTION_%d` (825FFE08) and its Left / Right wrapping and wearing (825FC7E8 item 0x63); the colour row's zone by the item's slot (82603E98, 825416A8) with Pete's colour stepping; any row accepts back to Slappy's (825FE3C0 case 0x1E); colour layers of the clothes' zones name the worn item (82538060: hat 0, outer torso 9, socks 10, pants 12) and a deck colour wears the deck of that colour (zone 11, 82DDC160) | ours, from the code (NOT RETAIL YET: Add Graphic does nothing until the Graphics menus; Remove Graphic has nothing to remove) |
+| skate-core `cas_rules.rs` | `DeckColour` field; `variants_by_model`, `colour_zone` (825416A8's table), `deck_of_colour` | ours, from the code |
+| skate-vita `cas_look.rs`; vita-pack `cas.rs`; vita-render `scene.rs` | A clothes colour layer's colour goes to the skin shader as a linear factor (`Lighting::linear_tint`): retail's cloth pixel shaders (`cacstamp_shift_defaultPS`, `cac_cloth_defaultPS`, `cacstamp_cloth_defaultPS` in `shaders_final.big`, read with a research-only Xenos disassembler) multiply the squared diffuse by `i_modulateColor1`, then lay the decals over it; the colour is the vault colour's first vector (values above 1 on the disc, zero second vectors) | ours, from the disc's shaders (NOT RETAIL YET: the decals, the logos' stamps, come with the Graphics menus) |
+
+Checks: skate-core Wear Styles tests (colour row tints the worn tee, the style row wraps and wears, a deck is Edit Deck,
+its colour wears the deck of that colour, Add Graphic waits); skate-ui `wear_styles_opens_on_a_colourisable_item_and_its_colour_row_tints_it`
+(the real movie, data-gated); skate-vita `wear_styles_colours_tint_the_item_and_every_deck_colour_has_a_deck` (the real
+cas.pak: all 10 deck colours have a deck, a colourisable top opens Wear Styles with the zone's swatches); all crate
+tests; FE_HASH unchanged `3bc34026d85cc590`; the Vita build. Data: `cas.pak` rebaked with `DeckColour` (147 MB).
+
+## CAC tattoos, slice 4a: the pages and the placement (2026-11-09)
+
+Research of 8-9 Nov 2026 in the TU3 code (notes "Tattoos survey", "Placement maths", "Placement flow", "Adjust pages"). 4b
+(the decal drawn on the skin) follows.
+
+| Files | Change | Kind |
+|---|---|---|
+| skate-core `stamp.rs` (new) | Retail's placement maths: the matrix of a placement (82C2E3A8: offset, centring, turn, scale `(s, 2 s)`, centring back; the shader's two rows are its columns 0 and 1, 82784B88), the fit test (82C2EBD8: the picture's four corners taken back through the inverse must lie in the part's rectangle), the step (82C2E698: add to one number, scale up to 15; if it does not fit, the first corner out moves the across offset and then the up offset by its overflow and 0.001; then the scale is multiplied by 1.8751249 until it fits), the start table (0x830442B8, male and female per location 0 to 11), the locations by region (0x83044438 - 0x830444F8), the rates (rotate 0.01, scale -0.1, across -0.005, up 0.005; dead zone 0.01, 825FBAE8) | ours, from the code (ours: the shrink loop stops after 40 turns; retail loops until it fits and its rectangles always allow it) |
+| skate-core `cas_rules.rs` | Fields `TattooCategory` (+0xE8), `StampUVConstraintQ1..Q4` (the target's rectangles, the step function's w4..w7), `StampBorderConstraint` (a stamp's bounds), `IsTattooViewingChoice`; `tattoo_rows` (8253E4D8 tattoo mode with 8253EC90: Misc rows in catalog order, none containing `logoEmpty` or starting `logo_`, `team_logo_`, `team_brand_logo_`, in the category's text, rows without one only in the category that takes them), `stamp_name/label/thumbnail/bounds/rect`, `tattoo_pants`; the vault's `tattoo_categories` (`cac_tattoo_category_order` `default`, each `cac_tattoo_categories` row's text and untagged flag) and `stamp_zones` (the zones' cameras, 8253E018) | ours, from the code and data (inferred: the pants worn while the lower body is placed are the rows flagged `IsTattooViewingChoice` of the skater's gender; retail's filter objects 82304668 / 82304680 are not decoded) |
+| skate-core `cac.rs` | Pete's rows 19 and 20 open the region pages (4, 5); a region of a body that has a tattoo asks first (825FE3C0, popups 82604618 / 82604658); the region sets the adjust word (+0x10, +0x14), clears the placement, picks the region's camera and pose (0x83044548 - 0x83044608 resolved to vault keys), takes the top off (825FB718) or wears the viewing pants (825FB8C8), then the categories (6, no Back); a category opens the stamps (0xB: the remove tile first, the stamp zone's camera); the remove tile clears the tattoo and goes back to Pete's with the clothes on, a stamp starts at its location's table row and opens the placement page (7, 8); there A goes back to Pete's with the clothes on, X starts over, Y puts the top or pants on and off, B goes back a page; the turn, scale and offsets move a little a frame (825FBAE8); a cleared record has no region (-1) and the placement (0, 1, -1, -1) in each slot (825315E8) | ours, from the code (NOT RETAIL YET: the record's graphic entry for a tattoo (name, three 64-bit values, flags) is ours, retail's layout of the stamp task's result is not traced; nothing is drawn on the skin until 4b; the stamp task's wait on the mesh is our rebuild wait) |
+| skate-ui `menu_stage.rs` | The new keys (A, X, Y on the customisation), the pad's bumpers and sticks into the placement page (`TopLeftShoulderHeld`, `ManualLStickY`, `ManualRStickX`, `ManualRStickY` of config/input.cfg), the two change questions (`ID_CAC_UPPER_TATTOO_CHANGE_CONFIRMATION`, `ID_CAC_LOWER_...`) | ours, from the code |
+| `tools/cas_thumbs.py`, `tools/vita-bake` `cas.rs` | The stamps' pictures (`fe/cas/logos/logo_object_tattoo_*`, 182) with the thumbnails; the vault's tattoo categories and stamp zones | ours |
+
+Checks: skate-core stamp tests (matrix, inverse, fit, step, caps, start table) and the tattoo tests of the screen; skate-ui
+`the_tattoo_pages_open_on_the_real_movie_and_place_a_stamp` (the real movie, data-gated: regions, categories, stamps, the
+placement page, sticks, X, A); skate-vita `the_tattoo_categories_list_stamps_whose_pictures_and_decals_are_in_the_pack` (the
+real cas.pak: 75 + 44 + 60 stamps, every picture in the pack). Data: `cas.pak` rebaked (150 MB; 1,834 thumbnails).
+
+## CAC tattoos, slice 4b: the tattoo drawn on the skin (2026-11-09)
+
+| Files | Change | Kind |
+|---|---|---|
+| `shaders/skin_decal.frag.cg`; vita-render `scene.rs` | A skin program with the second UV set and a decal on unit 1: the base colour times `1 + (decal.rgb - 1) * decal.a` (the upstream note on `cacstamp_skin_defaultPS`), the decal's coordinates the second UV set taken through the two rows of `Placement::custom_graphic` (retail's vertex shader dots `(u2, v2, 1)` with `i_customGraphic`, 82784B88); outside the picture no decal. The rows are set each frame (`Scene::set_decal_rows`), so moving the tattoo rebuilds nothing; a pick or a removal rebuilds the mesh once | ours, from the code and the shaders' disassembly (NOT RETAIL YET: lit with the skin's own shading, retail stamps into the skin texture first) |
+| vita-pack `cas.rs`; skate-vita `cas_look.rs`, `app.rs`, `fe_menus.rs`; skate-ui `menu_stage.rs`; skate-core `cac.rs` | The look carries each material's tattoo slot and the slots' pictures (the library's `tattoos`, baked since 4a); the upper tattoo lies on the bare top while the top is off and the lower on the legs; `Cac::decal_rows` | ours (NOT RETAIL YET: with the top on, retail's stamp target is not traced, so the upper tattoo is not shown on the arms under a shirt) |
+
+Follow-up (2026-11-09, after the first device check of 4b): the nine uncategorised `tattoo_diffuse_N` stamps that the first
+category lists (8253E4D8) have a `decal` texture the reference customiser setup does not decode; `tools/cas_stamps.py`
+decodes them (the reference's RX2 reader) into `extra-tattoos.json`, which `vita-bake cas` adds to the library's tattoos
+(179 stamps drawable). With the top on again the upper tattoo lies on the arms' skin with the same placement (NOT RETAIL
+YET: retail's target for a worn top is not traced); the decal rows come from the record at every look load, so the
+in-game skater keeps them after the screen closes. They are saved with the skater in `skaters.json` (our format; the
+tattoo's graphic entry layout is ours, not retail's).
+
+## CAC graphics and the glasses blend, slice 5 (2026-11-09)
+
+Research of 9 Nov 2026 in the TU3 code (825FE3C0 items 0x64 to 0x72 and menu 0x21, 825FD9F0 on menus 0xD / 0xE, 825FAAF0
+completions 8, 0xB, 0xC, 825FC7E8 keys on menus 0x22 to 0x24, 825FBAE8 sticks, 82600AF8 menus 0xD and 0xE, 8253E228 the
+zones, 8253E4D8 flags).
+
+| Files | Change | Kind |
+|---|---|---|
+| skate-core `cac.rs` | Wear Styles' Add Graphic: a top asks its location first (menu 0x21: front, back, left arm, right arm; the adjust word +0xC, the start from 0x830442B8 at the location, the pose and camera of 0x830445C8 / 0x83044528 resolved to vault keys `front`... and `custom_shirt_*`), then the categories (0xC: Brand, Team; no Back); a deck or a hat goes straight to them; Brand lists the Misc rows not starting `team_logo_`, `tattoo_` or `team_brand_logo_`, Team the ones not starting `logo_`, `tattoo_` or `team_brand_logo_`, none holding `logoEmpty` (8253E4D8 with 8253EC90); a logo becomes the item's graphic at its start (a board's and a hat's only location 2 and 3) and opens the item's placement page (0x22 shirt, 0x23 board, 0x24 hat); there A goes back to Slappy's, X starts over, B back a page, the sticks and bumpers move it on the worn item's rectangle; Remove Graphic clears the item's placement and graphic; the shirt's graphic is kept while the top is off for a tattoo (825FB718); a graphic entry's slot byte is the adjust index + 1 (shirt 1, upper tattoo 2, lower tattoo 3, board 4, hat 5; 825FB718 tests for 1) | ours, from the code (NOT RETAIL YET: the entry's name and three 64-bit values are ours; the first-visit tips (825FAA48) are not ported; Team skips the user-content logos) |
+| `tools/cas_stamps.py`, `tools/cas_thumbs.py`, `tools/vita-bake` `cas.rs` | The 233 logos' pictures (the `diffuse` channel of each logo material: the picture with its alpha; the `decal` channel is a darker copy) are decoded and baked as DXT5 into the library's `logos`; all 430 logo pictures of `fe/cas/logos/` are exported as thumbnails (2,082 in all) | ours |
+| `shaders/skin_decal.frag.cg`; vita-render `scene.rs` | The decal program takes five placement slots and a mode: a tattoo multiplies the skin, a logo lies over the base colour by its alpha (the cloth shaders lay their decals over the same way; NOT RETAIL YET: the squared linear diffuse and the colour modulation of the cloth shaders are not applied to the logo) | ours, from the disassembly |
+| `shaders/skin_blend.frag.cg`; vita-render `scene.rs`; skate-vita `cas_look.rs` | The glasses' lenses (retail's `cac_alpha`) blend by the base colour's alpha instead of being cut at 0.5: a created look's blended materials are drawn last with blending and no depth write, double sided | ours, from the code |
+
+Checks: skate-core tests of the graphics flow (a deck's and a shirt's pages, Remove Graphic); skate-ui
+`a_decks_graphic_pages_open_on_the_real_movie` (the real movie, data-gated); skate-vita `the_tattoo_categories_list_...`
+(the real cas.pak: 182 brand and 42 team logos with pictures and decals, a deck, a hat and a shirt build with their decal).
+Data: `cas.pak` rebaked (157 MB).
+
+Follow-up (first device check of slice 5): 176 logos (`logo_*_colour_mat`, `_bw_mat`) share a 128 x 128 placeholder arrow as
+their `diffuse` texture; their picture is the material's `decal` channel, which `tools/cas_stamps.py` now takes for them
+(`cas.pak` 164 MB). The coloured variants' decal is white with the logo's alpha and the black-and-white ones black: retail
+probably tints them (NOT RETAIL YET: not traced), so they draw as the decal says.

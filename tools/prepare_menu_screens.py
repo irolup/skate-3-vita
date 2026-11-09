@@ -29,6 +29,8 @@ VITA_ROOTS = (
     'source/screens/objectdropper/objectquickmenu',
     'source/screens/browser/browser',
     'source/screens/skatepark/parksetup',
+    'source/screens/cas/createskater',
+    'source/screens/TeamSkater_Selection/team_management',
 )
 
 # Runtime images the Vita's own screens load by name, beyond the reference's.

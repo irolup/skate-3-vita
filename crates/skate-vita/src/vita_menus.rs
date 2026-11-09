@@ -60,6 +60,8 @@ const SKATE_PROFILE: &str = "SkateProfileOffline";
 const RESUME_CAREER: &str = "ResumeCareer";
 const FREE_PLAY_OPTIONS: &str = "SoloFreeskateOptions";
 const SKATE_WITH: &str = "SkateWith";
+/// Retail's row of the career's team screens (the only way to the customisation): here it opens FE 15 directly.
+const MY_CAREER_TEAM: &str = "MyCareerTeam";
 
 const DIFFICULTY: &str = "ID_GAMESETTINGS_DIFFICULTY_OPTIONS";
 const SFX_VOLUME: &str = "ID_GAMESETTINGS_SFXVOLUME";
@@ -75,6 +77,7 @@ const PEDESTRIANS_ROW: &str = "VITA_PEDESTRIANS";
 const AI_SKATERS: &str = "VITA_AI_SKATERS";
 /// The Object Dropper's "All objects": every catalogue item anywhere (ours, owner 2026-10-29).
 const DROPPER_ALL: &str = "VITA_DROPPER_ALL";
+const CAC_UNLOCK_ALL: &str = "VITA_CAC_UNLOCK_ALL";
 /// The Object Dropper's "Free camera": the open world's camera moves with the cursor (ours, owner 2026-11-01).
 const DROPPER_FREE_CAMERA: &str = "VITA_DROPPER_FREE_CAMERA";
 const PHYSICS: &str = "VITA_PHYSICS";
@@ -110,6 +113,9 @@ pub enum Choice {
     SavePark,
     /// skate.Park's rows: Park Setup, the saved parks.
     NewPark,
+    /// My Career Team: the character customisation.
+    /// My Career Team: the team screen (FE 67), whose Edit Skater opens the customisation.
+    Team,
     MyParks,
 }
 
@@ -152,7 +158,7 @@ pub fn customize(c: Customize, worlds: &Worlds) {
                 // Retail's rows (the parks, districts and Skate School are Challenge Map locations; the session marker
                 // stands in for Respawn), quit at the end of Options (user 2026-10-23; the start-up menu is not reached
                 // from here: the Challenge Map has every world).
-                "SinglePlayer" => vec![CHALLENGE_MAP, RESUME_CAREER, FREE_PLAY_OPTIONS, SKATE_WITH, SKATE_PROFILE],
+                "SinglePlayer" => vec![CHALLENGE_MAP, MY_CAREER_TEAM, RESUME_CAREER, FREE_PLAY_OPTIONS, SKATE_WITH, SKATE_PROFILE],
                 "Create" => vec![REPLAY, ENTER_SKATE_PARK],
                 "Learn" => vec![TRICK_GUIDE, ON_SCREEN_HELP, CONTROLS, CALIBRATION],
                 "Options" => vec![GAME_SETTINGS, EXTRAS, QUIT],
@@ -229,6 +235,7 @@ pub fn customize(c: Customize, worlds: &Worlds) {
                 setting(PHYSICS, "Physics", Widget::Selector),
                 setting(DROPPER_ALL, "Object Dropper: all objects", Widget::Selector),
                 setting(DROPPER_FREE_CAMERA, "Object Dropper: free camera", Widget::Selector),
+                setting(CAC_UNLOCK_ALL, "Customisation: unlock all", Widget::Selector),
             ],
         ),
         (
@@ -271,7 +278,7 @@ fn cycle(labels: &[&str]) -> ValueRule {
 
 /// The registry side: handlers for the Vita's items, rules and values for its settings rows.
 pub fn register(registry: &mut MenuRegistry, settings: &Settings) {
-    for id in [SKATE, RESPAWN, PARKS, DISTRICTS, TRAINING, MAIN_MENU, QUIT, CONTROLS, CALIBRATION, REPLAY, ON_SCREEN_HELP, SAVE_PARK, ENTER_SKATE_PARK] {
+    for id in [MY_CAREER_TEAM, SKATE, RESPAWN, PARKS, DISTRICTS, TRAINING, MAIN_MENU, QUIT, CONTROLS, CALIBRATION, REPLAY, ON_SCREEN_HELP, SAVE_PARK, ENTER_SKATE_PARK] {
         if registry.data().item(id).is_some() {
             registry.register_handler(EntryRef::item(id), Handler { owner: owner(), select: true, highlight: false, callback: None });
         }
@@ -280,7 +287,7 @@ pub fn register(registry: &mut MenuRegistry, settings: &Settings) {
     let pedestrians: Vec<&str> = PEDESTRIANS.iter().map(|t| t.0).collect();
     let difficulty: Vec<String> = ["EASY", "NORMAL", "HARDCORE"].iter().map(|l| format!("ID_GAMESETTINGS_DIFFICULTY_{l}")).collect();
     let units = skate_core::menu_values::retail_rule(UNITS).unwrap_or_else(toggle);
-    let rules: [(&str, ValueRule); 16] = [
+    let rules: [(&str, ValueRule); 17] = [
         (DIFFICULTY, cycle(&difficulty.iter().map(String::as_str).collect::<Vec<_>>())),
         (SFX_VOLUME, ValueRule::retail_slider()),
         (MINIMAP, toggle()),
@@ -293,6 +300,7 @@ pub fn register(registry: &mut MenuRegistry, settings: &Settings) {
         (AI_SKATERS, toggle()),
         (DROPPER_ALL, toggle()),
         (DROPPER_FREE_CAMERA, toggle()),
+        (CAC_UNLOCK_ALL, toggle()),
         (PHYSICS, cycle(&["Fast", "Retail"])),
         (AUDIO, cycle(&["Retail", "Synth"])),
         (DEBUG_HUD, toggle()),
@@ -330,6 +338,7 @@ pub fn write_settings(registry: &mut MenuRegistry, s: &Settings) {
         (AI_SKATERS, flag(s.ai_skaters)),
         (DROPPER_ALL, flag(s.dropper_all)),
         (DROPPER_FREE_CAMERA, flag(s.dropper_free_camera)),
+        (CAC_UNLOCK_ALL, flag(s.cac_unlock_all)),
         (PHYSICS, flag(!s.fast_physics)),
         (AUDIO, flag(!s.retail_audio)),
         (DEBUG_HUD, flag(s.debug_hud)),
@@ -362,6 +371,7 @@ pub fn read_setting(registry: &MenuRegistry, id: &str, s: &mut Settings) -> bool
         AI_SKATERS => s.ai_skaters = on,
         DROPPER_ALL => s.dropper_all = on,
         DROPPER_FREE_CAMERA => s.dropper_free_camera = on,
+        CAC_UNLOCK_ALL => s.cac_unlock_all = on,
         PHYSICS => s.fast_physics = !on,
         AUDIO => s.retail_audio = !on,
         DEBUG_HUD => s.debug_hud = on,
@@ -403,6 +413,7 @@ pub fn choice(item: &str, sub: Option<usize>, worlds: &Worlds) -> Option<Choice>
     let world = |list: &[(usize, &str)]| sub.and_then(|k| list.get(k)).map(|(w, _)| Choice::World(*w));
     match (item, sub) {
         (SAVE_PARK, _) => Some(Choice::SavePark),
+        (MY_CAREER_TEAM, _) => Some(Choice::Team),
         (ENTER_SKATE_PARK, Some(0)) => Some(Choice::NewPark),
         (ENTER_SKATE_PARK, Some(1)) => Some(Choice::MyParks),
         (SKATE, _) => Some(Choice::Skate),
@@ -469,7 +480,7 @@ mod tests {
         let (mut sub, mut titles) = (Vec::new(), vec!["T".to_owned(); 3]);
         customize(Customize { data: &mut data, sub_options: &mut sub, settings_titles: &mut titles }, &worlds());
         let mode = data.mode(MODE).unwrap();
-        assert_eq!(mode.tabs[0].items, [CHALLENGE_MAP, RESUME_CAREER, FREE_PLAY_OPTIONS, SKATE_WITH, SKATE_PROFILE]);
+        assert_eq!(mode.tabs[0].items, [CHALLENGE_MAP, MY_CAREER_TEAM, RESUME_CAREER, FREE_PLAY_OPTIONS, SKATE_WITH, SKATE_PROFILE]);
         assert_eq!(mode.tabs[3].items, [GAME_SETTINGS, EXTRAS, QUIT]);
         assert_eq!(mode.tabs[2].items, [TRICK_GUIDE, ON_SCREEN_HELP, CONTROLS, CALIBRATION]);
         // In a skate.park: Save Park first in Create (retail FreePlayPark).
@@ -477,6 +488,7 @@ mod tests {
         let create = park.tabs.iter().find(|t| t.category == "Create").unwrap();
         assert_eq!(create.items[0], SAVE_PARK);
         assert_eq!(choice(SAVE_PARK, None, &worlds()), Some(Choice::SavePark));
+        assert_eq!(choice(MY_CAREER_TEAM, None, &worlds()), Some(Choice::Team));
         assert_eq!(sub[TRAINING_KIND].labels, ["Skate School", "Course"]);
         assert_eq!(titles.len(), 6, "three Vita screens after retail's");
         assert_eq!(rows_of(&data, 3), [REAR_TOUCH, DPAD_BUMPERS, FRONT_TOUCH]);

@@ -114,6 +114,14 @@ pub fn bake(install: &Path, out: &Path, names: &[String]) -> Result<(), String> 
     Ok(())
 }
 
+/// A render-only set (`.skate` without collision) as a map pack: the Trick Guide's and the customisation's.
+pub fn set_pack(skate: &[u8]) -> Result<Vec<u8>, String> {
+    let set = SkateMap::parse_render_only(skate)?;
+    let (render, _) = build_render(&set, None, None)?;
+    let (spawn, heading) = (set.spawn, set.heading);
+    Ok(Map { sim: map::strip_render(set), authored_spawn: spawn, authored_heading: heading, render, pieces: Vec::new() }.to_pack())
+}
+
 /// R2: `trickguide.pak`, the Trick Guide's 3D demo (the prepared `private/hud/scene`): the set as a map pack
 /// (`private/hud/scene/TrickGuide.map`), the ViewScene camera tracks (`ice_000.bin`) and the demo clips
 /// (`trickguide/<name>1.abin`, about 29 MB). The Vita reads it from the card a file at a time (one clip in memory).
@@ -122,10 +130,7 @@ pub fn bake_trick_guide(install: &Path, out: &Path) -> Result<(), String> {
     let started = std::time::Instant::now();
     let scene = install.join("assets/private/hud/scene");
     let read = |p: &Path| std::fs::read(p).map_err(|e| format!("{}: {e}", p.display()));
-    let set = SkateMap::parse_render_only(&read(&scene.join("TrickGuide.skate"))?)?;
-    let (render, _) = build_render(&set, None, None)?;
-    let (spawn, heading) = (set.spawn, set.heading);
-    let set_pack = Map { sim: map::strip_render(set), authored_spawn: spawn, authored_heading: heading, render, pieces: Vec::new() }.to_pack();
+    let set_pack = set_pack(&read(&scene.join("TrickGuide.skate"))?)?;
     let root = "private/hud/scene";
     let mut files = vec![
         File { path: format!("{root}/TrickGuide.map"), bytes: set_pack },

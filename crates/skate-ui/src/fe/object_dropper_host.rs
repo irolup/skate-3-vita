@@ -223,13 +223,52 @@ impl ObjectDropperHost {
         method: &str,
         args: &[Value],
     ) -> Result<Option<Value>, String> {
+        // The swatch renderer (`Game.SwatchRenderer_*`, 825A5FE8, 825A6038, 825A6178) serves every screen: the
+        // customisation's colour rows use it too.
+        if object == "Game" {
+            let slot_arg = |i: usize| args.get(i).map_or(0, to_integer).max(0) as usize;
+            let swatch = match method {
+                "SwatchRenderer_ReserveIndex" => {
+                    let slot = self.swatches.iter().position(Option::is_none).unwrap_or(self.swatches.len());
+                    if slot >= SWATCH_SLOTS {
+                        return Ok(Some(Value::Number(-1.0)));
+                    }
+                    if slot == self.swatches.len() {
+                        self.swatches.push(None);
+                    }
+                    self.swatches[slot] = Some([1.0; 3]);
+                    Some(Value::Number(slot as f64))
+                }
+                // (slot, red, green, blue): integers 0 to 255 or numbers 0 to 1 (825A6038 reads the argument's type:
+                // the colour grid passes integers, the customisation its colours). The VM keeps no type, so a colour
+                // with any channel over 1 is read as integers.
+                "SwatchRenderer_SetColour" => {
+                    let raw = [1, 2, 3].map(|i| args.get(i).map_or(0.0, |v| v.number() as f32));
+                    let scale = if raw.iter().any(|&v| v > 1.0) { 255.0 } else { 1.0 };
+                    let c = |i: usize| (raw[i - 1] / scale).clamp(0.0, 1.0);
+                    if let Some(slot) = self.swatches.get_mut(slot_arg(0)).filter(|s| s.is_some()) {
+                        *slot = Some([c(1), c(2), c(3)]);
+                    }
+                    Some(Value::Undefined)
+                }
+                "SwatchRenderer_FreeIndex" => {
+                    if let Some(slot) = self.swatches.get_mut(slot_arg(0)) {
+                        *slot = None;
+                    }
+                    Some(Value::Undefined)
+                }
+                _ => None,
+            };
+            if swatch.is_some() {
+                return Ok(swatch);
+            }
+        }
         if !self.open {
             return Ok(None);
         }
         // The item list is a menu picker: it asks the focus screen whether each row is enabled (vt+72: `8281DD70`,
         // true for both dropper states) and greys the rows it is not told about (no highlight).
         if object == "Game" {
-            let slot_arg = |i: usize| args.get(i).map_or(0, to_integer).max(0) as usize;
             return Ok(match method {
                 "OnMenuGetItemEnabled" => Some(Value::Bool(true)),
                 // The Style and Branding lists (825D0288 highlight, 825D0120 select): for the editor.
@@ -247,31 +286,6 @@ impl ObjectDropperHost {
                     Some(Value::Object(vm.array(rgb)?))
                 }
                 "ColourPicker_GetColourIndex" => Some(Value::Number(self.feed.quick.as_ref().map_or(0, |q| q.colour_index) as f64)),
-                "SwatchRenderer_ReserveIndex" => {
-                    let slot = self.swatches.iter().position(Option::is_none).unwrap_or(self.swatches.len());
-                    if slot >= SWATCH_SLOTS {
-                        return Ok(Some(Value::Number(-1.0)));
-                    }
-                    if slot == self.swatches.len() {
-                        self.swatches.push(None);
-                    }
-                    self.swatches[slot] = Some([1.0; 3]);
-                    Some(Value::Number(slot as f64))
-                }
-                // (slot, red, green, blue), 0 to 255.
-                "SwatchRenderer_SetColour" => {
-                    let c = |i: usize| args.get(i).map_or(0.0, |v| v.number() as f32 / 255.0).clamp(0.0, 1.0);
-                    if let Some(slot) = self.swatches.get_mut(slot_arg(0)).filter(|s| s.is_some()) {
-                        *slot = Some([c(1), c(2), c(3)]);
-                    }
-                    Some(Value::Undefined)
-                }
-                "SwatchRenderer_FreeIndex" => {
-                    if let Some(slot) = self.swatches.get_mut(slot_arg(0)) {
-                        *slot = None;
-                    }
-                    Some(Value::Undefined)
-                }
                 _ => None,
             });
         }

@@ -24,7 +24,7 @@ const DEFAULT_TRACK: i16 = 1;
 pub type Reader<'a> = &'a dyn Fn(&str) -> Result<Vec<u8>, String>;
 
 /// `native_matrix` (skate-sim `animation.rs`, private there).
-fn native_matrix(m: NativeMatrix) -> Mat4 {
+pub fn native_matrix(m: NativeMatrix) -> Mat4 {
     Mat4::from_cols(
         Vec3::from_array(m[0][..3].try_into().unwrap()).extend(0.0),
         Vec3::from_array(m[1][..3].try_into().unwrap()).extend(0.0),

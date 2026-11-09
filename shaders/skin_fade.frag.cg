@@ -16,9 +16,21 @@ float3 graded(float3 c, float w) {
 	return lerp(n, f, w);
 }
 
+// Retail's character shading (`mode` x 1): the light came halved, `tone` x is 2 x gain x the scene's exposure; the
+// colour is linear (albedo squared x a linear tint) and goes through the retail tone curve, as the parks' (park.frag.cg).
+uniform float2 tone;
+float3 shaded(float3 albedo, float3 light) {
+	if (tone.y < 0.5f)
+		return albedo * light;
+	float3 x = albedo * albedo * light * tone.x;
+	float3 t = saturate(1.0f - x);
+	float3 tm = max(x * 0.25f + 0.75f, 1.0f) - t * t;
+	return saturate(sqrt(max(tm * 0.5f, 0.0f)) * 1.41f);
+}
+
 float4 main(float2 vTexcoord : TEXCOORD0, float4 vColor : COLOR) : COLOR {
 	float4 c = tex2D(tex, vTexcoord) * tint;
 	if (c.a < cutoff)
 		discard;
-	return float4(graded(c.rgb * vColor.rgb, vColor.a), fade);
+	return float4(graded(shaded(c.rgb, vColor.rgb), vColor.a), fade);
 }

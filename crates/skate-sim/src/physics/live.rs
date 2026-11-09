@@ -820,6 +820,11 @@ impl Session {
 
     /// Constraint iterations of the board/skater solve: 50 is retail (the default), 25 the
     /// Vita's "Fast" physics (`GamePhysics::set_solver_iterations`).
+    /// The profile the customiser's preferences come from (`customiser::apply_preferences`, every tick).
+    pub fn set_profile(&mut self, profile: serde_json::Value) {
+        self.profile = profile;
+    }
+
     pub fn set_solver_iterations(&mut self, iterations: u32) {
         self.physics.set_solver_iterations(iterations);
     }

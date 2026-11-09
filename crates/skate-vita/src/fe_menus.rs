@@ -46,6 +46,10 @@ pub struct Update {
     pub teleports: Vec<(String, String, [[f32; 4]; 4])>,
     /// Call Skater (FE 62): a character key to call (true) or dismiss (false), in order.
     pub skater_calls: Vec<(String, bool)>,
+    /// Unlocks granted (Extras codes), for the unlock store.
+    pub unlocks: Vec<(skate_core::unlocks::UnlockKind, String)>,
+    /// The skater the player left the customisation with.
+    pub cac: Option<skate_core::skater_record::SkaterRecord>,
     /// Text the game asked for and the player typed: (callback, text) (Save Park's name).
     pub texts: Vec<(String, String)>,
     /// The game's own popups answered: (callback, option) (Save Park's overwrite question).
@@ -54,10 +58,15 @@ pub struct Update {
     pub browser: Vec<skate_ui::fe::browser_host::BrowserEvent>,
     /// New Park: the lot and template the player took in Park Setup.
     pub park_setup: Vec<skate_ui::fe::park_setup_host::ParkSetupChoice>,
+    /// What the team screen asks for.
+    pub team: Vec<skate_core::team::Effect>,
 }
 
 /// Save Park's text entry and popup callbacks.
 pub const PARK_NAME: &str = "park.name";
+/// The team screen's keyboards: the team's name, a member's (the member's index after the dot).
+pub const TEAM_NAME: &str = "team.name";
+pub const MEMBER_NAME: &str = "team.member.";
 pub const PARK_OVERWRITE: &str = "park.overwrite";
 /// My Parks' question before loading over unsaved edits.
 pub const PARK_LOAD: &str = "park.load";
@@ -86,6 +95,10 @@ pub struct Ready {
     /// Named images uploaded on first use (the Challenge Map's world maps and marker icons), freed once the menus
     /// have closed.
     named: Vec<String>,
+    /// Slappy's thumbnails on the GPU (`cas.pak` `cas/thumbs/`), freed as soon as they are not drawn, and the ones the
+    /// pack lacks (not asked again).
+    thumbs: Vec<String>,
+    thumbs_missing: Vec<String>,
     worlds: Worlds,
     /// Seconds left of the closing outro.
     closing: f32,
@@ -239,6 +252,8 @@ impl FeMenus {
                         shown: false,
                         hidden: false,
                         named: Vec::new(),
+                        thumbs: Vec::new(),
+                        thumbs_missing: Vec::new(),
                         worlds: loaded.worlds,
                         closing: 0.0,
                         replay: false,
@@ -292,7 +307,7 @@ impl FeMenus {
                     println!("FE_MENUS loading screen done; heap {} KiB", heap() / 1024);
                 }
                 if closing && r.closing <= 0.0 {
-                    for key in r.named.drain(..) {
+                    for key in r.named.drain(..).chain(r.thumbs.drain(..)) {
                         apt.remove_texture(&key);
                     }
                     println!("FE_MENUS closed; heap {} KiB, {}", heap() / 1024, r.stage.object_summary());
@@ -507,18 +522,39 @@ impl FeMenus {
     /// characters at most) over the menu; the answer comes in [`Update::texts`] under [`PARK_NAME`]. NOT RETAIL YET:
     /// the system keyboard opens over the pause menu itself (retail pushes FE 0x2E; the stage's FE 46 closed the menu).
     pub fn ask_park_name(&mut self, name: &str) {
+        self.ask_text(PARK_NAME, "ID_SKATEPARK_NAME_PARK", name, 16);
+    }
+
+    /// The system keyboard titled `title_id` on `text` (at most `max` characters); the answer comes in
+    /// [`Update::texts`] under `callback`. The team screen's names use it (retail 826397D8 pushes FE 0x2E).
+    pub fn ask_text(&mut self, callback: &str, title_id: &str, text: &str, max: usize) {
         if let FeMenus::Ready(r) = self {
             #[cfg(target_os = "vita")]
             {
-                let title = r.stage.text("ID_SKATEPARK_NAME_PARK");
-                let opened = r.keyboard.open_with(&title, name, 16);
-                println!("FE_MENUS keyboard for {PARK_NAME} ({title:?}): {}", if opened { "open" } else { "refused" });
+                let title = r.stage.text(title_id);
+                let opened = r.keyboard.open_with(&title, text, max);
+                println!("FE_MENUS keyboard for {callback} ({title:?}): {}", if opened { "open" } else { "refused" });
                 if opened {
-                    r.own_entry = Some(PARK_NAME.into());
+                    r.own_entry = Some(callback.into());
                 }
             }
             #[cfg(not(target_os = "vita"))]
-            let _ = (r, name);
+            let _ = (r, callback, title_id, text, max);
+        }
+    }
+
+    /// Opens the team screen (FE 67); false without its movie.
+    pub fn open_team(&mut self, team: skate_core::team::Team) -> bool {
+        match self {
+            FeMenus::Ready(r) => r.stage.open_team(team),
+            _ => false,
+        }
+    }
+
+    /// A name typed for the team screen.
+    pub fn team_named(&mut self, member: Option<usize>, text: &str) {
+        if let FeMenus::Ready(r) = self {
+            r.stage.team_named(member, text);
         }
     }
 
@@ -546,6 +582,43 @@ impl FeMenus {
     }
 
     /// New Park (skate.Park's first row): retail's Park Setup over the menu with the lots; false without its movie.
+    /// The character customisation (FE 15) on a skater; false without its movie.
+    /// The customisation's skater when its mesh is out of date (see `MenuStage::cac_look`).
+    pub fn cac_look(&mut self) -> Option<(skate_core::skater_record::SkaterRecord, skate_core::cac::LookChange)> {
+        match self {
+            FeMenus::Ready(r) => r.stage.cac_look(),
+            _ => None,
+        }
+    }
+
+    pub fn cac_decal_rows(&self) -> Option<[[[f32; 3]; 2]; 5]> {
+        match self {
+            FeMenus::Ready(r) => r.stage.cac_decal_rows(),
+            _ => None,
+        }
+    }
+
+    pub fn cac_look_done(&mut self) {
+        if let FeMenus::Ready(r) = self {
+            r.stage.cac_look_done();
+        }
+    }
+
+    /// What the customisation's preview draws while it is open.
+    pub fn cac_preview(&self) -> Option<skate_core::cac::Preview> {
+        match self {
+            FeMenus::Ready(r) if r.shown => r.stage.cac_preview(),
+            _ => None,
+        }
+    }
+
+    pub fn open_cac(&mut self, screen: skate_core::cac::Cac, cash: u32) -> bool {
+        match self {
+            FeMenus::Ready(r) => r.stage.open_cac(screen, cash),
+            _ => false,
+        }
+    }
+
     pub fn open_park_setup(&mut self, lots: Vec<skate_ui::fe::park_setup_host::ParkSetupLot>) -> bool {
         match self {
             FeMenus::Ready(r) => r.stage.open_park_setup(lots),
@@ -780,6 +853,9 @@ impl FeMenus {
                 r.stage.text_entered(None);
             }
         }
+        out.unlocks.extend(frame.unlocks.iter().cloned());
+        out.cac = r.stage.take_cac();
+        out.team.extend(frame.team_effects.iter().cloned());
         for (id, on) in &frame.cheats {
             println!("FE_MENUS cheat {id} {}", if *on { "on" } else { "off" });
             if id == "zombie" {
@@ -830,9 +906,39 @@ impl FeMenus {
         }
         let started = Instant::now();
         let draws = r.stage.draw();
+        // Slappy's thumbnails: a tile's picture is read from cas.pak when it is drawn, at most `THUMBS_PER_FRAME` a
+        // frame (16 KiB each, DXT5 as retail's), and freed once no tile draws it: only the shown page stays loaded.
+        let mut wanted: Vec<&str> = draws.iter().map(|d| d.texture.as_str()).filter(|t| t.starts_with(THUMB_PREFIX)).collect();
+        wanted.sort_unstable();
+        wanted.dedup();
+        let mut loaded = 0;
+        for key in &wanted {
+            if loaded >= THUMBS_PER_FRAME || apt.has_texture(key) || r.thumbs_missing.iter().any(|m| m == key) {
+                continue;
+            }
+            loaded += 1;
+            let path = format!("cas/thumbs/{}.tex", &key[skate_ui::fe::retail_menu_movies::NAMED_IMAGE_PREFIX.len()..]);
+            match crate::cas_look::read(&path).and_then(|b| vita_pack::cas::texture_from_pack(&b)) {
+                Ok(texture) => {
+                    apt.add_compressed_texture(key, &texture);
+                    r.thumbs.push((*key).to_owned());
+                }
+                Err(e) => {
+                    println!("FE_MENUS thumbnail {key}: {e}");
+                    r.thumbs_missing.push((*key).to_owned());
+                }
+            }
+        }
+        r.thumbs.retain(|k| {
+            let keep = wanted.binary_search(&k.as_str()).is_ok();
+            if !keep {
+                apt.remove_texture(k);
+            }
+            keep
+        });
         // Named images (image/...: the Challenge Map's world maps, its marker icons) upload when first drawn.
         for d in draws.iter().filter(|d| d.texture.starts_with(skate_ui::fe::retail_menu_movies::NAMED_IMAGE_PREFIX)) {
-            if apt.has_texture(&d.texture) || r.named.contains(&d.texture) {
+            if apt.has_texture(&d.texture) || r.named.contains(&d.texture) || d.texture.starts_with(THUMB_PREFIX) {
                 continue;
             }
             r.named.push(d.texture.clone());
@@ -875,6 +981,10 @@ impl FeMenus {
 
 /// The callback of the replay's popups (the Finished menu).
 const REPLAY_POPUP: &str = "replay.finished";
+/// The texture keys of Slappy's thumbnails (`CAC_GetThumbnailFileName` names through `ImageRenderer_Load`).
+const THUMB_PREFIX: &str = skate_ui::fe::menu_stage::CAS_THUMB_PREFIX;
+/// Thumbnails read and uploaded in one frame at most: a page fills in over three frames instead of one long one.
+const THUMBS_PER_FRAME: usize = 3;
 
 /// A retail prompt's button as the replay screens name their glyphs: the face buttons as they are, the others with
 /// `_hud` (a stick or the D-pad without a direction suffix: the stick, the D-pad's arrows).

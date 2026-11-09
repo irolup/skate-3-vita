@@ -34,8 +34,8 @@ pub enum ExtrasAction {
     /// Open text entry for a cheat code (row 0).
     CheatEntry,
     /// Grant content directly (ours for rows 1-3, user 2026-10-19): retail's redeem (`sub_82700380`) sets the row's
-    /// entitlement flag, then grants. The engine has no unlock store yet and nothing is locked ("leave everything
-    /// unlocked for now"): the grants go out as events for the store to take when it exists.
+    /// entitlement flag, then grants. The grants go out as events; the game puts them in its unlock store
+    /// (`crate::unlocks`).
     Grant { redeem: Unlock, grants: Vec<Unlock> },
     /// Push another FE screen by key.
     PushScreen(String),

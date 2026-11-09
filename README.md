@@ -92,7 +92,7 @@ It should end with a line like `menu-tables.json: 47 pause items, 35 settings ro
 
 ### Step 4 : rebuild the game's menu screens
 
-The main and pause menus, Game Settings, the replay editor and their popups are the game's own front-end movies. The first line exports them from your disc with the reference project's exporter. The loop then rebuilds two more screens: the manual meter and the trick analyzer. Copy the whole block at once:
+The main and pause menus, Game Settings, the replay editor, the character customisation, the team screen and their popups are the game's own front-end movies. The first line exports them from your disc with the reference project's exporter. The loop then rebuilds two more screens: the manual meter and the trick analyzer. Copy the whole block at once:
 
 ```sh
 python3 tools/prepare_menu_screens.py --game ../game_data/skate3_x360 --assets $INSTALL/assets --work ../game_data/menu-movies-work
@@ -110,6 +110,17 @@ python3 tools/prepare_object_catalog.py --game ../game_data/skate3_x360 --assets
 ```
 
 It should end with a line like `object-catalog: 661 items`. One failure, for `SkatePark_Spawner`, is normal: that piece has no model.
+
+The character customisation (Free Play > My Career Team > Edit Skater) needs the clothes, hair and faces from your disc, the 3D set the skater stands on, the shop's pictures, and the tattoos' and logos' pictures. The first line runs the reference project's customiser setup (about a minute); the next three export the set, the pictures and the stamps the setup leaves out:
+
+```sh
+(cd ../skate-3-rust-engine && python3 -m tools.asset_pipeline.customiser_setup --game ../game_data/skate3_x360 --assets $INSTALL/assets)
+python3 tools/cas_set.py --game ../game_data/skate3_x360 --assets $INSTALL/assets
+python3 tools/cas_thumbs.py --game ../game_data/skate3_x360 --assets $INSTALL/assets
+python3 tools/cas_stamps.py --game ../game_data/skate3_x360 --assets $INSTALL/assets
+```
+
+The last three end with lines like `cas set: ... CreateSakter.skate (... KiB)`, `2082 thumbnails (33312 KiB of DXT5)` and `9 more tattoos and 233 logos decoded into ...`.
 
 ### Step 5 : build vita-bake and bake the packs
 
@@ -130,6 +141,7 @@ $B audio    $INSTALL/assets/private/audio $OUT
 $B ambience $INSTALL/assets/private/audio $OUT
 $B trickguide $INSTALL $OUT
 $B catalog  $INSTALL $OUT
+$B cas      $INSTALL $OUT
 ```
 
 | Line | What it makes |
@@ -145,8 +157,9 @@ $B catalog  $INSTALL $OUT
 | `ambience` | the ambient city sounds |
 | `trickguide` | the Trick Guide's 3D demo: its set and the skater's trick animations |
 | `catalog` | the Object Dropper's objects and the skate.Park layouts. Without it the dropper and skate.Park don't work |
+| `cas` | the character customisation: the clothes, hair and faces, the set, the shops' pictures, and the tattoos and logos (about 165 MB). Without it the skater is the stock one and the shops (Slappy's, Back Alley Pete's) don't open |
 
-When it's done, `../game_data/SKATEVITA` holds about 1 GB of `.pak` files (and matching `.idx` files). That's your complete game data.
+When it's done, `../game_data/SKATEVITA` holds about 1.3 GB of `.pak` files (and matching `.idx` files). That's your complete game data.
 
 ### Step 6 : copy it to your Vita
 
@@ -167,7 +180,19 @@ $B district $INSTALL $OUT DownTown
 $B catalog  $INSTALL $OUT
 ```
 
-Then copy `catalog.pak`, `catalog.pak.idx`, `district_DownTown.pak` and every `map_*.pak` to `ux0:data/SKATEVITA/`. The game runs with older packs but without these fixes, and without any error: with old `map_*.pak` files the Object Dropper doesn't recognise skate.Parks, with an old `district_DownTown.pak` DownTown keeps two invisible walls (one at the Kube Tower), and with an old `catalog.pak` PCU Training - Basic doesn't change the park. If you never ran the catalogue step, you didn't have the dropper or skate.Park before: this adds them.
+For the character customisation and the team screen, export the menu screens again and run the customisation steps of step 4, then bake the UI and the customisation:
+
+```sh
+python3 tools/prepare_menu_screens.py --game ../game_data/skate3_x360 --assets $INSTALL/assets --work ../game_data/menu-movies-work
+(cd ../skate-3-rust-engine && python3 -m tools.asset_pipeline.customiser_setup --game ../game_data/skate3_x360 --assets $INSTALL/assets)
+python3 tools/cas_set.py --game ../game_data/skate3_x360 --assets $INSTALL/assets
+python3 tools/cas_thumbs.py --game ../game_data/skate3_x360 --assets $INSTALL/assets
+python3 tools/cas_stamps.py --game ../game_data/skate3_x360 --assets $INSTALL/assets
+$B ui       $INSTALL/assets $OUT ../game_data/ui-screens
+$B cas      $INSTALL $OUT
+```
+
+Then copy `catalog.pak`, `catalog.pak.idx`, `district_DownTown.pak`, every `map_*.pak`, `ui.pak`, `cas.pak` and `cas.pak.idx` to `ux0:data/SKATEVITA/`. The game runs with older packs but without these fixes, and without any error: with old `map_*.pak` files the Object Dropper doesn't recognise skate.Parks, with an old `district_DownTown.pak` DownTown keeps two invisible walls (one at the Kube Tower), and with an old `catalog.pak` PCU Training - Basic doesn't change the park. If you never ran the catalogue step, you didn't have the dropper or skate.Park before: this adds them. Without the new `ui.pak` the team screen and Edit Skater don't open; without `cas.pak` the skater is the stock one and the shops don't open. A `cas.pak` made before the tattoos and graphics is refused (the catalogue has more fields now): run the three customisation scripts and `$B cas` again, and copy the new `cas.pak` and `cas.pak.idx`.
 
 ## Building from source
 

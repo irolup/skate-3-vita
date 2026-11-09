@@ -347,6 +347,7 @@ pub fn start(retail_audio: bool) {
     STARTED.store(true, std::sync::atomic::Ordering::Release);
 }
 
+#[cfg(target_os = "vita")]
 fn start_audio(retail_audio: bool) {
     let mut synth = Synth::default();
     let mut retail: Option<crate::retail_audio::Player> = None;

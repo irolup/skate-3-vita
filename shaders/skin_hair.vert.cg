@@ -1,0 +1,66 @@
+// skate vita skater, hair (skin.vert.cg with the second UV set for the opacity map): GPU skinning with the 40-joint palette (35 until L1e: the peds have 39 joints) (root * joint global *
+// inverse bind, computed on the CPU), one directional N.L term plus ambient per
+// vertex (PLAN.md §6.2). Matrices are column-major GL data, so vectors multiply on
+// the left (vitaGL convention).
+uniform float4x4 viewproj;
+uniform float4x4 bones[40];
+uniform float3 lightDir; // unit vector towards the light
+uniform float2 light;    // ambient, diffuse
+uniform float2 gradeDepth; // the grade's near distance and 1 / (far - near)
+// Retail's character shading (upstream `retail_character_common.wgsl` `shade_character`, specular left out): the
+// material's nine rows, `mode` x 1 when on (0: the plain ambient + N.L above), y 1 for hair; the SH ambient light; the eye.
+uniform float4 rows[9];
+uniform float4 mode;
+uniform float3 sh[9];
+uniform float3 eye;
+
+// The light the vertex gets, halved to stay within the colour's range (the fragment doubles it back).
+float3 retailLight(float3 n, float3 world) {
+	float3 vd = normalize(eye - world);
+	float ndl = dot(n, lightDir);
+	if (mode.y > 0.5f) {
+		float fres = pow(1.0f - saturate(dot(n, vd)), max(rows[2].w, 1.0f));
+		float3 hl = rows[1].rgb * (saturate(ndl * 0.75f + 0.25f) + rows[5].w * 0.25f) + rows[6].rgb * fres * saturate(ndl * 1.75f + 0.25f);
+		return hl * 0.5f;
+	}
+	float3 v = n * rows[7].y;
+	float3 irr = saturate(sh[0] + v.x * sh[1] + v.y * sh[2] + v.z * sh[3] + v.x * v.z * sh[4] + v.z * v.y * sh[5]
+		+ v.y * v.x * sh[6] + (3.0f * v.z * v.z - 1.0f) * sh[7] + (v.x * v.x - v.y * v.y) * sh[8]);
+	float3 lit = rows[1].rgb * saturate(ndl) + irr * rows[5].w;
+	float fb = 1.0f - saturate(dot(n, vd));
+	float rfres = pow(max(fb, 1e-6f), rows[0].z);
+	float3 rd = normalize(lightDir * float3(-1.0f, 0.2f, -1.0f) - vd);
+	lit += saturate(rfres * saturate(dot(n, rd))) * rows[6].rgb;
+	return lit * 0.5f;
+}
+
+void main(
+	float3 aPosition,
+	float3 aNormal,
+	float2 aTexcoord,
+	float4 aJoints,
+	float4 aWeights,
+	float2 aTexcoord1,
+	float2 out vTexcoord : TEXCOORD0,
+	float2 out vTexcoord1 : TEXCOORD1,
+	float4 out vColor : COLOR,
+	float4 out gl_Position : POSITION
+) {
+	float4 p = float4(aPosition, 1.0f);
+	float4 n = float4(aNormal, 0.0f);
+	float4x4 b0 = bones[(int)aJoints.x];
+	float4x4 b1 = bones[(int)aJoints.y];
+	float4x4 b2 = bones[(int)aJoints.z];
+	float4x4 b3 = bones[(int)aJoints.w];
+	float4 world = mul(p, b0) * aWeights.x + mul(p, b1) * aWeights.y
+	             + mul(p, b2) * aWeights.z + mul(p, b3) * aWeights.w;
+	float3 normal = (mul(n, b0) * aWeights.x + mul(n, b1) * aWeights.y
+	               + mul(n, b2) * aWeights.z + mul(n, b3) * aWeights.w).xyz;
+	gl_Position = mul(float4(world.xyz, 1.0f), viewproj);
+	float lit = light.x + light.y * max(dot(normalize(normal), lightDir), 0.0f);
+	float3 l = mode.x > 0.5f ? retailLight(normalize(normal), world.xyz) : float3(lit, lit, lit);
+	// The alpha carries the grade's depth weight (no fragment shader reads the lighting alpha).
+	vColor = float4(l, saturate((gl_Position.w - gradeDepth.x) * gradeDepth.y));
+	vTexcoord = aTexcoord;
+	vTexcoord1 = aTexcoord1;
+}

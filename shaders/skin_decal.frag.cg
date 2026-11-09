@@ -1,0 +1,41 @@
+// skate vita skater, tattoo: the skin (skin.frag.cg) with a decal laid over the base colour (retail's
+// cacstamp_skin_defaultPS: skin * (1 + (decal.rgb - 1) * decal.a)). The decal's coordinates are the second UV set taken
+// through the two rows retail's vertex shader builds (`i_customGraphic`, skate_core::stamp::Placement::custom_graphic):
+// outside the picture there is no decal.
+uniform sampler2D tex;
+uniform sampler2D decal;
+uniform float4 tint;
+uniform float3 decalU;
+uniform float3 decalV;
+uniform float decalMode; // 0 a tattoo (multiplies the skin), 1 a logo (lies over the base colour)
+
+uniform float4 grade[6];
+float3 graded(float3 c, float w) {
+	float4 x = float4(c, 1.0f);
+	float3 n = float3(dot(grade[0], x), dot(grade[1], x), dot(grade[2], x));
+	float3 f = float3(dot(grade[3], x), dot(grade[4], x), dot(grade[5], x));
+	return lerp(n, f, w);
+}
+
+uniform float2 tone;
+float3 shaded(float3 albedo, float3 light) {
+	if (tone.y < 0.5f)
+		return albedo * light;
+	float3 x = albedo * albedo * light * tone.x;
+	float3 t = saturate(1.0f - x);
+	float3 tm = max(x * 0.25f + 0.75f, 1.0f) - t * t;
+	return saturate(sqrt(max(tm * 0.5f, 0.0f)) * 1.41f);
+}
+
+float4 main(float2 vTexcoord : TEXCOORD0, float2 vTexcoord1 : TEXCOORD1, float4 vColor : COLOR) : COLOR {
+	float4 c = tex2D(tex, vTexcoord) * tint;
+	float3 uv = float3(vTexcoord1, 1.0f);
+	float2 d = float2(dot(uv, decalU), dot(uv, decalV));
+	float4 t = tex2D(decal, d);
+	float inside = step(0.0f, d.x) * step(d.x, 1.0f) * step(0.0f, d.y) * step(d.y, 1.0f);
+	float cover = t.a * inside;
+	float3 tattoo = c.rgb * (1.0f + (t.rgb - 1.0f) * cover);
+	float3 logo = lerp(c.rgb, t.rgb, cover);
+	c.rgb = lerp(tattoo, logo, decalMode);
+	return float4(graded(shaded(c.rgb, vColor.rgb), vColor.a), 1.0f);
+}

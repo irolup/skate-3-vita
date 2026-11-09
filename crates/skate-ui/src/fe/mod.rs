@@ -17,6 +17,8 @@ pub mod image_renderer_host;
 pub mod menu_stage;
 pub mod object_dropper_host;
 pub mod park_setup_host;
+pub mod cac_host;
+pub mod team_host;
 pub mod browser_host;
 pub mod offline_profile_host;
 pub mod popup_host;

@@ -12,7 +12,9 @@
 //!                                          (with SCREENS, tools/prepare_ui_screen.py's folder) the linked screens
 //!        vita-bake district-stats INSTALL [NAME…]   what whole districts cost
 //!        vita-bake maps INSTALL OUT_DIR [NAME…]   map_<name>.pak for the 7 parks (or NAMEs)
+//!        vita-bake cas INSTALL OUT_DIR     cas.pak: the character customisation parts (upstream's customiser setup)
 mod audio;
+mod cas;
 mod catalog;
 mod district;
 mod living;
@@ -94,6 +96,7 @@ fn main() -> ExitCode {
         ["prop-stats", install, names @ ..] => map::prop_stats(Path::new(install), names),
         ["props", install, out] => map::bake_props(Path::new(install), Path::new(out)),
         ["catalog", install, out] => catalog::bake(Path::new(install), Path::new(out)),
+        ["cas", install, out] => cas::bake(Path::new(install), Path::new(out)),
         ["map-stats", packs @ ..] => packs.iter().try_for_each(|pack| {
             let map = vita_pack::map::Map::from_pack(&std::fs::read(pack).map_err(|e| format!("{pack}: {e}"))?)?;
             let triangles: u32 = map.render.draws.iter().map(|d| d.index_count / 3).sum();
@@ -110,7 +113,7 @@ fn main() -> ExitCode {
             };
             district::stats(Path::new(install), &names)
         }
-        _ => Err("usage: vita-bake all INSTALL OUT_DIR | skater GLB OUT_DIR | sim ASSETS OUT_DIR | ui ASSETS OUT_DIR [SCREENS] | maps INSTALL OUT_DIR [NAME…] | district-stats INSTALL [NAME…] | district-sim INSTALL OUT_DIR [NAME…] | district INSTALL OUT_DIR [NAME…] | catalog INSTALL OUT_DIR | map-stats PACK…".into()),
+        _ => Err("usage: vita-bake all INSTALL OUT_DIR | skater GLB OUT_DIR | sim ASSETS OUT_DIR | ui ASSETS OUT_DIR [SCREENS] | maps INSTALL OUT_DIR [NAME…] | district-stats INSTALL [NAME…] | district-sim INSTALL OUT_DIR [NAME…] | district INSTALL OUT_DIR [NAME…] | catalog INSTALL OUT_DIR | cas INSTALL OUT_DIR | map-stats PACK…".into()),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

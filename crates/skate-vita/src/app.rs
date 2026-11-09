@@ -36,6 +36,8 @@ const TRICK_NAMES: &str = "vfs:/assets/private/hud/trick-names.txt";
 /// The APT texture holding the world behind the pause menu, and the paused frames drawn before it is captured.
 const FROZEN_WORLD: &str = "frozen-world";
 const FREEZE_AFTER_FRAMES: u32 = 4;
+/// The customisation rebuilds a held slider's skater at most this often.
+const MORPH_REBUILD: Duration = Duration::from_millis(150);
 /// The APT texture of the loading screen's background, and how long the loading screen waits at most.
 const LOADING_BACKGROUND: &str = "loading-background";
 const LOADING_LIMIT: Duration = Duration::from_secs(180);
@@ -228,6 +230,8 @@ pub fn run() -> ! {
         s.settings = settings.controls;
         s.paused = !AUTOPLAY;
         s.career = crate::career::load();
+        s.progression = crate::progression::load();
+        s.skaters = crate::skaters::load();
     }
     let mut career_saved = Instant::now();
     {
@@ -281,14 +285,44 @@ pub fn run() -> ! {
     let mut scene_log = Instant::now();
     #[cfg(feature = "stream-bench")]
     let mut bench = crate::stream_bench::Bench::default();
-    let (joints, pack_error) = match std::fs::read(SKATER_PACK)
-        .map_err(|e| format!("{SKATER_PACK}: {e}"))
-        .and_then(|bytes| Skater::from_pack(&bytes))
-    {
-        Ok(skater) => {
-            scene.load_skater(&skater);
-            (Some(skater.joints), None)
+    // The skater: the created look when the customisation pack is there, else the stock mesh.
+    let look = {
+        let skaters = shared.lock().unwrap().skaters.clone();
+        crate::cas_look::load(&skaters).map_err(|e| println!("CAC look not loaded: {e}; the stock skater is drawn")).ok()
+    };
+    // The customisation rebuilds the player with the same builder (its parts and textures stay read).
+    let mut look_builder: Option<crate::cas_look::Builder> = None;
+    let mut cac_data: Option<std::sync::Arc<skate_core::cac::CacData>> = None;
+    // The customisation's preview: its set in the demo slot, its stand.
+    let mut cac_set_loaded = false;
+    let mut cac_set_tried: Option<()> = None;
+    let mut cac_stage = crate::cac_preview::Stage::default();
+    // A change of the skater waiting for its build, and when the last build was.
+    let mut cac_pending: Option<(skate_core::skater_record::SkaterRecord, skate_core::cac::LookChange)> = None;
+    let mut cac_built = Instant::now();
+    let loaded = match look {
+        Some((look, record, builder)) => {
+            match builder.screen_data(&crate::cas_look::read) {
+                Ok(data) => cac_data = Some(std::sync::Arc::new(data)),
+                Err(e) => println!("CAC screen data not loaded: {e}; Back Alley Pete's stays shut"),
+            }
+            if let Some(sh) = builder.ambient() {
+                scene.set_character_ambient(sh);
+            }
+            look_builder = Some(builder);
+            scene.load_look(&look.skater, &look.uv1, &look.opacity, &look.lighting, &look.decals);
+            scene.set_decal_rows(skate_core::cac::decal_rows_of(&record));
+            let mut s = shared.lock().unwrap();
+            s.skater_profile = Some(crate::skaters::sim_profile(&record));
+            s.skater_profile_new = true;
+            s.player = Some(record);
+            drop(s);
+            Ok(look.skater)
         }
+        None => std::fs::read(SKATER_PACK).map_err(|e| format!("{SKATER_PACK}: {e}")).and_then(|bytes| Skater::from_pack(&bytes)).inspect(|skater| scene.load_skater(skater)),
+    };
+    let (joints, pack_error) = match loaded {
+        Ok(skater) => (Some(skater.joints), None),
         Err(e) => {
             println!("skater pack not loaded: {e}");
             (None, Some(e))
@@ -412,12 +446,22 @@ pub fn run() -> ! {
         // The career stats, written outside the shared lock (the simulation keeps running).
         if career_saved.elapsed() >= Duration::from_secs(crate::career::SAVE_SECONDS) {
             career_saved = frame_start;
-            let changed = {
+            let (changed, progression, skaters) = {
                 let mut s = shared.lock().unwrap();
-                std::mem::take(&mut s.career_changed).then(|| s.career.clone())
+                (
+                    std::mem::take(&mut s.career_changed).then(|| s.career.clone()),
+                    std::mem::take(&mut s.progression_changed).then(|| s.progression.clone()),
+                    std::mem::take(&mut s.skaters_changed).then(|| s.skaters.clone()),
+                )
             };
             if let Some(stats) = changed {
                 crate::career::save(&stats);
+            }
+            if let Some(p) = progression {
+                crate::progression::save(&p);
+            }
+            if let Some(list) = skaters {
+                crate::skaters::save(&list);
             }
         }
         let pad = vita::pad();
@@ -574,6 +618,74 @@ pub fn run() -> ! {
                 let update = fe_menus.update(&values, frame_dt, &mut settings, &s.called_skaters);
                 changed |= update.settings_changed;
                 s.skater_calls.extend(update.skater_calls);
+                // The customisation's skater changed: built at once (clean materials, as retail's shop), the screen's keys
+                // wait for it; a held slider's weights are built at most every `MORPH_REBUILD` (a build takes about
+                // 50 ms). Leaving, the skater is built again as in the game.
+                if let Some((record, change)) = fe_menus.cac_look() {
+                    cac_pending = Some((record, change));
+                }
+                let due = match &cac_pending {
+                    Some((_, skate_core::cac::LookChange::Morphs)) => cac_built.elapsed() >= MORPH_REBUILD,
+                    Some(_) => true,
+                    None => false,
+                };
+                let rebuild = if due { cac_pending.take().map(|(record, _)| (record, false)) } else { None };
+                let rebuild = rebuild.or_else(|| update.cac.clone().map(|r| (r, true)));
+                if update.cac.is_some() {
+                    cac_pending = None;
+                }
+                // The tattoos move with the placement page without a rebuild: two rows a slot.
+                if let Some(rows) = fe_menus.cac_decal_rows() {
+                    scene.set_decal_rows(rows);
+                }
+                if let (Some((record, in_game)), Some(builder)) = (rebuild, look_builder.as_mut()) {
+                    cac_built = Instant::now();
+                    let started = Instant::now();
+                    match builder.assemble(&crate::cas_look::read, &record, in_game) {
+                        Ok(look) => {
+                            scene.load_look(&look.skater, &look.uv1, &look.opacity, &look.lighting, &look.decals);
+                            scene.set_decal_rows(skate_core::cac::decal_rows_of(&record));
+                            println!("CAC look rebuilt: {} vertices in {} ms", look.skater.vertex_count(), started.elapsed().as_millis());
+                        }
+                        Err(e) => println!("CAC look not rebuilt: {e}"),
+                    }
+                    fe_menus.cac_look_done();
+                }
+                if let Some(record) = update.cac {
+                    // Closing the customisation clears the clothing unlocks' new marks (82603358, kinds 5 and 6).
+                    s.progression.unlocks.clear_new(skate_core::unlocks::UnlockKind::ClothingUnlock);
+                    s.progression.unlocks.clear_new(skate_core::unlocks::UnlockKind::ClothingSponsor);
+                    s.progression_changed = true;
+                    s.skater_profile = Some(crate::skaters::sim_profile(&record));
+                    s.skater_profile_new = true;
+                    s.skaters[0] = Some(record.clone());
+                    s.skaters_changed = true;
+                    s.player = Some(record);
+                }
+                // The team screen's asks: Edit Skater opens the customisation over it, the names open the keyboard.
+                for effect in update.team {
+                    use skate_core::team::Effect;
+                    match effect {
+                        Effect::EditSkater(_) => {
+                            // The debug unlock-all is retail's unlock-all byte (+0x24, not saved).
+                            s.progression.unlocks.unlock_all = settings.cac_unlock_all;
+                            let screen = s.player.clone().map(|record| skate_core::cac::Cac::open(record, &s.progression.unlocks, cac_data.clone()));
+                            let cash = s.progression.brand.cash;
+                            if !screen.is_some_and(|screen| fe_menus.open_cac(screen, cash)) {
+                                println!("customisation not available");
+                            }
+                        }
+                        Effect::RenameTeam => fe_menus.ask_text(crate::fe_menus::TEAM_NAME, "ID_TEAM_MANAGEMENT_ENTER_NEW_TEAM_NAME", &s.progression.team_name, skate_core::team::NAME_LENGTH),
+                        Effect::RenameMember(m) => fe_menus.ask_text(&format!("{}{m}", crate::fe_menus::MEMBER_NAME), "ID_TEAM_MANAGEMENT_ENTER_NEW_TEAMMATE_NAME", &s.progression.player_name, skate_core::team::NAME_LENGTH),
+                        Effect::Import(_) => println!("team screen: Import Skater is not ported"),
+                        Effect::EmptyTeamName => {}
+                    }
+                }
+                for (kind, name) in update.unlocks {
+                    let granted = s.progression.unlocks.grant(kind, &name);
+                    println!("UNLOCK {} {name}: {}", kind.name(), if granted { "granted" } else { "already had" });
+                    s.progression_changed |= granted;
+                }
                 let mut left = false;
                 for choice in update.choices {
                     use crate::vita_menus::Choice;
@@ -627,6 +739,22 @@ pub fn run() -> ! {
                         }
                         // Park Setup comes with step S5.
                         // New Park: retail's Park Setup (lot and template); the Vita's lots are all open.
+                        // My Career Team: the team screen on the career team (the player alone until teammates join).
+                        Choice::Team => {
+                            let team = skate_core::team::Team::open(s.progression.team_name.clone(), vec![s.progression.player_name.clone()]);
+                            if !fe_menus.open_team(team) {
+                                // Without the team movie: the customisation directly (the 3 Nov stand-in).
+                                println!("team screen not available; the customisation opens directly");
+                                // The debug unlock-all is retail's unlock-all byte (+0x24, not saved).
+                            s.progression.unlocks.unlock_all = settings.cac_unlock_all;
+                            let screen = s.player.clone().map(|record| skate_core::cac::Cac::open(record, &s.progression.unlocks, cac_data.clone()));
+                                let cash = s.progression.brand.cash;
+                                if !screen.is_some_and(|screen| fe_menus.open_cac(screen, cash)) {
+                                    println!("customisation not available");
+                                }
+                            }
+                            left = false;
+                        }
                         Choice::NewPark => {
                             park_lots = crate::parks::lots();
                             let lots = park_lots
@@ -657,6 +785,20 @@ pub fn run() -> ! {
                 }
                 // Save Park's name typed: a taken one asks to overwrite (Yes saves over it, No types again), a new one saves.
                 for (callback, text) in update.texts {
+                    if callback == crate::fe_menus::TEAM_NAME {
+                        s.progression.team_name = text.chars().take(skate_core::team::NAME_LENGTH).collect();
+                        s.progression_changed = true;
+                        fe_menus.team_named(None, &text);
+                        continue;
+                    }
+                    if let Some(member) = callback.strip_prefix(crate::fe_menus::MEMBER_NAME).and_then(|m| m.parse::<usize>().ok()) {
+                        if member == 0 {
+                            s.progression.player_name = text.chars().take(skate_core::team::NAME_LENGTH).collect();
+                            s.progression_changed = true;
+                        }
+                        fe_menus.team_named(Some(member), &text);
+                        continue;
+                    }
                     if callback == crate::fe_menus::PARK_NAME {
                         if crate::parks::exists(&text) {
                             fe_menus.ask_park_overwrite();
@@ -1246,10 +1388,13 @@ pub fn run() -> ! {
             // The world stands still behind the pause menu (the simulation is held): after a few frames (the shown
             // pair settles at alpha 1) it is captured once and the capture is drawn instead of the scene (DownTown's
             // scene took about 15 ms of every paused frame).
-            let freeze = matches!(screen, Screen::Pause | Screen::Main) && !AUTOPLAY;
+            // While the customisation draws its preview the capture is kept, not drawn (and none is taken: it would be of
+            // its set); its screens closing would otherwise be captured with the world behind the next one.
+            let paused_screen = matches!(screen, Screen::Pause | Screen::Main) && !AUTOPLAY;
+            let freeze = paused_screen && fe_menus.cac_preview().is_none();
             paused_frames = if freeze { paused_frames.saturating_add(1) } else { 0 };
             let frozen = freeze && apt.has_texture(FROZEN_WORLD);
-            if !freeze && apt.has_texture(FROZEN_WORLD) {
+            if !paused_screen && apt.has_texture(FROZEN_WORLD) {
                 apt.remove_texture(FROZEN_WORLD);
             }
             // The Trick Guide's demo: its set loads when the guide opens (the screen is black then) and goes with it.
@@ -1278,6 +1423,29 @@ pub fn run() -> ! {
                 scene.unload_demo();
                 demo_palette = Vec::new();
             }
+            // The customisation's set: loaded into the demo slot while the screen is open (the Trick Guide's demo is
+            // not open then), gone with it.
+            let cac_preview = if matches!(screen, Screen::Pause | Screen::Main) { fe_menus.cac_preview() } else { None };
+            if cac_preview.is_some() && !cac_set_loaded && trick_demo.is_none() && cac_set_tried.is_none() {
+                let started = Instant::now();
+                let loaded = crate::cas_look::read(crate::cac_preview::SET).and_then(|b| vita_pack::map::Map::from_pack(&b));
+                match loaded {
+                    Ok(set) => {
+                        scene.load_demo(set.render);
+                        cac_set_loaded = true;
+                        println!("CAC preview: set loaded in {:.0} ms", started.elapsed().as_secs_f32() * 1000.0);
+                    }
+                    Err(e) => println!("CAC preview: no set ({e}); the skater is drawn alone"),
+                }
+                cac_set_tried = Some(());
+            } else if cac_preview.is_none() && (cac_set_loaded || cac_set_tried.is_some()) {
+                if cac_set_loaded && trick_demo.is_none() {
+                    scene.unload_demo();
+                }
+                cac_set_loaded = false;
+                cac_set_tried = None;
+                cac_stage = crate::cac_preview::Stage::default();
+            }
             let demo_view = match (&demo_wanted, &mut trick_demo) {
                 (Some((clip, track)), Some(demo)) => {
                     demo.update(clip, *track, frame_dt, &read);
@@ -1298,6 +1466,22 @@ pub fn run() -> ! {
                 let view_proj = math::projection_far(v.fov.unwrap_or(1.0), 100.0) * math::view(v.camera);
                 let eye = v.camera.w_axis.truncate();
                 scene.draw_demo(&Frame { view_proj, eye, palette: &demo_palette, props: &[], cars: &[], npcs: &[], peds: &[], hand_props: &[], icons: &[], trails: &[], catalog: &[], markers: &[], hidden: &[] });
+            } else if let (Some(preview), Some(binding)) = (cac_preview.as_ref(), &mut binding) {
+                // The customisation's preview: retail's set, the skater playing its stand on it, the page's camera.
+                cac_stage.update(preview, frame_dt, &crate::cas_look::read);
+                if let Some(v) = cac_stage.view(preview, &rig_names) {
+                    binding.palette(&v.snapshot, &v.snapshot, 1.0, &mut palette);
+                    let view_proj = math::projection_far(v.fov.unwrap_or(1.0), 100.0) * math::view(v.camera);
+                    let eye = v.camera.w_axis.truncate();
+                    let frame = Frame { view_proj, eye, palette: &palette, props: &[], cars: &[], npcs: &[], peds: &[], hand_props: &[], icons: &[], trails: &[], catalog: &[], markers: &[], hidden: &[] };
+                    if scene.demo_loaded() {
+                        scene.draw_demo(&frame);
+                    } else {
+                        scene.draw_skater_only(&frame, [0.08, 0.08, 0.1]);
+                    }
+                } else {
+                    draw_black(&mut apt);
+                }
             } else if frozen {
                 apt.draw_screen(FROZEN_WORLD);
             } else {
@@ -1465,7 +1649,7 @@ pub fn run() -> ! {
                 }
             }
             // Without room for the capture the scene goes on being drawn behind the menu; tried again every 2 s.
-            if freeze && paused_frames >= FREEZE_AFTER_FRAMES && (paused_frames - FREEZE_AFTER_FRAMES) % 120 == 0 {
+            if freeze && !apt.has_texture(FROZEN_WORLD) && paused_frames >= FREEZE_AFTER_FRAMES && (paused_frames - FREEZE_AFTER_FRAMES) % 120 == 0 {
                 let started = Instant::now();
                 let mut screen = crate::alloc::SCRATCH.lock().unwrap();
                 if vita_render::read_rgba(&mut screen) {
@@ -1599,6 +1783,13 @@ pub fn run() -> ! {
     }
     settings.save();
     crate::career::save(&shared.lock().unwrap().career);
+    crate::progression::save(&shared.lock().unwrap().progression);
+    {
+        let s = shared.lock().unwrap();
+        if s.skaters_changed {
+            crate::skaters::save(&s.skaters);
+        }
+    }
     stats.log_heap(0);
     println!("quit, exiting");
     // Let PrincessLog send the last line before the process goes away.

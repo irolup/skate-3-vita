@@ -1,26 +1,5 @@
-//! The AI skater's push: retail's PathController posts the same push intents the player's pad listener does
-//! while the skater is slower than its line wants, so an AI skater plays the normal Push animation (doc 26e "AI
-//! skaters push when slower than their line", research b341).
-//!
-//! Retail (TU3, evidence only; re-implemented):
-//! - `sub_8246BAA8` (every board tick, from `sub_8246FA30` on the ground, not in the air): the target speed is the
-//!   recorded step x 60 (`pc+0x1F0`), floored at tunable `8213474C` (4.0 m/s) when the skater is more than tunable
-//!   `A8027415` (2.0 m) off the line, then shaped by the avoider (`sub_82470830`, ours
-//!   [`super::avoid::AvoidState::shape_speed`]). At or above it the brake writer runs (`sub_8246B810`, not ported
-//!   [`brake`]); below it the push writer `sub_8246B4C8`.
-//! - `sub_8246B4C8`: no push in trick categories 4, 7, 10, 12 (`pc+0x340`), stuck stage 4 (`pc+0x238`), or when the
-//!   line direction (`pc+0x26C`) points against the board's forward. The factor is 0.97 (0.99 when
-//!   `sub_824681D8() == 23`, mode not decoded), or 0.3 when a start-trick node is under 40 recorded frames ahead
-//!   (`pc+0x31C`, `pc+0x308`) and the speed is above 2.0 m/s; x 0.3 when an off-board node is under 60 frames ahead
-//!   (`pc+0x39B`, `pc+0x354`), x 0.3 on a slope under -0.22 (`sub_8246B9C0`), x 0.3 above 11.0 m/s. No push at or
-//!   above factor x target, or with a heading error of tunable `86923C10` (40 degrees) or more. Else
-//!   `RightPush` or `LeftPush`, `NewPush` and `Pushing`, all 1.0, every tick the condition holds (no timer).
-//! - The foot (research b347, main checked both getters): `RightPush` when the SkaterAnim component's (type
-//!   `0x82453410`, "ISkaterAnim") stance-mirror bit (slot +0x1C `82B97140`, flags bit 30) differs from its riding-fakie
-//!   bit (slot +0x0C `82B970D8`, bit 29), else `LeftPush`: regular forward pushes right, goofy forward left, fakie
-//!   flips it. Ours: the same two bits of `SkaterAnimation::stance()`.
-//! - The brake writer `sub_8246B810` (b347), at or above the target, see [`brake`]: `Brake` (or `ManualBrake` in a
-//!   manual, category 8) with a ramped magnitude, only far above the target speed.
+//! The AI skater's push: PathController push intents while slower than its line (b341, 8246BAA8 / 8246B4C8).
+//! Retail mechanism, foot choice (b347) and brake: docs/hails-additions/26e-living-world-skater-ai.md#ai-skater-push
 
 use super::replay::{node_events, node_flags, ReplayLine};
 use super::Vec3;
@@ -147,6 +126,13 @@ pub fn off_board_frames(line: &ReplayLine, node: u32, into: u32, s: &PushSetting
     frames_to(line, node, into, s.off_board_frames, |n| n.flags & node_flags::OFF_BOARD != 0)
 }
 
+/// `sub_8246B4C8`'s direction gate: the line against the facing of `sub_82468FC0`, the effective forward negated while
+/// riding fakie.
+pub fn against_line(forward: Vec3, fakie: bool, along: Vec3) -> bool {
+    let sign = if fakie { -1.0 } else { 1.0 };
+    (forward[0] * along[0] + forward[1] * along[1] + forward[2] * along[2]) * sign < 0.0
+}
+
 /// The push intents of this tick, or `None` (`sub_8246B4C8`). The caller runs it only on the ground, on the board,
 /// outside a hold, and below the target (at or above it retail brakes instead).
 pub fn push(input: &PushInput, s: &PushSettings) -> Option<[(&'static str, f32); 3]> {
@@ -223,6 +209,15 @@ pub fn brake(input: &PushInput, on_line: bool, s: &BrakeSettings, push: &PushSet
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_fakie_skater_travelling_along_the_line_is_not_against_it() {
+        let (board, along) = ([0.0, 0.0, -1.0], [0.0, 0.0, 1.0]);
+        assert!(against_line(board, false, along), "forward stance, board against the line");
+        assert!(!against_line(board, true, along), "fakie: the facing is the board's other end");
+        assert!(against_line(along, true, along), "fakie with the board along the line faces away");
+        assert!(!against_line(along, false, along));
+    }
 
     fn input(speed: f32, target: f32) -> PushInput {
         PushInput { speed, target, category: 0, stuck_stage: 0, against_forward: false, heading_error: 0.0, trick_frames: None, off_board_frames: None, slope: 0.0, mirrored: true, fakie: false }

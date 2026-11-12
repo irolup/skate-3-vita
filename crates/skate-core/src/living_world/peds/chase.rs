@@ -1,17 +1,5 @@
-//! Ped chases (doc 26 "Ped chases"): the per-type chase record and where a chasing ped runs.
-//! Retail (TU3, evidence only; re-implemented; `.local/research/peds/b10-ped-chase-takedown.md`,
-//! `b11-ped-intercept-takedown.md`, main checked the constants and the angle source):
-//! - each ped type points at a `livingworld_entities_chase` record (escape distance, exhaustion,
-//!   run speed, max lead time, ...); the chase manager holds the `global` record (predict angle);
-//! - InterceptChasee Update (`826A3BF0`) asks the solver (`sub_82E3D4D8`) for a goal: the flat
-//!   intercept time `t` with `|Q + V t - P| = speed t` (`sub_82E15CD0`); no solution or `t` not
-//!   below the record's max lead time -> no new goal this tick. When the angle between
-//!   (chaser - chasee) and the chasee's velocity lies strictly between the predict angle and
-//!   180 deg minus it, the goal leads the chasee (`Q + V t`); else it is the chasee itself.
-//!   The goal keeps the higher of the two heights, the nav runs at the run speed with a 0.5 m
-//!   arrival radius (`0x8209975C`).
-//! Which root `sub_82E15CD0` takes when there are two is not fully decoded: we take the smallest
-//! positive one (inferred).
+//! Ped chases: the per-type chase record and where a chasing ped runs (intercept solver 82E3D4D8).
+//! Retail mechanism: docs/hails-additions/26g-living-world-ped-interactions.md#ped-chase-intercept
 
 use super::super::Vec3;
 use std::collections::BTreeMap;
@@ -137,10 +125,7 @@ impl ChaseGroup {
     pub fn info(&self, max_chasers: usize) -> ChaseGroupInfo {
         ChaseGroupInfo { count: self.chasers.len(), primary: self.chasers.first().copied(), end_reason: self.end_reason, can_add: self.chasers.len() < max_chasers && self.end_reason.is_none() }
     }
-    /// `82D96C38`: no duplicates, at most [`GROUP_CAPACITY`]; the first chaser resets the end
-    /// reason.
-    /// `82D96C38`: a join is refused when the group already holds `max_chasers` (vfn16, the chasee's record) or the
-    /// capacity.
+    /// 82D96C38: no duplicates; refused at `max_chasers` or the capacity; the first chaser resets the end reason.
     pub fn add(&mut self, chaser: u64, offset: Vec3, max_chasers: usize) -> bool {
         if self.chasers.contains(&chaser) || self.chasers.len() >= max_chasers.min(GROUP_CAPACITY) {
             return false;
@@ -173,10 +158,7 @@ impl ChaseGroup {
         if self.chasers.len() < 2 || self.chasers[0] != chaser {
             return false;
         }
-        // `82D97108`: the primary swaps with the next chaser, then the old primary moves to the back, so with three or
-        // more chasers the primary goes round the group. NOT RETAIL YET: retail can name the new primary (the
-        // caller's handle; the next chaser without one) and raises the old primary's rest time; ours always takes
-        // the next chaser.
+        // 82D97108: primary swaps with the next chaser, old primary to the back (NOT RETAIL YET: named primary, rest time).
         self.chasers.swap(0, 1);
         let old = self.chasers.remove(1);
         self.chasers.push(old);
@@ -248,11 +230,7 @@ pub fn intercept(chaser: Vec3, chasee: Vec3, velocity: Vec3, speed: f32, max_lea
     }
 }
 
-/// `82D99540` UpdateBlockPrediction: does a secondary chaser at `chaser` block a chasee at
-/// `chasee` moving at `velocity`? Within the range (flat), either touching (`chasee_radius` +
-/// the block radius; the chasee radius `G+1648` has no known writer, 0.0 here) or the chasee
-/// runs at the chaser faster than the closing speed within the cone. The block point is then the
-/// formation point (the entry direction stays 0).
+/// 82D99540 UpdateBlockPrediction: does a secondary chaser block the chasee (touch or cone): docs/hails-additions/26g-living-world-ped-interactions.md#chase-block-prediction
 pub fn should_block(chaser: Vec3, chasee: Vec3, velocity: Vec3, chasee_radius: f32, record: &ChaseRecord) -> bool {
     let g = |k: &str| record.get(k).unwrap_or(0.0);
     let d = [chasee[0] - chaser[0], chasee[2] - chaser[2]];
@@ -288,13 +266,16 @@ pub fn escaped(chaser: Vec3, chasee: Vec3, record: &ChaseRecord) -> bool {
     d[0] * d[0] + d[1] * d[1] + d[2] * d[2] - e * e > 0.0
 }
 
-/// The mover's reachability check (`82E2CB08`, every 10 mover updates: `82C465A8` snaps the ped and its current
-/// destination onto the navmesh, `82C464F0` tests that both have a polygon and are connected; research b177 / b302).
-/// `ped` and `destination` are the located polygons (`None` = not on the mesh, e.g. a chasee in deep water).
-/// True when the check reports the destination unreachable (retail result codes 0, 2, 3, 4 post an event; 1 posts
-/// none). Ours: the reachable-but-high-area-class case (`82C47D60`) is not ported.
+/// Mover reachability check (82E2CB08 every 10 updates; 82C465A8, 82C464F0; b177 / b302): docs/hails-additions/26g-living-world-ped-interactions.md#chase-reach-check
 pub fn reach_failed(mesh: &super::nav::NavMesh, ped: Option<u32>, destination: Option<u32>) -> bool {
     !matches!((ped, destination), (Some(a), Some(b)) if mesh.reachable(a, b))
+}
+
+/// The mover's check from world points (`82C465A8`): ped and destination snap with [`super::nav::NavMesh::reach_snap`]
+/// (window = radius 0.5 x the NavPower scale 1.3, b653), then the same connectivity test.
+pub fn reach_failed_at(mesh: &super::nav::NavMesh, ped: Vec3, destination: Vec3, window: f32) -> bool {
+    let snap = |p: Vec3| mesh.reach_snap(p, window).map(|n| n.poly);
+    reach_failed(mesh, snap(ped), snap(destination))
 }
 
 /// What the intercept goal's event handler (`82E31D58`) does with a report: an unreachable report rewrites
@@ -306,10 +287,7 @@ pub fn apply_reach_report(unreachable: &mut bool, failed: bool, near: bool) {
     }
 }
 
-/// The line the HUD's central message shows when a chase reaches the player (`826B4FC0`, chase manager
-/// `0x830854B8` vtable slot +64): `caught` false = the chase ended (`ID_CHASE_OVER`); a taze picks by halves, a
-/// takedown the four "caught" lines by quarters. `roll` is retail's `rand() % 101 * 0.01`. Language ids: the text is
-/// the HUD movie's language table ("ZAP!", "Tazed!", "BAM!", ...).
+/// HUD central message line when a chase reaches the player (826B4FC0, slot +64): docs/hails-additions/26g-living-world-ped-interactions.md#chase-message
 pub fn chase_message(caught: bool, tazed: bool, roll: f32) -> &'static str {
     match (caught, tazed) {
         (false, _) => "ID_CHASE_OVER",
@@ -348,6 +326,13 @@ mod tests {
         assert!(reach_failed(&m, ped, water), "a chasee in the water");
         assert!(reach_failed(&m, ped, island), "a chasee on an unconnected island");
         assert!(reach_failed(&m, None, bank), "the ped itself off the mesh");
+        // b653: no height test, a square 0.65 m X / Z window.
+        let at = |chasee: Vec3| reach_failed_at(&m, [1.0, 0.0, 1.0], chasee, 0.65);
+        assert!(!at([3.0, 1.5, 3.0]), "a chasee 1.5 m above the bank (a ledge or rail over it) is reachable");
+        assert!(!at([3.0, 12.0, 3.0]), "any height");
+        assert!(!at([4.6, 0.0, 2.0]), "0.6 m off the edge snaps back");
+        assert!(at([4.7, 0.0, 2.0]), "0.7 m off the edge does not");
+        assert!(at([7.0, 0.0, 2.0]), "the water between");
         // 82E31D58: an unreachable report sets the bit within the radius and clears it beyond; a reachable
         // destination posts nothing, so the bit stays (a chasee back on the bank does not end the wait).
         let mut bit = false;

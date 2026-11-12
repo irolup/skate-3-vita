@@ -239,6 +239,37 @@ pub(crate) fn collision_world_with(
     material: RetailContactMaterial,
     pieces: Option<LayoutPieces>,
 ) -> Result<BoardWorld, String> {
+    let mut world = collision_world_inner(map, material, pieces)?;
+    // The map's rails are the off-board searches' rail records (retail's rail query `82C1EAD8` starts with the map
+    // rails: ledge edges `82D32808`, the off-board contact check `82D81610`, respawn `82BFB6F8`; doc 26i).
+    let edges = map_rail_edges(map)?;
+    let count = edges.len();
+    world.set_static_edges(edges).map_err(str::to_owned)?;
+    info!("SKATE_RAIL_EDGES map rails {} -> {count} query edges", map.rails.len());
+    Ok(world)
+}
+
+/// One query edge per map rail segment: its contact chord, as the grind sees it (`grind_world::map_rail_chords`).
+pub(crate) fn map_rail_edges(map: &SkateMap) -> Result<Vec<skate_core::physics::board_world::query_metadata::EdgeSegment>, String> {
+    Ok(rail_edges(crate::grind_world::map_rail_chords(map)?))
+}
+
+/// Query edges from rail chords (start, end): degenerate and non-finite chords left out.
+pub(crate) fn rail_edges(chords: impl IntoIterator<Item = ([f32; 3], [f32; 3])>) -> Vec<skate_core::physics::board_world::query_metadata::EdgeSegment> {
+    use skate_core::{math::Vector3, physics::board_world::query_metadata::{Bounds, EdgeSegment}};
+    let v = |p: [f32; 3]| Vector3::new(p[0], p[1], p[2]);
+    chords
+        .into_iter()
+        .filter(|(a, b)| a != b && a.iter().chain(b).all(|c| c.is_finite()))
+        .filter_map(|(a, b)| Bounds::from_points([v(a), v(b)]).map(|local_bounds| EdgeSegment { start: v(a), end: v(b), local_bounds }))
+        .collect()
+}
+
+fn collision_world_inner(
+    map: &SkateMap,
+    material: RetailContactMaterial,
+    pieces: Option<LayoutPieces>,
+) -> Result<BoardWorld, String> {
     let pieces = pieces.filter(|p| !p.is_empty());
     if let Some(archive) = retail_archive(map)? {
         return retail_collision_world(archive, material, pieces);
@@ -1954,7 +1985,11 @@ pub(crate) fn load_types(
                     warn!("SKATE_PROP_TYPES: {map_name} template {template}: priority: {error}");
                     Some(100)
                 });
-                types.insert(template.clone(), DmoType { key: key.to_owned(), blocks, priority });
+                let audio = crate::physics::prop_dynamics::dmo_type_audio(&collections, key).unwrap_or_else(|error| {
+                    warn!("SKATE_PROP_TYPES: {map_name} template {template}: audio: {error}");
+                    None
+                });
+                types.insert(template.clone(), DmoType { key: key.to_owned(), blocks, priority, audio });
             }
             Err(error) => warn!("SKATE_PROP_TYPES: {map_name} template {template}: {error}"),
         }
@@ -2023,7 +2058,11 @@ pub(crate) fn load_map_prop_layer(
     simulation: skate_core::physics::rigid_body::RetailSimulationStep,
 ) -> Option<(PropCollisionLayer, crate::physics::prop_dynamics::PropDynamics)> {
     let (skate, json, name) = prop_files(asset_root, map);
-    load_prop_layer_at(asset_root, &skate, &json, &name, material, simulation)
+    let layout = crate::park_layout::layout_of(map).is_some_and(|l| l == name);
+    load_prop_layer_at(asset_root, &skate, &json, &name, material, simulation).map(|(layer, mut dynamics)| {
+        dynamics.set_layout_pieces(layout);
+        (layer, dynamics)
+    })
 }
 
 fn load_prop_layer_at(

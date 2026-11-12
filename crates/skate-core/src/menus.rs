@@ -131,8 +131,15 @@ pub mod facts {
     pub const COMPLETED_CHALLENGES: &str = "completed_challenges";
     /// 1 when the skate park being edited has unsaved changes.
     pub const PARK_DIRTY: &str = "park_dirty";
-    /// 1 when the park can be saved (retail: a park-state flag and a mode check).
+    /// 1 when the park can be saved (retail: a park-state flag only, `[0x83084690]+0x23`, b673).
     pub const PARK_SAVEABLE: &str = "park_saveable";
+    /// 1 when the current world row has `IsSkatePark` set (retail `82511168`, b673).
+    pub const WORLD_IS_SKATE_PARK: &str = "world_is_skate_park";
+    /// 1 when the San Van party pack (DLC product CCF000C, `82518AD0`) is owned (b673 / b458).
+    pub const PARTY_PACK_OWNED: &str = "party_pack_owned";
+    /// 1 when career progression still holds skate.Park locked (ProgressionManager +0x3A with neither DLC CCF0003 nor
+    /// the `film_skpk_univ_01` challenge known, b673); 0 = unlocked (ours: no career progression yet).
+    pub const SKATE_PARK_LOCKED: &str = "skate_park_locked";
     /// 1 in a downloaded community park (retail mode state 11 plus checks).
     pub const PARK_COMMUNITY: &str = "park_community";
     /// 1 when Skate Feed settings are available (retail sub_8245A2D0).
@@ -749,6 +756,9 @@ impl MenuRegistry {
         let parks = vec!["CareerPark".to_owned(), "FreePlayPark".to_owned()];
         let in_park = Rule::Mode(parks.clone());
         let not_in_park = Rule::Not(Box::new(in_park.clone()));
+        // Career / Free Play IsItemEnabled (8261F850 / 82620320, b673): also off in a world flagged as a skate park.
+        let not_park_world = Rule::All(vec![not_in_park.clone(), Rule::fact(WORLD_IS_SKATE_PARK, Cmp::Eq, 0.0)]);
+        let career = Rule::Mode(vec!["Career".to_owned()]);
         let rules: Vec<(EntryRef, Option<Rule>, Option<Rule>)> = vec![
             // Settings: GameSettings_GetNumOptions stops at the SFX pack row with <= 1 pack;
             // IsItemEnabled (sub_8260D648) greys it, Difficulty when online, Skate Feed when unavailable.
@@ -759,8 +769,12 @@ impl MenuRegistry {
             (EntryRef::item("Project10"), Some(Rule::fact(PROJECT10_UNLOCKED, Cmp::Ne, 0.0)), None),
             // Park IsItemEnabled (sub_8261FB18): SkateReel / SkateWith off in a park; SavePark,
             // RatePark and FlagSkatePark by park state.
-            (EntryRef::item("SkateReel"), None, Some(not_in_park.clone())),
-            (EntryRef::item("SkateWith"), None, Some(not_in_park)),
+            (EntryRef::item("SkateReel"), None, Some(not_park_world.clone())),
+            (EntryRef::item("SkateWith"), None, Some(not_park_world)),
+            // Career only: EnterSkatePark waits for career progression; PartyPlay needs the San Van pack (b673).
+            (EntryRef::item("EnterSkatePark"), None,
+                Some(Rule::Any(vec![Rule::Not(Box::new(career)), Rule::fact(SKATE_PARK_LOCKED, Cmp::Eq, 0.0)]))),
+            (EntryRef::item("PartyPlay"), None, Some(Rule::fact(PARTY_PACK_OWNED, Cmp::Ne, 0.0))),
             (EntryRef::item("SavePark"), None, Some(Rule::fact(PARK_SAVEABLE, Cmp::Ne, 0.0))),
             (EntryRef::item("RatePark"), None, Some(Rule::fact(PARK_COMMUNITY, Cmp::Ne, 0.0))),
             (EntryRef::item("FlagSkatePark"), None, Some(Rule::fact(PARK_COMMUNITY, Cmp::Ne, 0.0))),

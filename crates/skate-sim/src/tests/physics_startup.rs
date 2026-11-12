@@ -9,31 +9,10 @@ fn stock_skater_startup_builds_the_graphs_and_physical_body_from_the_same_rig() 
     let manifest = skate_data::GameAssets::load(root).unwrap();
     let graphs = crate::graph_runtime::StockGraphs::load(root, &manifest).unwrap();
     let mut physics = GamePhysics::load(root).unwrap();
-    // This regression isolates grounded controls on the original flat fixture.
-    // The production box is only six metres wide: sustained kickturning leaves
-    // it at x=-3.32, correctly selecting KnownAir and ForcePhysics2. Separate
-    // air_playback tests exercise the shipped course and deliberate roll-off.
-    let corners = [
-        Vector3::new(-20.0, ground::HEIGHT, -20.0),
-        Vector3::new(20.0, ground::HEIGHT, -20.0),
-        Vector3::new(20.0, ground::HEIGHT, 20.0),
-        Vector3::new(-20.0, ground::HEIGHT, 20.0),
-    ];
-    physics.world = (BoardWorld::new(
-        [[0, 2, 1], [0, 3, 2]]
-            .map(|indices| {
-                skate_core::physics::board_world::WorldTriangle::from_vertices(
-                    indices.map(|i| corners[i]),
-                    physics.settings.floor_material,
-                    0,
-                    skate_core::physics::collision::TriangleFeature::ONE_SIDED,
-                    [1.0; 3],
-                    0.0,
-                )
-                .unwrap()
-            })
-            .to_vec(),
-    )).into();
+    // This regression isolates grounded controls on the flat fixture. The production box is only six metres wide:
+    // sustained kickturning leaves it, correctly selecting KnownAir and ForcePhysics2. Separate air_playback tests
+    // exercise the shipped course and deliberate roll-off.
+    physics.world = (ground::flat_world(physics.settings.floor_material)).into();
     let mut skater = SkaterRuntime::load(root, &graphs, &physics, "normal").unwrap();
     assert_eq!(
         skater.animation.pose.len(),

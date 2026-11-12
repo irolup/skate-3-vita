@@ -83,6 +83,9 @@ pub enum MotionCondition {
     /// animation mode, so the condition is a resolved false leaf rather than
     /// an unsupported graph node.
     DebugAnimationsMode,
+    /// 82BA84F0: a GestureBoth, GestureLeft, GestureRight or Shove channel exists (keys 830BE040 / 830BE084 /
+    /// 830BFCC0 / 830BE010).
+    IsArmChannelPlaying,
     /// Stock gameplay predicates whose concrete values are published by the
     /// grind/handplant/skitch physical owners.
     StockGameplay(super::motion_stock_conditions::Condition),
@@ -186,6 +189,7 @@ impl MotionCondition {
             "IsHoldingSkateboard" => Self::IsHoldingSkateboard,
             "IsStandingOnMovingObject" => Self::IsStandingOnMovingObject,
             "IsInDebugAnimationsMode" => Self::DebugAnimationsMode,
+            "IsArmChannelPlaying" => Self::IsArmChannelPlaying,
             name if super::motion_stock_conditions::Condition::recognizes(name) => {
                 Self::StockGameplay(super::motion_stock_conditions::Condition::parse(a))
             }
@@ -243,6 +247,7 @@ impl MotionCondition {
                 p.offboard_trajectory_valid && n.matches(p.offboard_trajectory_time)
             }
             Self::DebugAnimationsMode => false,
+            Self::IsArmChannelPlaying => ["GestureBoth", "GestureLeft", "GestureRight", "Shove"].iter().any(|c| host.animation.channels.has(c)),
             Self::LocoState(condition) => condition.evaluate(
                 host.offboard_locomotion_state
                     .ok_or("LocoState requires retained Biped locomotion through OffBoard84")?,

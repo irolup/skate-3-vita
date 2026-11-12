@@ -55,6 +55,27 @@ pub const fn ped_pos(g: u32) -> u32 {
     ctl(PEDESTRIAN, 1, g)
 }
 
+/// The MixMap Dynamic slot (8): one instance per prop SFX object (`sub_824F4108`, 5): docs/hails-additions/27-dynamic-props.md#prop-sounds
+pub const DYNAMIC: u32 = 8;
+pub const DYNAMIC_INSTANCES: usize = 5;
+
+/// `SFXObj_DynamicObject` (outputs 0-11: the rolling / sliding loops).
+pub const fn dynamic(g: u32) -> u32 {
+    obj(DYNAMIC, 0, g)
+}
+/// The pushed prop's object (`Moving`, outputs 0-17).
+pub const fn moving(g: u32) -> u32 {
+    obj(DYNAMIC, 1, g)
+}
+/// The prop's 3DObjPos block (B0 reads `Ctl 8.0`).
+pub const fn dynamic_pos(g: u32) -> u32 {
+    ctl(DYNAMIC, 0, g)
+}
+/// `SFXCTL_DynamicObjectPhysics` (input 0: the moved prop's spin, the owner writer `sub_824B5558`).
+pub const fn dynamic_physics(g: u32) -> u32 {
+    ctl(DYNAMIC, 1, g)
+}
+
 /// The MixMap PlayerSpeech slot (13): one instance per skater's `CSTATE_SkaterSpeech` record (7 in
 /// free skate). Its object 0 is the skater's speech owner (`SFXObj_PlayerSpeech`, update
 /// `sub_824DA300`), every B lookup reads the 3DObjPos `Ctl 13.1`.

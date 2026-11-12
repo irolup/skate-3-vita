@@ -184,7 +184,9 @@ impl Runtime {
             }
             (a, b) => a.or(b),
         };
-        self.mixer.render_with_env(&mut self.bus, env);
+        // Only the local player's chains post a FlangeSub send level (level(21) / (22)).
+        let flange = if bed { self.grains.flange_send() } else { None };
+        self.mixer.render_with_env(&mut self.bus, env, flange);
         if bed {
             self.grains.add_to(&mut self.bus);
         }

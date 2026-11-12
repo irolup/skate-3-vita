@@ -98,6 +98,167 @@ pub struct PedAnimSet {
     pub entries: BTreeMap<String, Vec<RemapClip>>,
     /// The set's collision values (knock-down speeds, whether it allows knock-downs, ground time).
     pub collision: super::skater_contact::CollisionRules,
+    /// The locomotion speed rows, ascending (empty in an install from before setup named them).
+    pub speed_rows: Vec<SpeedRow>,
+}
+
+/// One locomotion speed row of a set (poster `sub_82E29D98`, research b682) [code + data]: from `threshold` m/s up
+/// the ped is in `state` with the `tier` cycle. `turn_from`: the previous row states a turn may start from.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SpeedRow {
+    pub threshold: f32,
+    pub state: String,
+    pub tier: Tier,
+    pub turn_from: Vec<String>,
+}
+
+/// The cycle tier intent of a speed row (`WalkCyc.Brisk`, `ChaseRunCyc.Slow` / `.Fast`) [data].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Tier {
+    #[default]
+    Default,
+    Brisk,
+    Slow,
+    Fast,
+}
+
+impl Tier {
+    pub fn from_intent(name: Option<&str>) -> Self {
+        match name {
+            Some("Brisk") => Tier::Brisk,
+            Some("Slow") => Tier::Slow,
+            Some("Fast") => Tier::Fast,
+            _ => Tier::Default,
+        }
+    }
+}
+
+/// The poster adds `add` to a speed above `above` before the pick (`0x8231A844` 1.0 / `0x820C6D98` 0.25, b682).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SpeedBump {
+    pub above: f32,
+    pub add: f32,
+}
+
+impl Default for SpeedBump {
+    fn default() -> Self {
+        Self { above: 1.0, add: 0.25 }
+    }
+}
+
+/// A moving ped's intent and tier. With a brain speed the speed rows decide: a ChaseRun row runs, a Walk row walks,
+/// each with its tier, a Shuffle row shuffles (an Idle row keeps the nav's walk). Without a speed a fleeing /
+/// chasing ped runs the set's untiered run row, else its first run row (OURS: the flee speed is not decoded; a set
+/// whose only run row is Slow, the female one, runs Slow). Rows empty (an old install): walk, or run when fleeing.
+pub fn moving_intent(nav: Intent, running: bool, speed: Option<f32>, rows: &[SpeedRow], bump: SpeedBump) -> (Intent, Tier) {
+    if nav != Intent::Walk {
+        return (nav, Tier::Default);
+    }
+    let run = |tier| (Intent::Run, tier);
+    match speed.and_then(|s| speed_row(rows, s, bump)) {
+        Some(r) if r.state == "ChaseRun" => run(r.tier),
+        Some(r) if r.state == "Walk" => (Intent::Walk, r.tier),
+        Some(r) if r.state == "Shuffle" => (Intent::Shuffle, Tier::Default),
+        Some(_) => (Intent::Walk, Tier::Default),
+        None if running => {
+            let runs = || rows.iter().filter(|r| r.state == "ChaseRun");
+            run(runs().find(|r| r.tier == Tier::Default).or_else(|| runs().next()).map_or(Tier::Default, |r| r.tier))
+        }
+        None => (Intent::Walk, Tier::Default),
+    }
+}
+
+/// A strafe step direction (`sub_82E2AFC0`'s Move* intents).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StrafeMove {
+    Forwards,
+    Backwards,
+    Side { degrees: u16, left: bool },
+}
+
+/// What the strafe flag posts this update: a turn toward the target, else a step along the move direction.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StrafeInput {
+    /// (45 / 90, left).
+    pub turn: Option<(u16, bool)>,
+    pub step: Option<StrafeMove>,
+}
+
+/// The strafe poster's edges (`sub_82E2AFC0`: 25 / 70 / 115 / 160 degrees, inclusive; the turn bucket `sub_82E2A500`
+/// with mask 0xCC keeps 45 and 90 only; b686) [code].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StrafeRules {
+    pub edges: [f32; 4],
+    /// The step aims at the first path node farther than this, m (`sub_82E2A6B0`: 3D squared distance > 0.01; b695).
+    pub node_reach: f32,
+}
+
+impl Default for StrafeRules {
+    fn default() -> Self {
+        Self { edges: [25.0, 70.0, 115.0, 160.0], node_reach: 0.1 }
+    }
+}
+
+/// Signed degrees from `heading` (yaw, `atan2(x, z)`) to the flat direction `dir`; positive = left (ours; retail's
+/// positive is right).
+fn signed_degrees(heading: f32, dir: [f32; 2]) -> f32 {
+    let mut e = dir[0].atan2(dir[1]) - heading;
+    while e > std::f32::consts::PI {
+        e -= std::f32::consts::TAU;
+    }
+    while e < -std::f32::consts::PI {
+        e += std::f32::consts::TAU;
+    }
+    e.to_degrees()
+}
+
+/// `sub_82E2ADE0` + `sub_82E2A500` (mask 0xCC), then `sub_82E2AFC0`: a turn toward `target` (3D, ped to target) from 25
+/// degrees off the facing (90 from 70 up); with no turn and `speed > 0`, the step along `step_dir` (none: Forwards).
+pub fn strafe_input(heading: f32, target: [f32; 3], step_dir: Option<[f32; 2]>, speed: f32, rules: &StrafeRules) -> StrafeInput {
+    let [e1, e2, e3, e4] = rules.edges;
+    // `sub_82E2AB18` normalises the target in 3D: the size is acos of the 3D dot with the flat facing, the side from the
+    // flat cross (b695).
+    let length = (target[0] * target[0] + target[1] * target[1] + target[2] * target[2]).sqrt();
+    let turn = (length > 1e-4 && target[0] * target[0] + target[2] * target[2] > 1e-8).then(|| {
+        let side = if signed_degrees(heading, [target[0], target[2]]) > 0.0 { 1.0 } else { -1.0 };
+        let dot = (target[0] * heading.sin() + target[2] * heading.cos()) / length;
+        side * dot.clamp(-1.0, 1.0).acos().to_degrees()
+    }).and_then(|d| {
+        let left = d > 0.0;
+        if d.abs() >= e2 {
+            Some((90, left))
+        } else if d.abs() >= e1 {
+            Some((45, left))
+        } else {
+            None
+        }
+    });
+    let step = (turn.is_none() && speed > 0.0).then(|| {
+        let d = step_dir.filter(|v| v[0] * v[0] + v[1] * v[1] > 1e-8).map_or(0.0, |v| signed_degrees(heading, v));
+        let left = d > 0.0;
+        match d.abs() {
+            a if a >= e4 => StrafeMove::Backwards,
+            a if a >= e3 => StrafeMove::Side { degrees: 135, left },
+            a if a >= e2 => StrafeMove::Side { degrees: 90, left },
+            a if a >= e1 => StrafeMove::Side { degrees: 45, left },
+            _ => StrafeMove::Forwards,
+        }
+    });
+    StrafeInput { turn, step }
+}
+
+/// The tier a cycle of `state` uses: Brisk is a walk cycle, Slow / Fast are run cycles.
+fn cycle_tier(state: Locomotion, tier: Tier) -> Tier {
+    match (state, tier) {
+        (Locomotion::Run, Tier::Slow | Tier::Fast) | (Locomotion::Walk, Tier::Brisk) => tier,
+        _ => Tier::Default,
+    }
+}
+
+/// The row a speed picks: the highest threshold at or below the bumped speed.
+pub fn speed_row(rows: &[SpeedRow], speed: f32, bump: SpeedBump) -> Option<&SpeedRow> {
+    let s = if speed > bump.above { speed + bump.add } else { speed };
+    rows.iter().filter(|r| r.threshold <= s).max_by(|a, b| a.threshold.total_cmp(&b.threshold))
 }
 
 /// The logical names M2 plays (`MotionGraph_Pedestrian.xml` includes) [data].
@@ -128,11 +289,68 @@ pub mod names {
     /// The chase / flee run cycle (stock `*_CHASE_RUN_N_0_CYC`, logical name hash
     /// `7746273E01422734`).
     pub const RUN: &str = "FwdChaseRunCyc";
+    pub const BRISK_WALK: &str = "FwdBriskWalkCyc";
+    pub const SLOW_RUN: &str = "FwdChaseRunSlowCyc";
+    /// The run's own start and stop (`motiongraph_chaserun.xml` ChaseIntoDefault, `motiongraph_idle.xml`
+    /// ChaseRunToIdle; research b684) [data].
+    pub const RUN_START: &str = "Stand2ChaseRun";
+    pub const RUN_STOP: &str = "ChaseRun2Stand";
+    /// The Shuffle state (`motiongraph_shuffle.xml`, the speed row from 1.0; research b686) [data].
+    pub const SHUFFLE_START: &str = "Stand2Shuffle";
+    pub const SHUFFLE: &str = "FwdShuffleCyc";
+    pub const SHUFFLE_STOP: &str = "Shuffle2Stand";
+    pub fn shuffle_turn(degrees: u16) -> &'static str {
+        match degrees {
+            45 => "ShuffleTurnR45",
+            90 => "ShuffleTurnR90",
+            135 => "ShuffleTurnR135",
+            _ => "ShuffleTurnR180",
+        }
+    }
+    /// The Strafe state (`motiongraph_strafe.xml`, template `strafemotion.xml`; BlockChasee; research b686) [data].
+    pub const STRAFE_INTO: &str = "Stand2Strafe";
+    pub const CHASE_TO_STRAFE: &str = "Chase2Strafe";
+    pub const STRAFE_IDLE: &str = "StrafeIdle";
+    pub const STRAFE_TO_RUN: &str = "Strafe2ChaseRun";
+    /// Strafe turns: 45 and 90 only (the poster's mask 0xCC).
+    pub fn strafe_turn(degrees: u16) -> &'static str {
+        if degrees <= 45 {
+            "StrafeTurnR45"
+        } else {
+            "StrafeTurnR90"
+        }
+    }
+    /// A strafe step's clip; a left step mirrors the right one.
+    pub fn strafe_move(m: super::StrafeMove) -> (&'static str, bool) {
+        match m {
+            super::StrafeMove::Forwards => ("StrafeForwards", false),
+            super::StrafeMove::Backwards => ("StrafeBackwards", false),
+            super::StrafeMove::Side { degrees, left } => (if degrees <= 45 { "StrafeR45" } else if degrees <= 90 { "StrafeR90" } else { "StrafeR135" }, left),
+        }
+    }
+    /// The Tired state (`motiongraph_tired.xml`, RestFromChase; b684) [data].
+    pub const TIRED_INTO: &str = "ChaseTiredInto";
+    pub const TIRED_CYCLE: &str = "ChaseTiredCyc";
+    pub const TIRED_OUT: &str = "ChaseTiredOut";
+    /// A turn while running (`blendedturn` on `ChaseRun.ChaseRunCyc`, right-hand clips mirrored for the left).
+    pub fn run_turn(degrees: u16) -> &'static str {
+        match degrees {
+            45 => "ChaseRunTurnR45",
+            90 => "ChaseRunTurnR90",
+            135 => "ChaseRunTurnR135",
+            _ => "ChaseRunTurnR180",
+        }
+    }
+    pub const FAST_RUN: &str = "FwdChaseRunFastCyc";
     /// Every logical name the loader resolves (more for later milestones; a mod may add).
     pub const ALL: &[&str] = &[
         "IdleBasicCyc", "FwdWalkCyc", "FwdBriskWalkCyc", "Stand2Walk", "Walk2Stand", "StandTurnR45", "StandTurnR90", "StandTurnR135",
         "StandTurnR180", "StandTurnR180Out", "WalkTurnR45", "WalkTurnR90", "WalkTurnR135", "WalkTurnR180", "WalkTurnR180Out", "FwdShuffleCyc",
-        "Stand2Shuffle", "Shuffle2Stand", "FwdChaseRunCyc",
+        "Stand2Shuffle", "Shuffle2Stand", "FwdChaseRunCyc", "FwdChaseRunSlowCyc", "FwdChaseRunFastCyc",
+        "Stand2ChaseRun", "ChaseRun2Stand", "ChaseRunTurnR45", "ChaseRunTurnR90", "ChaseRunTurnR135", "ChaseRunTurnR180",
+        "ChaseTiredInto", "ChaseTiredCyc", "ChaseTiredOut", "ShuffleTurnR45", "ShuffleTurnR90", "ShuffleTurnR135", "ShuffleTurnR180",
+        "Stand2Strafe", "Chase2Strafe", "StrafeIdle", "Strafe2ChaseRun", "StrafeTurnR45", "StrafeTurnR90", "StrafeForwards",
+        "StrafeBackwards", "StrafeR45", "StrafeR90", "StrafeR135",
         // Collision reactions (`super::skater_contact::REACTION_ANIMS`).
         "CollisionBackStanding", "CollisionFwdStanding", "CollisionLeftStanding",
         "WipeoutBackFall", "WipeoutBackGroundCyc", "WipeoutBackGetUp",
@@ -143,7 +361,7 @@ pub mod names {
         "Taunt",
         // The plugin states (`super::plugin_motion`): sit, ATM, vending machine, water fountain, newspaper box.
         "Stand2Sit", "SitIdleCyc", "Sit2Stand", "SitAvoidFwd", "SitAvoidLeft", "SitAvoidBack", "SitAvoidSmallFront",
-        "SitAvoidSmallLeft", "SitAvoidSmallBack", "ATMInsertCard", "ATMMakeSelection", "ATMCollectMoney", "ATMCollectCard",
+        "SitAvoidSmallLeft", "SitAvoidSmallBack", "AvoidJumpForward", "AvoidJumpLeft", "AvoidJumpBack", "AvoidStepForward", "AvoidStepLeft", "AvoidStepBack", "ATMInsertCard", "ATMMakeSelection", "ATMCollectMoney", "ATMCollectCard",
         "VendInsert", "VendSelect", "VendCollect", "WaterFountainInto", "WaterFountainCyc", "WaterFountainOut", "NewspaperCollect",
         // The light hand prop throw (`super::hand_prop::light_throw_clip`).
         "HandPropThrowLightForward", "HandPropThrowLightL45", "HandPropThrowLightL90", "HandPropThrowLightR180",
@@ -157,6 +375,8 @@ pub mod names {
         "HandPropPhoneTalk", "HandPropPhoneHangup", "HandPropLitter",
         // The tazer on the channel (DrawTazer / `82E3ED50` / EndTaze, b248).
         "TazerInto", "TazerCyc", "TazerOut",
+        // The greet / warn gestures on the channel (ChannelGreet / ChannelWarnWantTarget Begin, b677).
+        "GreetChannel", "WarnChannel",
     ];
 }
 
@@ -169,6 +389,8 @@ pub mod timing {
     pub const WALK_BLEND: f32 = 0.1;
     pub const TRANSITION_BLEND: f32 = 0.15;
     pub const TRANSITION_EXIT: f32 = 0.1;
+    pub const TIRED_BLEND: f32 = 0.1;
+    pub const TIRED_EXIT: f32 = 0.01;
 }
 
 /// The locomotion state (subset of `Motion.Locomotion` / `Idle`).
@@ -177,10 +399,27 @@ pub enum Locomotion {
     Idle,
     Start,
     Walk,
-    /// Running (flee / chase): the run cycle. The run's own start, stop and turn clips are not
-    /// wired (ours until the motion graph runs): it enters from standing or walking and stops
-    /// through the walk stop.
+    /// Running (flee / chase): the run cycle; it starts through `Stand2ChaseRun` (`RunStart`), turns with the run
+    /// turn clips, stops through `ChaseRun2Stand` and goes back to walking through `Stand2Walk`.
     Run,
+    RunStart,
+    RunTurnRight,
+    RunTurnLeft,
+    /// Shuffling (a slow approach, e.g. onto a plugin point): `Stand2Shuffle` in, the shuffle cycle, its turns.
+    ShuffleStart,
+    Shuffle,
+    ShuffleTurnRight,
+    ShuffleTurnLeft,
+    /// Strafing (BlockChasee): in, standing, a step, a turn (45 / 90).
+    StrafeInto,
+    StrafeIdle,
+    StrafeMove,
+    StrafeTurnRight,
+    StrafeTurnLeft,
+    /// Tired after a chase (RestFromChase): into from the run cycle, the tired cycle until rested, out.
+    TiredInto,
+    TiredCycle,
+    TiredOut,
     Stop,
     TurnRight,
     TurnLeft,
@@ -198,6 +437,21 @@ impl Locomotion {
             Locomotion::Start => "start",
             Locomotion::Walk => "walk",
             Locomotion::Run => "run",
+            Locomotion::RunStart => "run_start",
+            Locomotion::RunTurnRight => "run_turn_right",
+            Locomotion::RunTurnLeft => "run_turn_left",
+            Locomotion::ShuffleStart => "shuffle_start",
+            Locomotion::Shuffle => "shuffle",
+            Locomotion::ShuffleTurnRight => "shuffle_turn_right",
+            Locomotion::ShuffleTurnLeft => "shuffle_turn_left",
+            Locomotion::StrafeInto => "strafe_into",
+            Locomotion::StrafeIdle => "strafe_idle",
+            Locomotion::StrafeMove => "strafe_move",
+            Locomotion::StrafeTurnRight => "strafe_turn_right",
+            Locomotion::StrafeTurnLeft => "strafe_turn_left",
+            Locomotion::TiredInto => "tired_into",
+            Locomotion::TiredCycle => "tired",
+            Locomotion::TiredOut => "tired_out",
             Locomotion::Stop => "stop",
             Locomotion::TurnRight => "turn_right",
             Locomotion::TurnLeft => "turn_left",
@@ -213,6 +467,8 @@ impl Locomotion {
 pub enum Intent {
     Idle,
     Walk,
+    /// The Shuffle speed row.
+    Shuffle,
     Run,
     TurnRight,
     TurnLeft,
@@ -258,6 +514,16 @@ pub struct PedAnimPlayer {
     pub intent: Intent,
     /// The bucket of a turn intent (45 / 90 / 135 / 180; [`super::wander::NavOutput::turn_degrees`]).
     pub turn_degrees: u16,
+    /// The speed row's tier; the walk / run cycle follows it at the next branch window (blend 0.1).
+    pub tier: Tier,
+    /// The tier of the cycle playing now.
+    cycle_tier: Tier,
+    /// The brain rests from a chase (RestFromChase's Tired packet; its end posts StopTired).
+    pub resting: bool,
+    /// The strafe flag's intents ([`strafe_input`]); `None` = no strafe.
+    pub strafe: Option<StrafeInput>,
+    /// The strafe step playing now.
+    strafe_playing: Option<StrafeMove>,
     plays: u32,
     reaction: Option<ReactionRun>,
     channel: Option<ChannelRun>,
@@ -341,6 +607,11 @@ impl PedAnimPlayer {
             rng,
             intent: Intent::Idle,
             turn_degrees: 180,
+            tier: Tier::Default,
+            cycle_tier: Tier::Default,
+            resting: false,
+            strafe: None,
+            strafe_playing: None,
             plays: 0,
             reaction: None,
             channel: None,
@@ -362,6 +633,49 @@ impl PedAnimPlayer {
     /// The incoming layer's blend weight (1 = no blend in progress).
     pub fn blend_weight(&self) -> f32 {
         if self.previous.is_none() || self.blend_time <= 0.0 { 1.0 } else { (self.blend_elapsed / self.blend_time).clamp(0.0, 1.0) }
+    }
+
+    /// Strafe flag cleared: back to locomotion without a stand clip; a run plays `Strafe2ChaseRun`.
+    fn leave_strafe(&mut self, set: &PedAnimSet) -> bool {
+        self.strafe_playing = None;
+        let moved = match self.intent {
+            Intent::Walk => self.play_cycle(set, timing::IDLE_BLEND, Locomotion::Walk),
+            Intent::Shuffle => self.play(set, names::SHUFFLE, timing::IDLE_BLEND, false, Locomotion::Shuffle),
+            Intent::Run => self.play(set, names::STRAFE_TO_RUN, timing::START_BLEND, false, Locomotion::RunStart) || self.play_cycle(set, timing::IDLE_BLEND, Locomotion::Run),
+            _ => false,
+        };
+        moved || self.play(set, names::IDLE, timing::IDLE_BLEND, false, Locomotion::Idle)
+    }
+
+    /// TiredComplete: back to locomotion with LastState Tired: Idle and Walk start their cycles directly (their into
+    /// lists have no Tired), a run plays the plain `Stand2ChaseRun`.
+    fn leave_tired(&mut self, set: &PedAnimSet) {
+        let ok = match self.intent {
+            Intent::Walk => self.play_cycle(set, timing::IDLE_BLEND, Locomotion::Walk),
+            Intent::Run => self.play(set, names::RUN_START, timing::START_BLEND, false, Locomotion::RunStart) || self.play_cycle(set, timing::IDLE_BLEND, Locomotion::Run),
+            _ => false,
+        };
+        if !ok {
+            self.play(set, names::IDLE, timing::IDLE_BLEND, false, Locomotion::Idle);
+        }
+    }
+
+    /// The walk or run cycle of the speed row's tier (`WalkCyc` / `ChaseRunCyc`, blend 0.1 [data]); a set without
+    /// the tier's clip plays the default cycle.
+    fn play_cycle(&mut self, set: &PedAnimSet, blend: f32, state: Locomotion) -> bool {
+        let tier = cycle_tier(state, self.tier);
+        let (tiered, base) = match (state, tier) {
+            (Locomotion::Run, Tier::Slow) => (Some(names::SLOW_RUN), names::RUN),
+            (Locomotion::Run, Tier::Fast) => (Some(names::FAST_RUN), names::RUN),
+            (Locomotion::Run, _) => (None, names::RUN),
+            (_, Tier::Brisk) => (Some(names::BRISK_WALK), names::WALK),
+            _ => (None, names::WALK),
+        };
+        let played = tiered.is_some_and(|n| self.play(set, n, blend, false, state)) || self.play(set, base, blend, false, state);
+        if played {
+            self.cycle_tier = tier;
+        }
+        played
     }
 
     fn play(&mut self, set: &PedAnimSet, name: &str, blend: f32, mirror: bool, state: Locomotion) -> bool {
@@ -494,6 +808,14 @@ impl PedAnimPlayer {
         }
     }
 
+    /// Stop the channel with its clip's own blend-out (the Collision state machine's `StopChannel` behaviour,
+    /// `motiongraph_collision.xml`; NOT RETAIL YET: the behaviour's fade is in code not read).
+    pub fn channel_stop_own(&mut self) {
+        if let Some(c) = self.channel.as_mut() {
+            c.stopping = true;
+        }
+    }
+
     /// The slot is free (`skeleton+140 == 7`).
     pub fn channel_idle(&self) -> bool {
         self.channel.is_none()
@@ -583,13 +905,83 @@ impl PedAnimPlayer {
         // Transitions.
         let remaining = clips.clip(&self.current.clip).map_or(0.0, |c| c.length() - self.current.time);
         let before = self.plays;
+        // Tired from Idle / Walk at once (NotFromRun), from the run cycle at its branch window (FromRun; the graph's
+        // `TiredBranchInfo` is not decoded, ours: the run cycle's windows).
+        let tired = self.resting
+            && match self.state {
+                Locomotion::Idle | Locomotion::Walk => self.play(set, names::TIRED_CYCLE, timing::TIRED_BLEND, false, Locomotion::TiredCycle),
+                Locomotion::Run => self.in_branch_window() && self.play(set, names::TIRED_INTO, timing::TIRED_BLEND, false, Locomotion::TiredInto),
+                _ => false,
+            };
+        // Strafe in (`StrafeInto` from Walk / Shuffle / Idle, `StrafeFromChase` from the run; at the branch window) and out
+        // (no Strafe2Stand: IdleInto / WalkInto / ShuffleInto do not list Strafe, the cycles start directly).
+        let strafing = matches!(self.state, Locomotion::StrafeIdle | Locomotion::StrafeMove | Locomotion::StrafeTurnRight | Locomotion::StrafeTurnLeft);
+        let strafe = !tired
+            && match (self.strafe.is_some(), self.state) {
+                (true, Locomotion::Idle) => self.play(set, names::STRAFE_INTO, timing::START_BLEND, false, Locomotion::StrafeInto),
+                (true, Locomotion::Walk | Locomotion::Shuffle) => self.in_branch_window() && self.play(set, names::STRAFE_INTO, timing::START_BLEND, false, Locomotion::StrafeInto),
+                (true, Locomotion::Run) => self.in_branch_window() && self.play(set, names::CHASE_TO_STRAFE, timing::START_BLEND, false, Locomotion::StrafeInto),
+                (false, Locomotion::StrafeIdle) => self.leave_strafe(set),
+                (false, Locomotion::StrafeMove) => self.in_branch_window() && self.leave_strafe(set),
+                (false, _) if strafing => remaining <= timing::TRANSITION_EXIT && self.leave_strafe(set),
+                _ => false,
+            };
         match self.state {
+            _ if tired || strafe => {}
+            Locomotion::StrafeInto => {
+                if remaining <= timing::START_EXIT {
+                    self.strafe_playing = None;
+                    self.play(set, names::STRAFE_IDLE, timing::IDLE_BLEND, false, Locomotion::StrafeIdle);
+                }
+            }
+            Locomotion::StrafeIdle | Locomotion::StrafeMove => {
+                let input = self.strafe.unwrap_or_default();
+                if self.state == Locomotion::StrafeIdle || self.in_branch_window() {
+                    if let Some((degrees, left)) = input.turn {
+                        let state = if left { Locomotion::StrafeTurnLeft } else { Locomotion::StrafeTurnRight };
+                        self.strafe_playing = None;
+                        self.play(set, names::strafe_turn(degrees), timing::TRANSITION_BLEND, left, state);
+                    } else if input.step != self.strafe_playing {
+                        self.strafe_playing = input.step;
+                        match input.step {
+                            Some(m) => {
+                                let (clip, mirror) = names::strafe_move(m);
+                                self.play(set, clip, timing::TRANSITION_BLEND, mirror, Locomotion::StrafeMove);
+                            }
+                            None => {
+                                self.play(set, names::STRAFE_IDLE, timing::IDLE_BLEND, false, Locomotion::StrafeIdle);
+                            }
+                        }
+                    }
+                }
+            }
+            Locomotion::StrafeTurnRight | Locomotion::StrafeTurnLeft => {
+                if remaining <= timing::TRANSITION_EXIT {
+                    self.play(set, names::STRAFE_IDLE, timing::IDLE_BLEND, false, Locomotion::StrafeIdle);
+                }
+            }
+            Locomotion::TiredInto => {
+                if remaining <= timing::TIRED_EXIT {
+                    self.play(set, names::TIRED_CYCLE, timing::TIRED_BLEND, false, Locomotion::TiredCycle);
+                }
+            }
+            // StopTired, at the end of a loop (`WillExpire 0.01 always`).
+            Locomotion::TiredCycle => {
+                if !self.resting && (self.current.wrapped || remaining <= timing::TIRED_EXIT) && !self.play(set, names::TIRED_OUT, timing::TIRED_BLEND, false, Locomotion::TiredOut) {
+                    self.leave_tired(set);
+                }
+            }
+            Locomotion::TiredOut => {
+                if remaining <= timing::TIRED_EXIT {
+                    self.leave_tired(set);
+                }
+            }
             Locomotion::Idle => match self.intent {
                 Intent::Walk => {
                     self.play(set, names::START, timing::START_BLEND, false, Locomotion::Start);
                 }
                 Intent::Run => {
-                    if !self.play(set, names::RUN, timing::START_BLEND, false, Locomotion::Run) {
+                    if !self.play(set, names::RUN_START, timing::START_BLEND, false, Locomotion::RunStart) && !self.play_cycle(set, timing::START_BLEND, Locomotion::Run) {
                         self.play(set, names::START, timing::START_BLEND, false, Locomotion::Start);
                     }
                 }
@@ -599,6 +991,11 @@ impl PedAnimPlayer {
                 Intent::TurnLeft => {
                     self.play(set, names::stand_turn(self.turn_degrees), timing::TRANSITION_BLEND, true, Locomotion::TurnLeft);
                 }
+                Intent::Shuffle => {
+                    if !self.play(set, names::SHUFFLE_START, timing::START_BLEND, false, Locomotion::ShuffleStart) {
+                        self.play(set, names::START, timing::START_BLEND, false, Locomotion::Start);
+                    }
+                }
                 Intent::Idle => {
                     if self.current.wrapped && self.rng.unit() < timing::IDLE_CYCLE_SWAP {
                         self.play(set, names::IDLE, timing::IDLE_BLEND, false, Locomotion::Idle);
@@ -606,8 +1003,8 @@ impl PedAnimPlayer {
                 }
             },
             Locomotion::Start => {
-                if remaining <= timing::START_EXIT && !(self.intent == Intent::Run && self.play(set, names::RUN, timing::WALK_BLEND, false, Locomotion::Run)) {
-                    self.play(set, names::WALK, timing::WALK_BLEND, false, Locomotion::Walk);
+                if remaining <= timing::START_EXIT && !(self.intent == Intent::Run && self.play_cycle(set, timing::WALK_BLEND, Locomotion::Run)) {
+                    self.play_cycle(set, timing::WALK_BLEND, Locomotion::Walk);
                 }
             }
             Locomotion::Walk => {
@@ -622,17 +1019,83 @@ impl PedAnimPlayer {
                     if self.in_branch_window() {
                         self.play(set, names::walk_turn(self.turn_degrees), timing::TRANSITION_BLEND, mirror, state);
                     }
+                } else if self.intent == Intent::Shuffle && self.in_branch_window() {
+                    self.play(set, names::SHUFFLE_START, timing::START_BLEND, false, Locomotion::ShuffleStart);
                 } else if self.intent == Intent::Run && self.in_branch_window() {
-                    self.play(set, names::RUN, timing::WALK_BLEND, false, Locomotion::Run);
+                    // Walk is in ChaseRunInto's list: the run start plays from the walk too.
+                    if !self.play(set, names::RUN_START, timing::START_BLEND, false, Locomotion::RunStart) {
+                        self.play_cycle(set, timing::WALK_BLEND, Locomotion::Run);
+                    }
                 } else if self.intent != Intent::Walk && self.intent != Intent::Run && self.in_branch_window() {
                     self.play(set, names::STOP, timing::TRANSITION_BLEND, false, Locomotion::Stop);
+                } else if self.intent == Intent::Walk && cycle_tier(Locomotion::Walk, self.tier) != self.cycle_tier && self.in_branch_window() {
+                    self.play_cycle(set, timing::WALK_BLEND, Locomotion::Walk);
                 }
             }
             Locomotion::Run => {
-                if self.intent == Intent::Walk && self.in_branch_window() {
-                    self.play(set, names::WALK, timing::WALK_BLEND, false, Locomotion::Walk);
-                } else if self.intent != Intent::Run && self.intent != Intent::Walk && self.in_branch_window() {
-                    self.play(set, names::STOP, timing::TRANSITION_BLEND, false, Locomotion::Stop);
+                let turn = match self.intent {
+                    Intent::TurnRight => Some((false, Locomotion::RunTurnRight)),
+                    Intent::TurnLeft => Some((true, Locomotion::RunTurnLeft)),
+                    _ => None,
+                };
+                if !self.in_branch_window() {
+                } else if let Some((mirror, state)) = turn {
+                    // A set without the run turn stops, as before.
+                    if !self.play(set, names::run_turn(self.turn_degrees), timing::TRANSITION_BLEND, mirror, state) {
+                        self.play(set, names::STOP, timing::TRANSITION_BLEND, false, Locomotion::Stop);
+                    }
+                } else if self.intent == Intent::Walk {
+                    // WalkInto from ChaseRun: WalkIntoDefault's Stand2Walk.
+                    if !self.play(set, names::START, timing::START_BLEND, false, Locomotion::Start) {
+                        self.play_cycle(set, timing::WALK_BLEND, Locomotion::Walk);
+                    }
+                } else if self.intent == Intent::Shuffle {
+                    self.play(set, names::SHUFFLE_START, timing::START_BLEND, false, Locomotion::ShuffleStart);
+                } else if self.intent == Intent::Idle {
+                    if !self.play(set, names::RUN_STOP, timing::TRANSITION_BLEND, false, Locomotion::Stop) {
+                        self.play(set, names::STOP, timing::TRANSITION_BLEND, false, Locomotion::Stop);
+                    }
+                } else if cycle_tier(Locomotion::Run, self.tier) != self.cycle_tier {
+                    self.play_cycle(set, timing::WALK_BLEND, Locomotion::Run);
+                }
+            }
+            // `motiongraph_shuffle.xml`: the shuffle start and turns exit at 0.1 into the shuffle cycle (blend 0.1).
+            Locomotion::ShuffleStart | Locomotion::ShuffleTurnRight | Locomotion::ShuffleTurnLeft => {
+                if remaining <= timing::TRANSITION_EXIT {
+                    self.play(set, names::SHUFFLE, timing::IDLE_BLEND, false, Locomotion::Shuffle);
+                }
+            }
+            Locomotion::Shuffle => {
+                if self.in_branch_window() {
+                    match self.intent {
+                        Intent::TurnRight => {
+                            self.play(set, names::shuffle_turn(self.turn_degrees), timing::TRANSITION_BLEND, false, Locomotion::ShuffleTurnRight);
+                        }
+                        Intent::TurnLeft => {
+                            self.play(set, names::shuffle_turn(self.turn_degrees), timing::TRANSITION_BLEND, true, Locomotion::ShuffleTurnLeft);
+                        }
+                        // IdleInto's ShuffleToIdle; WalkInto / ChaseRunInto play their plain starts.
+                        Intent::Idle => {
+                            if !self.play(set, names::SHUFFLE_STOP, timing::TRANSITION_BLEND, false, Locomotion::Stop) {
+                                self.play(set, names::STOP, timing::TRANSITION_BLEND, false, Locomotion::Stop);
+                            }
+                        }
+                        Intent::Walk => {
+                            self.play(set, names::START, timing::START_BLEND, false, Locomotion::Start);
+                        }
+                        Intent::Run => {
+                            if !self.play(set, names::RUN_START, timing::START_BLEND, false, Locomotion::RunStart) {
+                                self.play_cycle(set, timing::WALK_BLEND, Locomotion::Run);
+                            }
+                        }
+                        Intent::Shuffle => {}
+                    }
+                }
+            }
+            // The run start and run turns exit at `WillExpire 0.1` into the run cycle.
+            Locomotion::RunStart | Locomotion::RunTurnRight | Locomotion::RunTurnLeft => {
+                if remaining <= timing::TRANSITION_EXIT {
+                    self.play_cycle(set, timing::WALK_BLEND, Locomotion::Run);
                 }
             }
             Locomotion::Stop | Locomotion::TurnRight | Locomotion::TurnLeft => {
@@ -643,7 +1106,7 @@ impl PedAnimPlayer {
             // `blendedturn` exit (`WillExpire 0.1`, then TurnComplete): back to the walk cycle (its blend is ours).
             Locomotion::WalkTurnRight | Locomotion::WalkTurnLeft => {
                 if remaining <= timing::TRANSITION_EXIT {
-                    self.play(set, names::WALK, timing::WALK_BLEND, false, Locomotion::Walk);
+                    self.play_cycle(set, timing::WALK_BLEND, Locomotion::Walk);
                 }
             }
             Locomotion::Reaction => {

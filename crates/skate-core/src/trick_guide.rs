@@ -1,12 +1,5 @@
-//! The Trick Guide screen (pause menu Learn > Trick Guide; FE screen 14, template 29 TrickTutorial, movie
-//! `screens/tricks/trickguide`; doc 31 "Trick Guide"). Port of retail's screen-14 object (TU3 vtable 0x823038B8):
-//! a three-level list (categories, subcategories, tricks) over the trick records, the picker callbacks and the
-//! FETrickTutorial natives the movie reads. Research `.local/research/menus-m6/trick-guide-open.md` and
-//! `trick-guide-gestures.md` (main re-read the handlers named below).
-//!
-//! The data is a [`TrickGuide`]: setup's records by Attrib key (scoring_trickcategory / tricksubcategory /
-//! scoring_trick), the category order and the slot name tables. Every part is plain data, so a mod can add or
-//! change entries by key; the navigation reads nothing else.
+//! The Trick Guide screen (FE 14, template 29): port of retail's screen-14 object (vtable 0x823038B8); data-driven.
+//! Details: docs/hails-additions/31-retail-menus.md#trick-guide-screen
 use std::collections::BTreeMap;
 
 /// A record's 64-bit Attrib key: the stable id of a category, subcategory or trick.
@@ -203,7 +196,9 @@ pub mod movie_state {
 pub struct Stance {
     /// CAS byte +120 of the player's skater record; HUDComponents.PlayerStance_IsRegular returns it (826635A0).
     pub regular: bool,
-    /// `[[sub_824AD2F0()]+224]+20`. NOT RETAIL YET: meaning not decoded (a controls option); false here.
+    /// `[[sub_824AD2F0()]+224]+20`: the local player is riding switch (synced each tick from `[0x83067070]+40`,
+    /// written by `82775328` from the skater's relative stance, b672). The remap applies when the effective stance
+    /// (natural XOR switch) is regular.
     pub alternate: bool,
     /// `[[sub_824AD2F0()]+260]+37`: zero makes a remapped X read B, else A. NOT RETAIL YET: meaning not decoded;
     /// set here (the remap then undoes the movie's own A / X swap).

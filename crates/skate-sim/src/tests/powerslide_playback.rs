@@ -43,7 +43,8 @@ fn run_side(side: i16) {
         let phase = sequence_start.map(|start| tick - start);
         let left = match phase {
             Some(12..=23) => [side * 32767, 0],
-            Some(36..=95) => [side * 22000, 32767],
+            // Start window: stick back and to the side (riding_intentions.rs, 8259A430).
+            Some(36..=95) => [side * 22000, -32767],
             _ => [0; 2],
         };
         input.sample_raw_for_test(skate_core::input::xbox::XboxState {
@@ -106,7 +107,7 @@ fn run_side(side: i16) {
             if emitted && let Some(value) = published {
                 assert_eq!(
                     skater.animation_input.fields.slide.to_bits(),
-                    value.to_bits(),
+                    (-value).to_bits(),
                     "Slide changed between canonical animation packet and Skeleton input"
                 );
                 saw_packet |= value != 0.0;

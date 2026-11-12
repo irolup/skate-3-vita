@@ -109,7 +109,7 @@ fn run(m: &NavMesh, o: &mut NavObstacles, props: &mut [ObstacleInput], bodies: &
             let out = b.nav.step_avoiding(m, &p, CrosswalkRule::Off, &NoSignals, b.id, b.pos, b.heading, b.state, &others, Some(o), dt);
             b.heading += out.turn;
             match out.intent {
-                Intent::Walk | Intent::Run => {
+                Intent::Walk | Intent::Run | Intent::Shuffle => {
                     b.state = Locomotion::Walk;
                     let f = forward(b.heading);
                     let to = [b.pos[0] + f[0] * 1.325 * dt, b.pos[1], b.pos[2] + f[1] * 1.325 * dt];
@@ -257,10 +257,7 @@ fn step_check_lets_a_ped_out_of_a_prop_pushed_onto_it() {
     assert!(o.step_ok([1.0, 0.0, 0.0], [0.5, 0.0, 0.0], 0.35));
 }
 
-/// A prop held by Move Object stays an obstacle (retail: the hold only sets DMO+4464 bit 0x20, which
-/// the obstacle code never reads; the off gate is the separate word +144+4252): cut while held
-/// still, solid for a ped's step while dragged faster than 0.4 m/s, and the mod switch restores
-/// the earlier "held = ignored" rule.
+/// A held prop stays an obstacle (hold sets only DMO+4464 0x20): cut when still, solid when dragged; mod switch.
 #[test]
 fn held_prop_stays_an_obstacle() {
     let mut o = NavObstacles::new(ObstacleParams::default());
@@ -316,6 +313,56 @@ fn a_standing_skater_is_a_moving_avoider_unless_the_ped_ignores_skaters() {
     o.set_params(ObstacleParams { skaters: false, ..ObstacleParams::default() });
 }
 
+/// Retail's predictive side-step (`82E9CE90` / `82E9CBD0`, b699): left round a standing skater dead ahead, behind a
+/// crossing one, nothing beyond 3 s or once touching.
+#[test]
+fn a_ped_side_steps_a_skater_up_to_three_seconds_ahead() {
+    let skater = |x: f32, z: f32, v: [f32; 3]| ObstacleInput { id: SKATER_OBSTACLE_BASE, center: [x, 0.9, z], axes: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], half_extents: [0.3, 0.9, 0.3], velocity: v, inactive: false, held: false };
+    let mut o = NavObstacles::new(ObstacleParams::default());
+    let (p, v, r) = ([0.0, 0.0, 0.0], [0.0, 1.4], 0.35);
+    o.update(&[skater(0.0, 3.5, [0.0; 3])]);
+    let a = o.side_step(p, v, r, Ignore::default());
+    assert!((a[0] - 3.9).abs() < 1e-4 && a[1].abs() < 1e-6, "dead ahead -> left (+x when facing +z): {a:?}");
+    assert_eq!(o.side_step(p, v, r, Ignore { id: None, skaters: true }), [0.0; 2], "SkaterAvoidance off");
+    o.update(&[skater(0.0, 5.5, [0.0; 3])]);
+    assert_eq!(o.side_step(p, v, r, Ignore::default()), [0.0; 2], "contact later than 3 s");
+    o.update(&[skater(0.0, 0.6, [0.0; 3])]);
+    assert_eq!(o.side_step(p, v, r, Ignore::default()), [0.0; 2], "already touching: the contact slide's job");
+    // Crossing from the ped's right to its left (+x): the ped steers right, behind it.
+    o.update(&[skater(-2.0, 2.0, [1.0, 0.0, 0.0])]);
+    let a = o.side_step(p, v, r, Ignore::default());
+    assert!(a[0] < 0.0, "behind the crossing skater: {a:?}");
+    o.set_params(ObstacleParams { avoid_horizon: 0.0, ..ObstacleParams::default() });
+    o.update(&[skater(0.0, 3.5, [0.0; 3])]);
+    assert_eq!(o.side_step(p, v, r, Ignore::default()), [0.0; 2], "mod switch off");
+}
+
+/// Retail's contact slide (`82E9D0C0`, b698): a ped walking head-on into a standing skater slides round it instead of
+/// standing pressed against it (DownTown 2026-10-29: 45 s); a cut prop keeps the face clamp.
+#[test]
+fn a_ped_running_head_on_into_a_skater_slides_round_it() {
+    let mut o = NavObstacles::new(ObstacleParams::default());
+    let h = ObstacleParams::default().skater_half_extents;
+    let skater = ObstacleInput { id: SKATER_OBSTACLE_BASE, center: [0.0, h[1], 0.0], axes: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], half_extents: h, velocity: [0.0; 3], inactive: false, held: false };
+    o.update(&[skater]);
+    let radius = 0.35;
+    let mut p = [-0.66, 0.0, 0.0];
+    for _ in 0..200 {
+        let to = [p[0] + 0.05, 0.0, p[2]];
+        p = o.resolve_step(p, to, radius).expect("never refused head-on");
+        assert!(!o.blocked(p, radius), "never inside the skater");
+    }
+    assert!(p[2].abs() > 0.65 && p[0] > 1.0, "slid round the side: {p:?}");
+    // Grazing (dot >= -0.3): the face clamp only, no extra slide.
+    let g = o.resolve_step([-0.66, 0.0, 0.0], [-0.6, 0.0, 0.3], radius).unwrap();
+    assert!((g[2] - 0.3).abs() < 1e-4 && g[0] <= -0.65 + 1e-3);
+    // Mod switch off: the old stand against the face.
+    o.set_params(ObstacleParams { contact_slide: 0.0, ..ObstacleParams::default() });
+    o.update(&[skater]);
+    let q = o.resolve_step([-0.66, 0.0, 0.0], [-0.61, 0.0, 0.0], radius).unwrap();
+    assert!(q[2].abs() < 1e-6);
+}
+
 /// A prop that comes to rest with a ped inside its grown footprint (its own dropped hand prop, laptop 2026-10-19): a step
 /// toward the nearest free point (`snap_out`) is allowed, a step on through the middle is not (the walker then walks
 /// the ped out first, `peds.rs`, b349).
@@ -335,4 +382,76 @@ fn a_ped_inside_a_fresh_cut_can_walk_out_toward_the_nearest_free_point() {
     let step = [ped[0] + dir[0] / len * 0.05, 0.0, ped[2] + dir[1] / len * 0.05];
     assert!(o.step_ok(ped, step, radius), "walking out is allowed");
     assert!(!o.step_ok(ped, [0.25, 0.0, 0.08], radius), "walking further in is not");
+}
+
+/// Research b716 (`82E9DF70`, recomp trace 2026-10-30): the path turn term pulls the side-step's sideways velocity back
+/// every tick, so at walking speed (2 m/s, the centripetal limit above the side-step's 3.9) it settles near
+/// `a x controller_step` instead of growing, and it drains within a few ticks once nothing pushes.
+#[test]
+fn the_path_turn_holds_a_side_step_near_one_controller_step_of_push() {
+    let o = NavObstacles::new(ObstacleParams::default());
+    let (base, speed, dt, a) = ([0.0, 1.0], 2.0, 1.0 / 60.0, 3.9);
+    let mut sv = [0.0f32; 2];
+    for _ in 0..180 {
+        sv = [sv[0] + a * dt, sv[1]];
+        sv = o.path_turn(sv, base, speed, dt);
+    }
+    assert!(sv[0] > 0.05 && sv[0] < 0.2, "settles near 3.9 / 30 = 0.13 m/s: {sv:?}");
+    // Retail's 1 / 30 s controller step removes it in one step; our 60 Hz tick halves it each tick (gone in ~0.1 s).
+    for _ in 0..6 {
+        sv = o.path_turn(sv, base, speed, dt);
+    }
+    assert!(sv[0].abs() < 3e-3, "gone once nothing pushes: {sv:?}");
+    // Standing still: no turn (the centripetal limit is 0), the old fade's job is gone.
+    assert_eq!(o.path_turn([0.1, 0.0], base, 0.0, dt), [0.1, 0.0]);
+    // A mod can switch the pull-back off.
+    let off = NavObstacles::new(ObstacleParams { path_turn_accel: 0.0, ..ObstacleParams::default() });
+    assert_eq!(off.path_turn([0.1, 0.0], base, speed, dt), [0.1, 0.0]);
+}
+
+/// Research b717 / b718 (`82E9D0C0`, the recomp's compare re-read by main): the contact slide's speed tests. A body
+/// moving away along the slide direction at half the path speed (2 m/s) or more gets push-out only; a ped at or below
+/// half its path speed takes its direction from its steer target, a faster one from its velocity.
+#[test]
+fn the_contact_slide_tests_the_avoiders_speed_and_a_slow_peds_steer_target() {
+    use super::obstacles::Contact;
+    let h = ObstacleParams::default().skater_half_extents;
+    let skater = |v: [f32; 3]| ObstacleInput { id: SKATER_OBSTACLE_BASE, center: [0.0, h[1], 0.0], axes: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], half_extents: h, velocity: v, inactive: false, held: false };
+    let (from, to, r) = ([-0.66, 0.0, 0.0], [-0.6, 0.0, 0.0], 0.35);
+    let fast = Contact { velocity: Some([1.4, 0.0]), target: Some([5.0, 0.0]) };
+    let mut o = NavObstacles::new(ObstacleParams::default());
+    o.update(&[skater([0.0; 3])]);
+    let slid = o.resolve_step_contact(from, to, r, Ignore::default(), fast).unwrap();
+    assert!(slid[2].abs() > 1e-3, "a standing skater: slide round it {slid:?}");
+    o.update(&[skater([1.5, 0.0, 0.0])]);
+    o.update(&[skater([1.5, 0.0, 0.0])]);
+    let pushed = o.resolve_step_contact(from, to, r, Ignore::default(), fast).unwrap_or(from);
+    assert!(pushed[2].abs() < 1e-4, "moving away at 1.5 >= 1.0 m/s: push-out only {pushed:?}");
+    // Slow (0.5 <= 1.0 m/s) with its steer target off to the side: not heading into the skater, no slide.
+    o.update(&[skater([0.0; 3])]);
+    o.update(&[skater([0.0; 3])]);
+    let slow = Contact { velocity: Some([0.5, 0.0]), target: Some([-0.66, 5.0]) };
+    let held = o.resolve_step_contact(from, to, r, Ignore::default(), slow).unwrap_or(from);
+    assert!(held[2].abs() < 1e-4, "steer target across: no slide {held:?}");
+}
+
+/// Research b716 (`82E9FC20` / `82E9F9F0`): within the goal radius a moving body ahead inside the stopping distance
+/// (v^2 / 160 at 80 m/s^2, the ray radius 1.225 + the avoider's 0.455) brakes the ped; farther, beyond the goal radius,
+/// or moving away at a quarter of the ped's speed or more, it does not.
+#[test]
+fn a_ped_brakes_only_for_a_body_inside_its_stopping_distance_near_its_goal() {
+    let skater = |z: f32, vz: f32| ObstacleInput { id: SKATER_OBSTACLE_BASE, center: [0.0, 0.9, z], axes: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], half_extents: [0.3, 0.9, 0.3], velocity: [0.0, 0.0, vz], inactive: false, held: false };
+    let mut o = NavObstacles::new(ObstacleParams::default());
+    let (p, v, near) = ([0.0, 0.0, 0.0], [0.0, 2.0], [0.0, 1.0]);
+    let brakes = |o: &mut NavObstacles, z: f32, vz: f32, target: [f32; 2]| {
+        o.update(&[skater(z, vz)]);
+        o.update(&[skater(z, vz)]);
+        o.brakes(p, v, target, Ignore::default())
+    };
+    assert!(brakes(&mut o, 1.69, 0.0, near), "inside 1.68 + 0.025");
+    assert!(!brakes(&mut o, 1.75, 0.0, near), "beyond the stopping distance");
+    assert!(!brakes(&mut o, 1.69, 0.0, [0.0, 5.0]), "goal 5 m away, beyond the 2 m goal radius");
+    assert!(!brakes(&mut o, 1.69, 0.6, near), "moving away at 0.6 >= 0.5 m/s");
+    o.set_params(ObstacleParams { brake_decel: 0.0, ..ObstacleParams::default() });
+    assert!(!brakes(&mut o, 1.69, 0.0, near), "mod switch off");
 }

@@ -233,6 +233,8 @@ pub(crate) fn sync_hand_props(peds: &mut super::peds::PedState, settings: &super
             let thrown = at.and_then(|at| mind.brain.update_hand_prop_release(&s, at)).or_else(|| mind.brain.update_litter());
             if let Some(velocity) = thrown.or(mind.hand_prop_release.take()) {
                 *held = None;
+                // The idle action runs only while held (`82E3ED50`, b649): no talk after the drop.
+                mind.action_cue = None;
                 let room = released.len() < s.max_live;
                 let model = data.hand_props.props.get(&h.key).and_then(|r| r.glb.clone());
                 let tris = model.as_deref().and_then(|g| triangles(hand_triangles, asset_root, g));
@@ -245,6 +247,7 @@ pub(crate) fn sync_hand_props(peds: &mut super::peds::PedState, settings: &super
                     }
                     None => {
                         mind.brain.hand_prop.clear();
+                        mind.unlink_seq = mind.unlink_seq.wrapping_add(1);
                         info!("PED_HAND_PROP ped=#{} {} released without a body tick={tick}", ped.id.serial, h.key);
                     }
                 }
@@ -254,6 +257,8 @@ pub(crate) fn sync_hand_props(peds: &mut super::peds::PedState, settings: &super
             if want.as_deref() != Some(h.key.as_str()) {
                 *held = None;
                 mind.brain.hand_prop.holding = false;
+                mind.action_cue = None;
+                mind.unlink_seq = mind.unlink_seq.wrapping_add(1);
                 info!("PED_HAND_PROP ped=#{} {} removed tick={tick}", ped.id.serial, h.key);
                 continue;
             }
@@ -281,6 +286,7 @@ pub(crate) fn sync_hand_props(peds: &mut super::peds::PedState, settings: &super
             };
             if out {
                 *linked = None;
+                mind.unlink_seq = mind.unlink_seq.wrapping_add(1);
                 info!("PED_HAND_PROP ped=#{} unlinked body={r} tick={tick}", ped.id.serial);
             }
             continue;

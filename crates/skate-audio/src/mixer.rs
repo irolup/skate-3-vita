@@ -654,12 +654,13 @@ impl Mixer {
     /// Render one block of SFX Master (6 channels, overwritten): the voices into their buses, then
     /// the environment network and the eEQChain buses.
     pub fn render(&mut self, bus: &mut [[f32; BLOCK]; 6]) {
-        self.render_with_env(bus, None);
+        self.render_with_env(bus, None, None);
     }
 
-    /// [`Mixer::render`] with another contributor's mono input to the environment bus, added after
-    /// the voices' (the grain chains' graph 2, pass order 5 after the voices' 0).
-    pub fn render_with_env(&mut self, bus: &mut [[f32; BLOCK]; 6], env: Option<&[f32; BLOCK]>) {
+    /// [`Mixer::render`] with another contributor's mono inputs to the environment bus and to
+    /// FlangeSub return A, added after the voices' (the grain chains' graph 2, pass order 5 after
+    /// the voices' 0).
+    pub fn render_with_env(&mut self, bus: &mut [[f32; BLOCK]; 6], env: Option<&[f32; BLOCK]>, flange_a: Option<&[f32; BLOCK]>) {
         for ch in bus.iter_mut() {
             *ch = [0.0; BLOCK];
         }
@@ -674,6 +675,12 @@ impl Mixer {
         }
         if let Some(env) = env {
             for (d, &x) in self.buses.env_in.iter_mut().zip(env.iter()) {
+                *d += x;
+            }
+        }
+        if let Some(flange) = flange_a.filter(|_| self.buses.flange.enabled()) {
+            self.buses.flange_active[0] = true;
+            for (d, &x) in self.buses.flange_in[0].iter_mut().zip(flange.iter()) {
                 *d += x;
             }
         }
@@ -754,12 +761,16 @@ impl VoiceHost for Mixer {
             pan,
             send: Send::default(),
             routing,
-            output: routing.output_bus.map_or(Output::Master, |(i, _)| Output::Eq(i)),
+            // Codes 2048 / 512: the dynamic-object manager's graphs A / B, mono (`sub_824A3140`, research b641).
+            output: match routing.fixed {
+                Some(code) => crate::bus::dynamic::CODES.iter().position(|&c| c == code).map_or(Output::Master, |i| Output::Dynamic(i as u8)),
+                None => routing.output_bus.map_or(Output::Master, |(i, _)| Output::Eq(i)),
+            },
             // Send A is posted 0 at open; property 5 / 2 set it.
             env: Level::new(0.0),
             owner_env: Level::new(0.0),
             fx_send: Level::new(0.0),
-            mono_out: false,
+            mono_out: routing.fixed.is_some(),
             group,
             fade: None,
             env_direct: None,
@@ -957,6 +968,33 @@ mod tests {
             assert!((env[k] - 0.1 * sum).abs() < 1e-6, "the env send taps the same sum");
         }
         assert!((0..6).filter(|&c| c != 1).all(|c| mono[c].iter().all(|&v| v == 0.0)));
+    }
+
+    /// The grain bed's FlangeSub input (`flange_a`) reaches return A only while the returns are
+    /// enabled; without them it changes nothing.
+    #[test]
+    fn the_bed_flange_input_feeds_return_a_only_when_enabled() {
+        use crate::bus::flange::FlangePreset;
+        let mut tap = [0.0f32; BLOCK];
+        tap[0] = 1.0;
+        let render = |enabled: bool, input: Option<&[f32; BLOCK]>| {
+            let mut m = Mixer::new();
+            if enabled {
+                m.buses.flange.set_presets(FlangePreset([20.0, 0.3, 0.2, 0.1, 1500.0, 0.002, 0.5, 0.9, 0.03]), FlangePreset([1.7, 0.3, 0.0, 1.0, 250.0, 0.0005, 0.25, 0.6, 0.11]));
+                m.buses.flange.frame([32692, 2313, 32692, 2313]);
+            }
+            let mut out = Vec::new();
+            for b in 0..8 {
+                let mut bus = [[0.0f32; BLOCK]; 6];
+                m.render_with_env(&mut bus, None, input.filter(|_| b == 0));
+                out.push(bus);
+            }
+            out
+        };
+        assert_eq!(render(false, None), render(false, Some(&tap)));
+        let wet = render(true, Some(&tap));
+        assert_ne!(render(true, None), wet);
+        assert!(wet.iter().any(|b| b[1].iter().any(|&v| v != 0.0)), "the delayed copy lands in the centre");
     }
 
     #[test]

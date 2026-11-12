@@ -9,6 +9,7 @@ pub enum Condition {
     TrickOutType { value: u32 },
     LandingIntoGrind,
     DroppingIn,
+    DropInWithoutTransition,
 }
 impl Condition {
     pub fn parse(a: &Attributes<'_>) -> Result<Option<Self>, String> {
@@ -29,6 +30,7 @@ impl Condition {
             },
             Some("IsLandingIntoGrind") => Self::LandingIntoGrind,
             Some("IsDroppingIn") => Self::DroppingIn,
+            Some("IsDropInWithoutTransition") => Self::DropInWithoutTransition,
             _ => return Ok(None),
         }))
     }
@@ -42,6 +44,7 @@ impl Condition {
             Self::TrickOutType { value } => p.trick_out_240 == value, //82BBDA10
             Self::LandingIntoGrind => p.air_grind_443 && p.air_time_184 < 0.2, //82BBDD70
             Self::DroppingIn => p.dropping_in_324,          //82BA41F0
+            Self::DropInWithoutTransition => p.tipslide_325, //82BA4268
         }
     }
 }
@@ -57,4 +60,6 @@ pub struct Physical {
     pub air_grind_443: bool,
     pub air_time_184: f32,
     pub dropping_in_324: bool,
+    /// Tipslide82D420A0 state byte98, FillOut82D42788.
+    pub tipslide_325: bool,
 }

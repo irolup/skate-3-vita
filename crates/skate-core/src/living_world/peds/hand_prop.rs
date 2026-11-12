@@ -1,15 +1,5 @@
-//! Ped hand prop release (b25, b87, b90): the throw at a trash bin, the drop, the release frame and the unlink.
-//!
-//! Retail [code]: `sub_82E3E648` starts a throw (holding required; pending + aimed bits, target, launch speed, release
-//! time, the clip by the angle to the target), the per-ped update `sub_82E3ED50` releases the held object when the
-//! release time runs out, aimed with the launch velocity of `sub_82E16AB0` and timer 35 = the flight time, through
-//! `sub_82E3EBE0` (holding cleared, the object goes into physics); a released object still linked to the ped is
-//! unlinked by `sub_82E3FAE0` once it is outside the unlink box around the ped. The ped never destroys it (b90 §3).
-//!
-//! The attack throw (ThrowHandPropAtWantTarget, `sub_82E3E960`, b92 / b93) aims at the target first: both the target
-//! and the ped are predicted ahead, the XZ intercept solve `sub_82E15CD0` picks the earliest point (or, with no
-//! solution, the ped's own predicted position), a random horizontal jitter and a lift follow. A released prop that hits
-//! the skater is an ordinary prop contact: retail has no hand-prop hit, bail, speech or score code (b92 Q2).
+//! Ped hand prop release (b25, b87, b90): throw at a bin, drop, release frame, unlink; attack throw (b92 / b93).
+//! Retail mechanism: docs/hails-additions/26g-living-world-ped-interactions.md#hand-prop-release
 
 use super::super::Vec3;
 use super::brain::PedBrain;
@@ -116,6 +106,8 @@ pub struct HandPropSettings {
     pub half_gravity: f32,
     /// The unlink box half sizes around the ped, metres x / y (up) / z (`82E3F090`: 0.5, 2.0, 0.5).
     pub unlink_box: [f32; 3],
+    /// The unlink stops whatever clip the ped channel plays with this fade (`82E3FAE0`, `DAT_82099280` 0.2 s, b649).
+    pub unlink_fade: f32,
     /// A released prop takes part in the skater's body contact (retail: an ordinary DMO contact, b92 Q2 / b94); a mod
     /// may turn it off.
     pub skater_contact: bool,
@@ -153,6 +145,7 @@ impl Default for HandPropSettings {
             aim_lift: 1.0,
             half_gravity: 4.9,
             unlink_box: [0.5, 2.0, 0.5],
+            unlink_fade: 0.2,
             skater_contact: true,
             starting_props: true,
             heavy_group: 12,
@@ -188,10 +181,7 @@ pub fn launch(origin: Vec3, target: Vec3, speed: f32, half_gravity: f32) -> Opti
     Some(([d[0] / flat * speed, vy, d[2] / flat * speed], time))
 }
 
-/// The intercept solve `sub_82E15CD0` [code, b93 B2 / B3]: a projectile of flat speed `speed` from `origin` meeting
-/// a target at `aim` moving at `velocity` (XZ only). Solved along the dominant axis (strict: equal |dx| and |dz| have
-/// no solution); returns the target's point at the earliest non-negative time (Y of `aim`), `None` with no solution.
-/// Ported as read, including the `v_minor + k * v_major` term (an exact intercept would subtract; b93 B2).
+/// Intercept solve 82E15CD0 (b93 B2 / B3), ported as read incl. the `v_minor + k * v_major` term: docs/hails-additions/26g-living-world-ped-interactions.md#hand-prop-intercept
 pub fn intercept(aim: Vec3, velocity: Vec3, origin: Vec3, speed: f32, epsilon: f32) -> Option<Vec3> {
     if speed <= 0.0 {
         return None;
@@ -470,10 +460,7 @@ impl PedBrain {
         Some([0.0; 3])
     }
 
-    /// The per-ped release step (`sub_82E3ED50`): a pending throw releases when timer 34 has run out (ours; retail
-    /// compares a clip time query against the same value, b90 §2 [inferred equal]) with the launch velocity from the
-    /// prop's hand position; timer 35 gets the flight time. Returns the release velocity on the release frame (the
-    /// host releases the object at once; DropHandProp posts [`super::brain::ChaseRequest::HandPropReleased`]).
+    /// Per-ped release step (82E3ED50): pending throw releases when timer 34 runs out; returns the release velocity.
     pub fn update_hand_prop_release(&mut self, settings: &HandPropSettings, prop_position: Vec3) -> Option<Vec3> {
         let throw = self.hand_prop.throw?;
         if !self.hand_prop.holding || self.timer(THROW_TIMER) > 0.0 {

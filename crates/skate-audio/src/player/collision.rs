@@ -33,9 +33,9 @@
 //!   AudioSurfaceMap words 12..16 by tier and the other material's class (every shipped entry
 //!   holds 8 = SFX Master), into the bus's centre.
 //!
-//! Not modelled: the Hall of Meat override in `sub_824965D0` (global `+564`, materials 97..100 → kind 8), the stamp's
-//! global counter (`*(0x830CFD94)+16`, UNCERTAIN: we use the post order) and the flagged
-//! (`+57` / `+56`) alternate window / band records, which no ported poster asks for.
+//! Not modelled: the Hall of Meat override in `sub_824965D0` (global `+564`, materials 97..100 → kind 8) and the stamp's
+//! global counter (`*(0x830CFD94)+16`, UNCERTAIN: we use the post order). The `+57` alternate window / band
+//! records are read by flagged posters only (the prop impacts, [`CollisionTuning::impact_band_flagged`]).
 use skate_audio_fma::madd::Madd as _;
 use super::Outputs;
 use super::contacts::SpliceHost;
@@ -78,6 +78,18 @@ pub struct Material {
     pub scale: f32,
     /// Impact bands `+0`, `+4`, `+8`, `+12` (zero when unresolved).
     pub bands: [f32; 4],
+    /// Byte `+57` set: the alternate window / band records (RefSpecs `E007F3FC90E887D0` /
+    /// `F64F891C312EFD5E`) a flagged poster reads instead (`sub_82496DF8` / `sub_82497088`, the
+    /// prop impact poster `world::props`); `None` = no alternates.
+    pub alt: Option<Records>,
+}
+
+/// One window + band record pair (zero when a RefSpec does not resolve).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Records {
+    pub windows: [i32; 14],
+    pub scale: f32,
+    pub bands: [f32; 4],
 }
 
 impl Default for Material {
@@ -94,15 +106,24 @@ impl Default for Material {
             windows: [0; 14],
             scale: 0.0,
             bands: [0.0; 4],
+            alt: None,
         }
     }
 }
 
 impl Material {
-    /// The window word at record offset `off` (0..=56, not 40).
-    fn window(&self, off: usize) -> i32 {
+    /// The window word at record offset `off` (0..=56, not 40) of the default or (`flagged`) alternate record.
+    fn window(&self, off: usize, flagged: bool) -> i32 {
         let i = if off < 40 { off / 4 } else { off / 4 - 1 };
-        self.windows.get(i).copied().unwrap_or(0)
+        self.records(flagged).0.get(i).copied().unwrap_or(0)
+    }
+
+    /// (windows, scale, bands): the alternates when the poster passes the flag and the material has them.
+    fn records(&self, flagged: bool) -> (&[i32; 14], f32, &[f32; 4]) {
+        match (&self.alt, flagged) {
+            (Some(a), true) => (&a.windows, a.scale, &a.bands),
+            _ => (&self.windows, self.scale, &self.bands),
+        }
     }
 }
 
@@ -185,6 +206,12 @@ impl CollisionTuning {
     /// `sub_82496C58`: the contact level of `m` against `other` at `tier`, interpolating its
     /// window over [low, high] at `value` (clamped to high).
     pub fn contact_level(&self, m: i32, other: i32, tier: i32, low: f32, high: f32, value: f32) -> i32 {
+        self.contact_level_flagged(m, other, tier, low, high, value, false)
+    }
+
+    /// [`Self::contact_level`] with `sub_82496DF8`'s flag (alternate window record).
+    #[allow(clippy::too_many_arguments)]
+    pub fn contact_level_flagged(&self, m: i32, other: i32, tier: i32, low: f32, high: f32, value: f32, flagged: bool) -> i32 {
         if m < 0 || tier == NO_TIER {
             return 0;
         }
@@ -194,16 +221,16 @@ impl CollisionTuning {
         let class = if m >= 97 || other == NO_MATERIAL { 0 } else { self.class(other) };
         let (lo, hi) = match tier {
             0 => match class {
-                0 => (rec.window(8), rec.window(12)),
-                1 => (rec.window(24), rec.window(28)),
-                _ => (rec.window(52), rec.window(56)),
+                0 => (rec.window(8, flagged), rec.window(12, flagged)),
+                1 => (rec.window(24, flagged), rec.window(28, flagged)),
+                _ => (rec.window(52, flagged), rec.window(56, flagged)),
             },
             1 => match class {
-                0 => (rec.window(0), rec.window(4)),
-                1 => (rec.window(16), rec.window(20)),
-                _ => (rec.window(44), rec.window(48)),
+                0 => (rec.window(0, flagged), rec.window(4, flagged)),
+                1 => (rec.window(16, flagged), rec.window(20, flagged)),
+                _ => (rec.window(44, flagged), rec.window(48, flagged)),
             },
-            2 => (rec.window(32), rec.window(36)),
+            2 => (rec.window(32, flagged), rec.window(36, flagged)),
             _ => (0, 32767),
         };
         if high > low {
@@ -217,8 +244,13 @@ impl CollisionTuning {
     /// `sub_82497088`: (tier, low, high) of an impact against the material's bands; tier 3 under
     /// the floor.
     pub fn impact_band(&self, m: i32, impact: f32) -> (i32, f32, f32) {
+        self.impact_band_flagged(m, impact, false)
+    }
+
+    /// [`Self::impact_band`] with `sub_82497088`'s flag (alternate band record).
+    pub fn impact_band_flagged(&self, m: i32, impact: f32, flagged: bool) -> (i32, f32, f32) {
         let Some(rec) = (m >= 0).then(|| self.material(m)).flatten() else { return (NO_TIER, 0.0, 0.0) };
-        let [b0, b4, b8, b12] = rec.bands;
+        let [b0, b4, b8, b12] = *rec.records(flagged).2;
         if impact < b12 {
             return (NO_TIER, 0.0, 0.0);
         }
@@ -233,10 +265,15 @@ impl CollisionTuning {
 
     /// `sub_82496F50`: the window record's `+40` scale (1 for a material without one).
     pub fn level_scale(&self, m: i32) -> f32 {
+        self.level_scale_flagged(m, false)
+    }
+
+    /// [`Self::level_scale`] with the flag (`sub_82496F50` passes it to `sub_82496DF8`).
+    pub fn level_scale_flagged(&self, m: i32, flagged: bool) -> f32 {
         if !(0..NO_MATERIAL).contains(&m) {
             return 1.0;
         }
-        self.material(m).map_or(0.0, |r| r.scale)
+        self.material(m).map_or(0.0, |r| r.records(flagged).1)
     }
 
     /// `sub_824965D0` / `sub_824967F8`: (bank family, sound id, gain word, pitch word) of `m`

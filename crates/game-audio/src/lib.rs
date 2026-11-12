@@ -5,6 +5,8 @@ mod ambience;
 mod crossfade_groups;
 mod emitters;
 mod prefetch;
+mod prop_sounds;
+pub use prop_sounds::{enabled as prop_sounds_enabled, set_enabled as set_prop_sounds};
 pub use prefetch::set_thread_init as set_bank_worker_init;
 pub mod frontend_marker;
 mod frontend;
@@ -113,6 +115,7 @@ mod pack_tests {
         for tick in 0..30 {
             let requests: &[u64] = if tick == 0 { &keys } else { &[] };
             native.frame(&library, crate::native::FrameInput {
+            props: &mut Vec::new(),
                 riding: &riding, steps: 1, listener: None, cuts: (0, 0), overstep: 0.0, game_dt: 1.0 / 60.0, real_dt: 1.0 / 60.0, silenced: false,
                 frontend: requests, teleport: None, map: None,
             });
@@ -152,6 +155,7 @@ mod pack_tests {
             let (x, z) = if t < 4.0 { (-350.0, -1058.0) } else { (162.0, 34.0) };
             let riding = skate_sim::AudioRiding { board: glam::Vec3::new(x, 0.0, z), ..Default::default() };
             native.frame(&library, crate::native::FrameInput {
+            props: &mut Vec::new(),
                 riding: &riding, steps: 1, listener: None, cuts: (0, 0), overstep: 0.0, game_dt: 1.0 / 60.0, real_dt: 1.0 / 60.0, silenced: false,
                 frontend: &[], teleport: None, map: Some(("University", 1)),
             });
@@ -200,6 +204,7 @@ mod pack_tests {
             let riding = skate_sim::AudioRiding { board: at, ..Default::default() };
             let listener = crate::native::Listener { position: at, forward: glam::Vec3::NEG_Z };
             native.frame(&library, crate::native::FrameInput {
+            props: &mut Vec::new(),
                 riding: &riding, steps: 1, listener: Some(listener), cuts: (0, 0), overstep: 0.0, game_dt: 1.0 / 60.0, real_dt: 1.0 / 60.0, silenced: false,
                 frontend: &[], teleport: None, map: Some(("University", 1)),
             });
@@ -241,6 +246,7 @@ mod pack_tests {
             let riding = skate_sim::AudioRiding { board: at, ..Default::default() };
             let listener = crate::native::Listener { position: at, forward: glam::Vec3::NEG_Z };
             native.frame(&library, crate::native::FrameInput {
+            props: &mut Vec::new(),
                 riding: &riding, steps: 1, listener: Some(listener), cuts: (0, 0), overstep: 0.0, game_dt: 1.0 / 60.0, real_dt: 1.0 / 60.0, silenced: false,
                 frontend: &[], teleport: None, map: Some(("University", 1)),
             });

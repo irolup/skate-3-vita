@@ -137,3 +137,30 @@ fn replay_buffer_clears_when_the_clock_goes_back() {
     assert_eq!(buffer.frame_count(), 1);
     assert_eq!(buffer.bytes(), 0);
 }
+
+/// b620: `encode_into` writes the same bytes as the old encoder (scaled / unscaled, hidden, moved joints on both sides
+/// of the rest epsilon, joint counts not a multiple of 8), reusing one buffer.
+#[test]
+fn encode_into_matches_reference() {
+    let mut seed = 0x2545_f491_u32;
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        (seed as f32 / u32::MAX as f32) * 2.0 - 1.0
+    };
+    let mut out = Vec::new();
+    for case in 0..10_000 {
+        let n = case % 101;
+        let rest: Vec<[f32; 3]> = (0..n).map(|_| [next(), next(), next()]).collect();
+        let mut joint = |r: [f32; 3], next: &mut dyn FnMut() -> f32| {
+            let d = match (next() * 4.0) as i32 { 0 => 0.0, 1 => 0.5e-4, 2 => 2.0e-4, _ => next() };
+            let scale = if case % 7 == 0 { [1.0 + next() * 0.1, 1.0, 1.0] } else { [1.0; 3] };
+            JointPose { translation: [r[0] + d, r[1], r[2] - d], rotation: [next(), next(), next(), next()], scale }
+        };
+        let joints = rest.iter().map(|r| joint(*r, &mut next)).collect();
+        let pose = ActorPose { root: joint([next(), next(), next()], &mut next), joints, hidden: case % 5 == 0 };
+        encode_into(&pose, &rest, &mut out);
+        assert_eq!(out, encode_reference(&pose, &rest), "case {case}");
+    }
+}

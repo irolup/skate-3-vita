@@ -4,7 +4,7 @@ These are the reference repositories this project copies from or follows. Pinned
 
 | Reference | URL | Commit |
 |---|---|---|
-| skate-3-rust-engine | https://github.com/SK8-ENGINE/skate-3-rust-engine | `8df32c51`, a commit of pull request #52 (copied at `cb79689`, resynced 2026-10-08 to `b3c9679`, 2026-10-13 to `2e16697`, 2026-10-17 to `618e824`, 2026-10-19 to `fad5aae`, 2026-10-21 to `b110bab`, 2026-10-23 to `74c124a`, 2026-10-24 to `36018e19`, then `0947dea5`, and 2026-10-26 to `8df32c51`: see **Resync to b3c9679**, **Resync to 2e16697**, **L1 resync to PR #52 head `618e824`**, **L1 resync to PR #52 head `fad5aae`**, **Resync to PR #52 head `b110bab`**, **Resync to PR #52 head `74c124a`** and **Resync to PR #52 head `36018e19`** (steps 6 and 7: `0947dea5`) and **Resync to PR #52 head `8df32c51`**) |
+| skate-3-rust-engine | https://github.com/SK8-ENGINE/skate-3-rust-engine | `3d14a7bb`, a commit of pull request #52 (copied at `cb79689`, resynced 2026-10-08 to `b3c9679`, 2026-10-13 to `2e16697`, 2026-10-17 to `618e824`, 2026-10-19 to `fad5aae`, 2026-10-21 to `b110bab`, 2026-10-23 to `74c124a`, 2026-10-24 to `36018e19`, then `0947dea5`, 2026-10-26 to `8df32c51` and 2026-11-10 to `3d14a7bb`: see **Resync to b3c9679**, **Resync to 2e16697**, **L1 resync to PR #52 head `618e824`**, **L1 resync to PR #52 head `fad5aae`**, **Resync to PR #52 head `b110bab`**, **Resync to PR #52 head `74c124a`** and **Resync to PR #52 head `36018e19`** (steps 6 and 7: `0947dea5`) and **Resync to PR #52 head `8df32c51`**) |
 | cargo-vita | https://github.com/vita-rust/cargo-vita | `c6bbf22` |
 | vitasdk-sys | https://github.com/vita-rust/vitasdk-sys | `cee132f` |
 | examples | https://github.com/vita-rust/examples | `5ef9e08` |
@@ -1419,3 +1419,31 @@ Follow-up (first device check of slice 5): 176 logos (`logo_*_colour_mat`, `_bw_
 their `diffuse` texture; their picture is the material's `decal` channel, which `tools/cas_stamps.py` now takes for them
 (`cas.pak` 164 MB). The coloured variants' decal is white with the logo's alpha and the black-and-white ones black: retail
 probably tints them (NOT RETAIL YET: not traced), so they draw as the decal says.
+
+## Park save wheel and input freeze (8.3, 10 Nov 2026)
+
+| Files | Change | Kind |
+|---|---|---|
+| skate-vita `lab.rs`, `app.rs` | Save Park from the pause menu is answered by the sim thread while paused (the paused world does not tick, so the park's bytes can be taken at once); before, the request waited for the pause to end, so the save wheel appeared only after the menu closed. While a park is written or deleted (the wheel is up) the pad reads neutral for the game (`input_frozen`) and for the menus and the teleporter prompt, so nothing can be done while it spins | ours (the owner's report on retail: the wheel shows while it saves and deletes; the wheel's minimum time stays ours) |
+
+## Resync to PR #52 head `3d14a7bb` (Phase 8.1, 10 Nov 2026)
+
+Upstream PR #52 moved 81 commits past `8df32c51` (it includes `c9c121c5`). Method: files equal to upstream's old version (comments aside) copied whole; the ones we changed three-way merged; the Bevy-side ones ported by hand.
+
+| Files | Upstream work | Kind |
+|---|---|---|
+| skate-core `living_world/**` (peds `object_flee`, `scatter`, `anim`, `avoid`, `brain`, `chase`, `flee`, `obstacles`; `ai_signals`, `path_follow`, `replay`, `skaters`), `player/wipeout/{air, common, mod}.rs`, `player/ghost.rs`, `replay_buffer.rs`, `menus.rs`, `trick_guide.rs` | peds' motion graph, dodging, steering, object / vehicle flee, scatter alarm; NPC line ends and take-offs; wipeout closing limits; new menu facts | verbatim; `common.rs` keeps `madd` |
+| skate-core `living_world/dmo.rs` | live objects score and cull at their current position (`live_at`), live score s1 = 2^31 | merged into our memoised census |
+| skate-core `living_world/peds/nav.rs` | `find_path_elements`, `reach_snap`, `raw_start_offset` | merged into our scratch-array A* |
+| skate-core `physics/board_world.rs` | `set_static_edges` | merged |
+| skate-audio `world/{props, moveable}.rs`, `bus/dynamic.rs`, `grain/bed.rs`, `mixer.rs`, `player/collision.rs` | retail prop sounds data side, the rolling chain's FlangeSub send | verbatim / merged; game-audio reads the `alt` records |
+| skate-sim `physics/prop_dynamics.rs` | skater rows with actor shoves, audio contacts, water not solid to props, grab geometry cache, held prop meets actors by its box | hand-merged with our streaming / rail / census work; props-in-water code kept dormant (no Better Water on the Vita), `SKATE_PROP_WATCH` and `skater_push_box` not taken |
+| skate-sim `living_world/{peds, ped_body, ped_hand_props, vehicles}.rs`, `living_world.rs` | standing dodge, strafe, gesture, object and vehicle flee (opt-in, off), scatter, contact slide, ped body A follows prop shoves, cars as on-foot ground (`modding::bridge::MovingQueries`, `dynamics::sweep_sphere`) | hand-ported |
+| skate-sim `living_world/npc_skaters.rs` | branches take only lines valid for the character; the puppet takes the stock graph's scored trees for grabs, grinds and manuals (`NpcScoreClips`, `stock_tree_leaf_at`, `grab_tree`, tweak attributes, pose scratch buffers) | three-way merged; our per-NPC clip cache (`ClipCache`) now wraps the new resolver, the pose step reuses one `NpcPoseScratch`, and the score clips are built when the living world starts (`Session::start_living_world`) |
+| game-audio `prop_sounds.rs` (new), `native.rs`, `player_audio.rs`, skate-vita `retail_audio.rs`, skate-sim `Session::take_prop_audio` | retail prop sounds host: impacts into the collision manager, rolling / sliding loops, the pushed prop's start / main loops and one-shots (`game_audio/prop_sounds.rs`, 648 lines) | ported without Bevy: the simulation thread publishes the props' entries through the audio mailbox; the host runs around the MixMap ticks; loops start only when their banks are in memory or delivered by the prefetch worker (no card read on the host thread); mods' per-type patches not ported |
+| skate-sim `skate_world.rs`, `collision_window.rs`, `physics.rs` | map rails are the off-board query edges (also in every streamed window), prop audio types, layout pieces not census streamed | ported |
+| skate-vita `vita_menus.rs` | menu facts `world_is_skate_park`, `party_pack_owned` (0), `skate_park_locked` (0) | ours |
+
+Not taken: one file per sound bank (`8c3bc66a`, setup side), replay editor changes (our editor has no colour lanes or Free keys), video screens, ped tint cache, FPS overlay, Bevy transform / pbr changes, mods, docs, `tools/dev-bench`.
+Checks: reference built from `3d14a7bb`, its 20 Course dumps bit-identical to `oracle/ref`; port 20/20, no-fma 20/20. skate-core 1336 passed, skate-sim 394 passed (`embedded_static_rwcm_hits_distinct_actor_query_ids` as before). DownTown `PERF_HASH 1e8ab886f55b2733` with the NPC puppet trees (`8d99be42c8057b58` before them; was `bd5e031e28835b47`); the NPC trees cost about 0.006 ms a tick more (`z_npc_pose` 0.025 to 0.029 ms); on the same machine and data `main` measures 1.58 ms a tick (living world 0.23 ms) and this resync 1.02 ms (0.10 ms), so no slower. Streamed windows: DownTown `200,60` 20/20 identical to the whole world with the rail edges; the district-pack run is 0/20 on `main` too (stale check against the current pack, not from this resync). skate-ui 70, skate-vita 65, game-audio 5, vita-pack 12 passed.
+Data: the prop sound banks (`DMO_Starts`, `Dynamics_Objects_Roll`, `Dynamics_Objects_Slide_A / B`) and the collision records' `alt` entries come from the audio export of upstream's setup at this pin; the audio export on this machine is older, so the prop sounds stay silent until it is rerun and the sound pack rebaked. Their memory and the 16-voice cap are to be checked on the Vita.

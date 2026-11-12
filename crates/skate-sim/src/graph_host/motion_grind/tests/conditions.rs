@@ -10,6 +10,7 @@ fn physical() -> Physical {
         air_grind_443: true,
         air_time_184: 0.125,
         dropping_in_324: true,
+        tipslide_325: false,
     }
 }
 #[test]
@@ -19,6 +20,9 @@ fn conditions_use_their_actual_fields_not_a_shared_grinding_proxy() {
     assert!(Condition::TrickOutType { value: 2 }.evaluate(&p));
     assert!(Condition::LandingIntoGrind.evaluate(&p));
     assert!(Condition::DroppingIn.evaluate(&p));
+    assert!(!Condition::DropInWithoutTransition.evaluate(&p), "byte 325, not the dropping-in byte 324");
+    p.tipslide_325 = true;
+    assert!(Condition::DropInWithoutTransition.evaluate(&p));
     assert!(!Condition::Approach { forwards: true }.evaluate(&p));
     p.filtered_grinding_80 = true;
     assert!(Condition::Approach { forwards: true }.evaluate(&p));

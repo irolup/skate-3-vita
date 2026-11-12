@@ -12,6 +12,23 @@ pub fn check_collision(state: &mut Requests, s: &Settings, mode: &Mode, f: &Fram
         state.request(0, 0.0);
     }
 }
+/// 82D90358's closing limits: (branch, xz, y); the branch names which one applies.
+pub fn closing_limits(s: &Settings, mode: &Mode, f: &Frame) -> (&'static str, f32, f32) {
+    let a = &s.air;
+    let deck_scalar = if f.flags_2476 & (1 << 26) != 0 { a.body_flip_acc_scalar } else { 1.0 };
+    let (branch, mut xz, y) =
+        if f.flags_2472 & (1 << 15) != 0 && f.jump_fix_frames > a.ignore_danger_frames {
+            ("trick", a.xz_trick, a.y_trick)
+        } else if f.wheel_contact {
+            ("wheels", mode.ground_xz * deck_scalar, s.ground.y_acceleration)
+        } else {
+            ("air", a.xz_acceleration * deck_scalar, a.y_acceleration)
+        };
+    if f.board_material_flags & (1 << 29) != 0 {
+        xz *= a.light_dmo_scalar;
+    }
+    (branch, xz, y)
+}
 pub fn check(state: &mut Requests, s: &Settings, mode: &Mode, f: &Frame, use_com: bool) {
     if state.mode != 2 {
         state.mode = 2;
@@ -31,22 +48,7 @@ pub fn check(state: &mut Requests, s: &Settings, mode: &Mode, f: &Frame, use_com
     let a = &s.air;
     let body_flip = f.flags_2476 & (1 << 26) != 0;
     let scalar = if body_flip { a.body_flip_scalar } else { 1.0 };
-    let deck_scalar = if body_flip {
-        a.body_flip_acc_scalar
-    } else {
-        1.0
-    };
-    let (mut xz, y) = if f.flags_2472 & (1 << 15) != 0 && f.jump_fix_frames > a.ignore_danger_frames
-    {
-        (a.xz_trick, a.y_trick)
-    } else if f.wheel_contact {
-        (mode.ground_xz * deck_scalar, s.ground.y_acceleration)
-    } else {
-        (a.xz_acceleration * deck_scalar, a.y_acceleration)
-    };
-    if f.board_material_flags & (1 << 29) != 0 {
-        xz *= a.light_dmo_scalar;
-    }
+    let (_, xz, y) = closing_limits(s, mode, f);
     common::closing(state, f, xz, y);
     let displacement = a.max_displacement * scalar;
     if mode.check_squash && f.maximum_pose_error > a.max_squash * scalar {

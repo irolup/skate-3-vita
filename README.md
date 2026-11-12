@@ -167,32 +167,15 @@ Copy the whole `../game_data/SKATEVITA` folder onto your console at `ux0:data/SK
 
 ### Already made your game data with an earlier version?
 
-You don't have to start over. Update the project and rebuild what changed, using the same `INSTALL`, `OUT` and `B` as in steps 3 and 5:
+You don't have to start over. Update this project and the reference project, then run steps 3 to 6 again with the same commands:
 
 ```sh
 git pull
 git -C ../skate-3-rust-engine fetch origin pull/52/head
-git -C ../skate-3-rust-engine checkout 8df32c51
-cargo build --release -p vita-bake
-python3 tools/prepare_object_catalog.py --game ../game_data/skate3_x360 --assets $INSTALL/assets
-$B maps     $INSTALL $OUT
-$B district $INSTALL $OUT DownTown
-$B catalog  $INSTALL $OUT
+git -C ../skate-3-rust-engine checkout 3d14a7bb
 ```
 
-For the character customisation and the team screen, export the menu screens again and run the customisation steps of step 4, then bake the UI and the customisation:
-
-```sh
-python3 tools/prepare_menu_screens.py --game ../game_data/skate3_x360 --assets $INSTALL/assets --work ../game_data/menu-movies-work
-(cd ../skate-3-rust-engine && python3 -m tools.asset_pipeline.customiser_setup --game ../game_data/skate3_x360 --assets $INSTALL/assets)
-python3 tools/cas_set.py --game ../game_data/skate3_x360 --assets $INSTALL/assets
-python3 tools/cas_thumbs.py --game ../game_data/skate3_x360 --assets $INSTALL/assets
-python3 tools/cas_stamps.py --game ../game_data/skate3_x360 --assets $INSTALL/assets
-$B ui       $INSTALL/assets $OUT ../game_data/ui-screens
-$B cas      $INSTALL $OUT
-```
-
-Then copy `catalog.pak`, `catalog.pak.idx`, `district_DownTown.pak`, every `map_*.pak`, `ui.pak`, `cas.pak` and `cas.pak.idx` to `ux0:data/SKATEVITA/`. The game runs with older packs but without these fixes, and without any error: with old `map_*.pak` files the Object Dropper doesn't recognise skate.Parks, with an old `district_DownTown.pak` DownTown keeps two invisible walls (one at the Kube Tower), and with an old `catalog.pak` PCU Training - Basic doesn't change the park. If you never ran the catalogue step, you didn't have the dropper or skate.Park before: this adds them. Without the new `ui.pak` the team screen and Edit Skater don't open; without `cas.pak` the skater is the stock one and the shops don't open. A `cas.pak` made before the tattoos and graphics is refused (the catalogue has more fields now): run the three customisation scripts and `$B cas` again, and copy the new `cas.pak` and `cas.pak.idx`.
+Step 3's converter updates `../game_data/prepared` in place: it rebuilds only what the new reference project changed, keeps the rest, and removes the old copy when it's done, so it's quicker than the first time. Its inner folder gets a new name, so run step 3's `INSTALL=` line again too. Step 5 rebuilds vita-bake and bakes every pack again. Then copy the whole `../game_data/SKATEVITA` folder to your Vita as in step 6.
 
 ## Building from source
 

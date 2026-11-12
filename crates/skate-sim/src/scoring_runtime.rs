@@ -201,6 +201,12 @@ impl Runtime {
     pub(crate) fn line_score(&self) -> f32 {
         self.session.holder.snapshot.line
     }
+    /// `[P+0x3C]+0x88` (`82DA6630`): the larger of the last trick sequence's reward and the one in progress,
+    /// truncated, the score the NPC reaction manager compares (minus `+0x34`, reset to 0; its other writers unread).
+    pub(crate) fn reaction_score(&self) -> i32 {
+        let s = &self.session.holder.snapshot;
+        s.last_reward.max(s.accumulated) as i32
+    }
     pub(crate) fn multiplier(&self) -> f32 {
         self.session.combo.multiplier
     }

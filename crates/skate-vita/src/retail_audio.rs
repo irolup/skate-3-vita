@@ -30,12 +30,14 @@ pub struct Mailbox {
     pub map: Option<(String, u64)>,
     /// The teleport effect amount (the Go To Marker hold, 0..=1), when there is one.
     pub teleport: Option<f32>,
+    /// The awake props' audio entries the simulation published and the host has not taken yet.
+    pub props: Vec<skate_sim::PropAudioSample>,
     /// Ticks left of the relocation's full amount (retail sends 1.0 for the relocation tick and two more).
     teleport_hold: u8,
 }
 
 pub static MAILBOX: Mutex<Mailbox> =
-    Mutex::new(Mailbox { riding: None, steps: 0, listener: None, cuts: 0, silenced: true, frontend: Vec::new(), map: None, teleport: None, teleport_hold: 0 });
+    Mutex::new(Mailbox { riding: None, steps: 0, listener: None, cuts: 0, silenced: true, frontend: Vec::new(), map: None, teleport: None, props: Vec::new(), teleport_hold: 0 });
 
 /// Set once the host has the front-end sounds: the synth's marker cues stay silent then.
 static FRONTEND_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -113,7 +115,32 @@ pub fn publish(session: &mut skate_sim::live::Session) -> skate_sim::AudioRiding
     });
     let cuts = session.presentation_cuts();
     let progress = session.marker_view().progress;
+    // The props' entries since the last frame (taken here, where the simulation owns them), folded into the ones the
+    // host has not taken yet: a contact stays its strongest.
+    // The buffers circulate (this side's scratch, the mailbox, the host's): nothing is allocated here per frame and no
+    // buffer is freed on another thread (a list made here and freed by the host every frame fragmented the small-block
+    // area). With the setting off the props are not read at all.
+    static SCRATCH: Mutex<Vec<skate_sim::PropAudioSample>> = Mutex::new(Vec::new());
+    let mut scratch = SCRATCH.lock().unwrap();
+    let props_on = game_audio::prop_sounds_enabled();
+    if props_on {
+        session.take_prop_audio(&mut scratch);
+    } else {
+        scratch.clear();
+    }
     let mut m = MAILBOX.lock().unwrap();
+    if props_on {
+        for sample in scratch.iter_mut() {
+            if let Some(before) = m.props.iter().find(|o| o.id == sample.id)
+                && before.contact.is_some_and(|b| sample.contact.is_none_or(|n| b.0 > n.0))
+            {
+                sample.contact = before.contact;
+            }
+        }
+    }
+    std::mem::swap(&mut m.props, &mut *scratch);
+    scratch.clear();
+    drop(scratch);
     // The hold's progress while it runs, then 1.0 for the relocation and two more ticks.
     m.teleport = if m.teleport_hold > 0 {
         m.teleport_hold -= 1;
@@ -223,6 +250,7 @@ pub fn load_and_run() -> Result<(), String> {
     let mut last = Instant::now();
     let (mut frames, mut total_us, mut max_us, mut window) = (0u32, 0u64, 0u32, Instant::now());
     let mut emitters_max = 0usize;
+    let mut props: Vec<skate_sim::PropAudioSample> = Vec::new();
     loop {
         next += period;
         let now = Instant::now();
@@ -235,6 +263,8 @@ pub fn load_and_run() -> Result<(), String> {
         last = Instant::now();
         let (riding, steps, listener, cuts, silenced, frontend, teleport, map) = {
             let mut m = MAILBOX.lock().unwrap();
+            // The props' entries replace the scratch's (the frame swaps them back out).
+            std::mem::swap(&mut props, &mut m.props);
             (m.riding, std::mem::take(&mut m.steps), m.listener, m.cuts, m.silenced, std::mem::take(&mut m.frontend), m.teleport, m.map.clone())
         };
         let Some(riding) = riding else { continue };
@@ -249,6 +279,7 @@ pub fn load_and_run() -> Result<(), String> {
             real_dt,
             silenced,
             frontend: &frontend,
+            props: &mut props,
             teleport,
             map: map.as_ref().map(|(n, g)| (n.as_str(), *g)),
         });

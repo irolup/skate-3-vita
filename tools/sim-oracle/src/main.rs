@@ -1021,6 +1021,7 @@ fn audio_render(assets: &str, sound_pak: &str, scenario: &str, out: &str) -> Res
         });
         let started = std::time::Instant::now();
         native.frame(&library, game_audio::native::FrameInput {
+            props: &mut Vec::new(),
             riding: &riding, steps, listener, cuts: (session.presentation_cuts(), 0), overstep: 0.0, game_dt: dt, real_dt: dt, silenced: false, frontend: &[], teleport: None, map: audio_map.as_deref().map(|m| (m, 1)),
         });
         host_us += started.elapsed().as_micros();

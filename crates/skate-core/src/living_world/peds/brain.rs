@@ -36,6 +36,18 @@ pub struct BrainSettings {
     /// How often the mover checks that its destination is reachable, seconds: every 10 mover updates
     /// (`82E2CB08`, counter mover `+0xB0`), at the console's 30 fps cadence 10 / 30 s [code; cadence: ours].
     pub reach_check_seconds: f32,
+    /// The reach check's snap window along X and along Z, m (`82C46348`: radius 0.5 at `0x8209975C` x the NavPower
+    /// params scale 1.3 at `0x82099484`; b653) [code + data].
+    pub reach_snap_window: f32,
+    /// How long the scatter alarm runs after the player's D-pad Down gesture, s (`0x821DE7BC` 180.0, b654) [data];
+    /// 0 turns the alarm off.
+    pub scatter_seconds: f32,
+    /// Scatter's arrival radius, m: a new leg within this of the goal (`826A8E48` mover vfn 0x88(3.0), `0x82063B08`, b645)
+    /// [code]; a plain flee uses `FleeParams::arrival_radius`.
+    pub scatter_arrival_radius: f32,
+    /// Scatter's upper-body channel stop: fade seconds (`826A8E48` writes channel state 5 with 0.2 at `0x82099280`, the
+    /// same as `StopChannel`; b824) [code].
+    pub scatter_channel_fade: f32,
     /// DrawTazer's draw time (`826A8258`, timer 37, `0x82099478` 0.133 s) and TazeWantTarget's
     /// delay before the hit (`826A8398`, timer 39, `0x820D06C0` 0.3 s); speeches 66 / 67.
     pub tazer_draw_seconds: f32,
@@ -45,6 +57,8 @@ pub struct BrainSettings {
     /// The tazer clips' channel blends (ped vfn248 `82E3A3F0` -> vfn240(name, 0.2, 0.2)) and the time left on the
     /// draw / holster clip at which the tazer counts as drawn / put away (`82E3ED50`, `0x82099280` 0.2 s) [code, b248].
     pub tazer_clip_blend: f32,
+    /// The greet / warn gestures' channel blend in and out (`0x82099280` = 0.2, b677).
+    pub gesture_blend: f32,
     pub tazer_clip_end: f32,
     /// ChannelGreetWantTarget: the greet time (timer 36, `0x82063AB8` 3.5 s), speeches 56 / 63
     /// (`8269FC30`).
@@ -97,7 +111,7 @@ impl Default for ZombieFollowSettings {
 
 impl Default for BrainSettings {
     fn default() -> Self {
-        Self { wander_speed: 2.0, warn_seconds: 3.5, know_about_seconds: 30.0, mood_want_memory_seconds: 30.0, watch_cone: 0.959_931, watch_ahead: 4.0, warn_speech: 53, tazer_draw_seconds: 0.133, tazer_hit_seconds: 0.3, taze_speech: 66, end_taze_speech: 67, tazer_clip_blend: 0.2, tazer_clip_end: 0.2, greet_seconds: 3.5, conversation_turn_seconds: 3.0, conversation_gather_seconds: 30.0, greet_speech: 56, return_greet_speech: 63, chases_enabled: true, aggressive_capture_distance: 2.0, unreachable_radius: 5.0, reach_check_seconds: 10.0 / 30.0, start_chase_speech: 55, new_chasee_speech: 15, hand_prop: Default::default(), zombie_follow: Default::default(), trip_kind: super::skater_contact::ReactionKind::Knockdown, trip_direction: super::skater_contact::ReactionDirection::FromBack, avoid: super::avoid::AvoidRules::RETAIL }
+        Self { wander_speed: 2.0, warn_seconds: 3.5, know_about_seconds: 30.0, mood_want_memory_seconds: 30.0, watch_cone: 0.959_931, watch_ahead: 4.0, warn_speech: 53, tazer_draw_seconds: 0.133, tazer_hit_seconds: 0.3, taze_speech: 66, end_taze_speech: 67, tazer_clip_blend: 0.2, gesture_blend: 0.2, tazer_clip_end: 0.2, greet_seconds: 3.5, conversation_turn_seconds: 3.0, conversation_gather_seconds: 30.0, greet_speech: 56, return_greet_speech: 63, chases_enabled: true, aggressive_capture_distance: 2.0, unreachable_radius: 5.0, reach_check_seconds: 10.0 / 30.0, reach_snap_window: 0.65, scatter_seconds: 180.0, scatter_arrival_radius: 3.0, scatter_channel_fade: 0.2, start_chase_speech: 55, new_chasee_speech: 15, hand_prop: Default::default(), zombie_follow: Default::default(), trip_kind: super::skater_contact::ReactionKind::Knockdown, trip_direction: super::skater_contact::ReactionDirection::FromBack, avoid: super::avoid::AvoidRules::RETAIL }
     }
 }
 
@@ -116,7 +130,7 @@ pub mod timers {
     /// SetSitTimer's timer (`SitTimer`).
     pub const SIT: i32 = 24;
     /// The graph's timer names by index (`sub_82E42B08` compares in this order).
-    pub const NAMES: [&str; 47] = [
+    pub const NAMES: [&str; 48] = [
         "NextWarnTimer",
         "InvestigateTimer",
         "ChaseSkaterOutViewTimer",
@@ -164,10 +178,11 @@ pub mod timers {
         "CollisionVolumeUnlock",
         "PluginTimeout",
         "ScatterTime",
+        "UnspawnTime",
     ];
-    /// `sub_82E42B08`: a timer name's index; an unknown name gets 47.
+    /// `sub_82E42B08`: a timer name's index (`UnspawnTime` = 47); an unknown name gets -1, its own slot (b825).
     pub fn index(name: &str) -> i32 {
-        NAMES.iter().position(|n| *n == name).map_or(47, |i| i as i32)
+        NAMES.iter().position(|n| *n == name).map_or(-1, |i| i as i32)
     }
     /// The brain holds at most this many running timers (`82E40940` drops a new one when full).
     pub const CAPACITY: usize = 14;
@@ -252,6 +267,9 @@ pub enum PedOp {
     /// `826A3530` Begin: motion intent 4, remember the flee target; `826A3760` End: forget it.
     /// Update `826A35F8` not decoded (the body steers away from the target).
     Flee,
+    /// `826A8E48` Begin: motion intent 4 (Flee) with the scatter threat flag (the local player is the threat);
+    /// `826A8FF8` Update: a new leg within `scatter_arrival_radius` of the goal; `826A9188` End: clears the flag (b645).
+    Scatter,
     /// Begin: save the speed suggestion, look at the want target; Update: face it (flat), speed
     /// 0.0 (`0x82165A10`); End: restore the speed, stop facing.
     StopAndFaceWantTarget { want: String },
@@ -550,6 +568,7 @@ impl PedOp {
             "ApproachWantTarget" => PedOp::ApproachWantTarget { want: want(), speed: float("speed").unwrap_or(2.0) },
             "AlertToWantTarget" => PedOp::AlertToWantTarget { want: want() },
             "Flee" => PedOp::Flee,
+            "Scatter" => PedOp::Scatter,
             "StopAndFaceWantTarget" => PedOp::StopAndFaceWantTarget { want: want() },
             "WatchWantTargetWithoutInterruptingLocomotion" => PedOp::WatchWantTarget { want: want() },
             "TurnToFaceSkater" => PedOp::TurnToFaceSkater,
@@ -841,6 +860,10 @@ impl HandProp {
 /// `SG_TAZR_TAZR2STND_F_0_N`) and its hand prop record (`livingworld_handprops` "tazr", tasergun_lw) [data, b248].
 /// Mods change them through those tables.
 pub const TAZER_INTO: &str = "TazerInto";
+/// The greet and warn gesture fields of a ped anim set (`GreetChannel` `Hash_6F928ECB7DFA7A05`, `WarnChannel`
+/// `Hash_C3298FF93E24D541`; strings `0x82307D1C` / `0x82307D04`, b677).
+pub const GREET_CHANNEL: &str = "GreetChannel";
+pub const WARN_CHANNEL: &str = "WarnChannel";
 pub const TAZER_CYC: &str = "TazerCyc";
 pub const TAZER_OUT: &str = "TazerOut";
 pub const TAZER_PROP: &str = "tazr";
@@ -893,6 +916,11 @@ pub struct PedBrain {
     pub motion_intent: Option<u8>,
     pub speed_suggestion: Option<f32>,
     pub flee_from: Option<u64>,
+    /// Scatter's threat flag (brain `+0xCD0` bit 0, set by its Begin `826A8E48`, cleared by its End `826A9188`): the flee
+    /// direction (`82E318F8`) takes the local player as the threat instead of the flee want target (b645).
+    pub scatter_threat: bool,
+    /// A channel stop the host applies to the body (fade seconds), then clears: Scatter's Begin (b824).
+    pub channel_stop: Option<f32>,
     /// The plugin (conversation id) the ped belongs to, whether the main graph runs it, in a
     /// conversation, the locked waypoint, monitored intents (name -> (stage, stages)), the
     /// speaker's turn passed.
@@ -968,6 +996,9 @@ pub struct PedBrain {
     pub alt_target: Option<Vec3>,
     /// The point the body turns to face (`ped+5888` face direction, bit 0x20 at `+2100`).
     pub face: Option<Vec3>,
+    /// The mover's strafe flag and target (`+0x60` / `+0x50`): set by BlockChasee every update (`sub_82E2C000`),
+    /// cleared at its End (`sub_826A4338` -> `sub_82E21B18`; b686). The body strafes facing it.
+    pub strafe_target: Option<Vec3>,
     /// The speed suggestion saved by a face / watch Begin, restored by its End.
     pub saved_speed: Option<Option<f32>>,
     /// WatchWantTarget latched into stop-and-face; StandAndWatchSkater's watch point.
@@ -1053,6 +1084,9 @@ pub enum ChaseSteer {
 pub enum ChaseRequest {
     /// A hand prop throw started: the host plays `clip` (blend [`super::hand_prop::HandPropSettings::clip_blend`]).
     HandPropClip { clip: &'static str },
+    /// A greet / warn gesture on the upper-body channel ([`GREET_CHANNEL`] / [`WARN_CHANNEL`], ped vfn+0xF8 `82E3A3F0`,
+    /// blends [`BrainSettings::gesture_blend`]; b677).
+    GestureClip { clip: &'static str },
     /// A tazer clip on the upper-body channel (`TAZER_INTO` / `TAZER_CYC` / `TAZER_OUT`, ped vfn248, blends 0.2).
     TazerClip { clip: &'static str },
     /// The held hand prop leaves the hand with `velocity` (m/s): the host turns it into a physics prop.
@@ -1062,7 +1096,9 @@ pub enum ChaseRequest {
     StateMessage { target: u64, state: u8 },
     Leave { chasee: u64 },
     GiveUpPrimary { chasee: u64 },
-    GroupEnd { chasee: u64, reason: i32 },
+    /// `notify`: from the ChaserGroupEndChase op (`826A5318`), which also shows a CAUGHT line for aggressivecapture
+    /// of the local player (b680); the taze path's group end (group vfn24) shows none.
+    GroupEnd { chasee: u64, reason: i32, notify: bool },
     /// TakeDownTargetableSuccess: knock `target` down (the host speaks 65 / 19).
     Takedown { target: u64 },
     /// TakeDownTargetableFailure.
@@ -1146,6 +1182,14 @@ impl PedBrain {
     /// A want from the mood producer, with the result's flag 0x40 ([`Want::forget_on_unset`]).
     pub fn raise_want(&mut self, want: &str, target: u64, forget_on_unset: bool) {
         self.wants.insert(want.to_ascii_lowercase(), Want { target, needs_addressing: true, forget_on_unset });
+    }
+    /// `82E2EF40`: a prop moving at the ped ([`super::object_flee::in_path`]) sets the flee want straight, outside the
+    /// mood system: every want stops needing addressing, then flee needs addressing with the prop as its target.
+    pub fn flee_object(&mut self, target: u64) {
+        for w in self.wants.values_mut() {
+            w.needs_addressing = false;
+        }
+        self.wants.insert("flee".to_owned(), Want { target, needs_addressing: true, forget_on_unset: false });
     }
     /// A passed mood result's want (`sub_82E41B98`): raised, and its target known for at least `memory` seconds
     /// ([`BrainSettings::mood_want_memory_seconds`], `82E42868`), so the entry that counts finished reactions exists.
@@ -1438,6 +1482,8 @@ impl Host for BrainHost<'_> {
             PedOp::UnsetWant { want } => b.unset_want(want),
             PedOp::ChannelGreetWantTarget { want, deactivate, return_greet } => match b.wants.get(want).map(|w| w.target) {
                 Some(target) if (self.target_position)(target).is_some() => {
+                    // `8269FAC0`: the gesture, then the greet time (b677).
+                    b.chase_requests.push(ChaseRequest::GestureClip { clip: GREET_CHANNEL });
                     b.set_timer(timers::WARN, s.greet_seconds);
                     if !return_greet {
                         b.chase_requests.push(ChaseRequest::Greeted { target });
@@ -1456,10 +1502,20 @@ impl Host for BrainHost<'_> {
                     }
                 }
             }
-            PedOp::ChannelWarnWantTarget { .. } => {
-                b.set_timer(timers::WARN, s.warn_seconds);
-                b.speech = Some(s.warn_speech);
-            }
+            // `8269F7B0`: only with the target found: the gesture, the warn time, the speech; else the want goes when the op
+            // deactivates it (b677).
+            PedOp::ChannelWarnWantTarget { want, deactivate } => match b.wants.get(want).map(|w| w.target) {
+                Some(target) if (self.target_position)(target).is_some() => {
+                    b.chase_requests.push(ChaseRequest::GestureClip { clip: WARN_CHANNEL });
+                    b.set_timer(timers::WARN, s.warn_seconds);
+                    b.speech = Some(s.warn_speech);
+                }
+                _ => {
+                    if *deactivate {
+                        b.unset_want(want);
+                    }
+                }
+            },
             // `826A77A8`: no ped speech event in zombie mode (b95).
             PedOp::SendSpeech { value } if !b.zombie => b.speech = Some(*value),
             PedOp::SetSimpleTimer { timer, length } => b.set_timer(*timer, *length),
@@ -1713,7 +1769,7 @@ impl Host for BrainHost<'_> {
             }
             PedOp::ChaserGroupEndChase { reason } => {
                 if let Some(c) = b.chasee {
-                    b.chase_requests.push(ChaseRequest::GroupEnd { chasee: c, reason: *reason });
+                    b.chase_requests.push(ChaseRequest::GroupEnd { chasee: c, reason: *reason, notify: true });
                 }
             }
             PedOp::EndChase => {
@@ -1744,6 +1800,15 @@ impl Host for BrainHost<'_> {
                 b.motion_intent = Some(motion::FLEE);
                 b.flee_from = b.wants.get("flee").map(|w| w.target);
             }
+            // Scatter (`826A8E48`): the Flee intent with the threat forced to the local player (b645).
+            PedOp::Scatter => {
+                b.motion_intent = Some(motion::FLEE);
+                b.scatter_threat = true;
+                b.channel_stop = Some(s.scatter_channel_fade);
+                // Begin also lets go of a position lock (`(ped+0x1714)+0xE0` bit 0x80 cleared, b825).
+                b.position_locked = false;
+                b.locked_at = None;
+            }
             PedOp::StopAndFaceWantTarget { .. } | PedOp::WatchWantTarget { .. } => {
                 b.saved_speed = Some(b.speed_suggestion);
                 b.watch_latched = false;
@@ -1761,6 +1826,9 @@ impl Host for BrainHost<'_> {
         let b = &mut *self.brain;
         match op {
             PedOp::Wander => b.speed_suggestion = Some(s.wander_speed),
+            // Flee / Scatter Update (`826A35F8` / `826A8FF8`) hand the mover the run speed every tick (`CD65`, b824), so a
+            // ped that wandered before (2.0) runs; no record leaves it to the run fallback.
+            PedOp::Flee | PedOp::Scatter => b.speed_suggestion = self.chase.record.and_then(|r| r.run_speed()),
             PedOp::DisableNavigation => b.navigation_disabled = true,
             PedOp::ZombieFollow => {
                 if let Some((player, _)) = self.skater {
@@ -1827,7 +1895,7 @@ impl Host for BrainHost<'_> {
                         }
                         let capture = super::chase::reason::AGGRESSIVE_CAPTURE;
                         if self.chase.group(target).is_some_and(|g| g.count > 0 && g.end_reason != Some(capture)) {
-                            b.chase_requests.push(ChaseRequest::GroupEnd { chasee: target, reason: capture });
+                            b.chase_requests.push(ChaseRequest::GroupEnd { chasee: target, reason: capture, notify: false });
                         }
                     }
                 }
@@ -1857,6 +1925,7 @@ impl Host for BrainHost<'_> {
                     d[0] * d[0] + d[1] * d[1] + d[2] * d[2] < at_target * at_target
                 });
                 let b = &mut *self.brain;
+                b.strafe_target = chasee;
                 if at_point {
                     b.face = chasee;
                     b.speed_suggestion = Some(0.0);
@@ -1964,6 +2033,7 @@ impl Host for BrainHost<'_> {
             PedOp::SuggestVelocity { .. } => b.speed_suggestion = None,
             PedOp::UnsetWantOnEnd { want } => b.unset_want(want),
             PedOp::Flee => b.flee_from = None,
+            PedOp::Scatter => b.scatter_threat = false,
             PedOp::TakedownTauntVictim => {
                 b.face = None;
                 b.monitored.remove("SGIntent");
@@ -2004,6 +2074,7 @@ impl Host for BrainHost<'_> {
             }
             PedOp::BlockChasee { .. } => {
                 b.face = None;
+                b.strafe_target = None;
                 b.speed_suggestion = None;
             }
             PedOp::SetAltTargetToChaseePosition => b.alt_target = None,

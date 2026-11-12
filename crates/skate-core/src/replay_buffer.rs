@@ -79,6 +79,8 @@ pub struct ReplayBuffer {
     tracks: BTreeMap<u64, Track>,
     bytes: usize,
     since_trim: usize,
+    /// The key `record` encodes into; cloned only when it becomes a new key (b620).
+    scratch: Vec<u8>,
 }
 
 impl ReplayBuffer {
@@ -139,13 +141,13 @@ impl ReplayBuffer {
             track.rest = pose.joints.iter().map(|j| j.translation).collect();
             self.bytes += track.rest.len() * 12;
         }
-        let data = encode(pose, &track.rest);
+        encode_into(pose, &track.rest, &mut self.scratch);
         let Some(last) = track.keys.back() else {
-            self.bytes += data.len() + KEY_OVERHEAD;
-            track.keys.push_back(Key { time: now, data });
+            self.bytes += self.scratch.len() + KEY_OVERHEAD;
+            track.keys.push_back(Key { time: now, data: self.scratch.clone() });
             return;
         };
-        if last.data == data || last.time == now {
+        if last.data == self.scratch || last.time == now {
             return;
         }
         // Held since an earlier frame: repeat the held pose at the previous frame so playback holds instead of
@@ -155,8 +157,8 @@ impl ReplayBuffer {
             self.bytes += held.len() + KEY_OVERHEAD;
             track.keys.push_back(Key { time: previous, data: held });
         }
-        self.bytes += data.len() + KEY_OVERHEAD;
-        track.keys.push_back(Key { time: now, data });
+        self.bytes += self.scratch.len() + KEY_OVERHEAD;
+        track.keys.push_back(Key { time: now, data: self.scratch.clone() });
     }
 
     /// The actor left the world in the current frame.
@@ -186,6 +188,13 @@ impl ReplayBuffer {
 
     pub fn ids(&self) -> impl Iterator<Item = u64> + '_ {
         self.tracks.keys().copied()
+    }
+
+    /// Whether `id` is drawn at `time` ([`ReplayBuffer::sample`] gives a pose that is not hidden), without decoding it.
+    pub fn shown(&self, id: u64, time: f64) -> bool {
+        let Some(track) = self.tracks.get(&id).filter(|t| t.end.is_none_or(|end| time < end)) else { return false };
+        let upper = track.keys.partition_point(|k| k.time <= time);
+        upper.checked_sub(1).and_then(|i| track.keys.get(i)).is_some_and(|k| k.data.first().is_some_and(|f| f & FLAG_HIDDEN == 0))
     }
 
     /// The pose of `id` at `time`: None before its first key or from its despawn on. Between two keys every joint is
@@ -246,7 +255,40 @@ const FLAG_HIDDEN: u8 = 2;
 /// Key layout: flags u8, joint count u16, root (translation 3 x f32, rotation 4 x i16, scale 3 x f32), a bit mask of
 /// joints whose translation left the rest value, those translations (3 x f32), every joint's rotation (4 x i16), and
 /// with FLAG_SCALE every joint's scale (3 x f32).
-fn encode(pose: &ActorPose, rest: &[[f32; 3]]) -> Vec<u8> {
+fn encode_into(pose: &ActorPose, rest: &[[f32; 3]], out: &mut Vec<u8>) {
+    let scaled = pose.joints.iter().any(|j| j.scale.iter().any(|s| (s - 1.0).abs() > 1.0e-4));
+    let n = pose.joints.len();
+    out.clear();
+    out.push(if scaled { FLAG_SCALE } else { 0 } | if pose.hidden { FLAG_HIDDEN } else { 0 });
+    out.extend_from_slice(&(n as u16).to_le_bytes());
+    put_f32s(out, &pose.root.translation);
+    put_quat(out, pose.root.rotation);
+    put_f32s(out, &pose.root.scale);
+    let mask = out.len();
+    out.resize(mask + n.div_ceil(8), 0);
+    for (i, (j, r)) in pose.joints.iter().zip(rest).enumerate() {
+        if j.translation.iter().zip(r).any(|(a, b)| (a - b).abs() > REST_EPSILON) {
+            out[mask + i / 8] |= 1 << (i % 8);
+        }
+    }
+    for (i, joint) in pose.joints.iter().enumerate().take(rest.len()) {
+        if out[mask + i / 8] & (1 << (i % 8)) != 0 {
+            put_f32s(out, &joint.translation);
+        }
+    }
+    for joint in &pose.joints {
+        put_quat(out, joint.rotation);
+    }
+    if scaled {
+        for joint in &pose.joints {
+            put_f32s(out, &joint.scale);
+        }
+    }
+}
+
+/// The encoder before b620, kept as the reference `encode_into` must match byte for byte.
+#[cfg(test)]
+fn encode_reference(pose: &ActorPose, rest: &[[f32; 3]]) -> Vec<u8> {
     let scaled = pose.joints.iter().any(|j| j.scale.iter().any(|s| (s - 1.0).abs() > 1.0e-4));
     let n = pose.joints.len();
     let moved: Vec<bool> = pose

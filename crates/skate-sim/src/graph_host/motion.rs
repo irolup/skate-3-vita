@@ -161,6 +161,182 @@ pub(crate) fn stock_riding_fakie_settings(graph: &LoadedGraph) -> Result<Vec<ska
         .collect())
 }
 
+/// The trees the stock motion graph plays for one score name: docs/hails-additions/26c-living-world-npc-skaters.md#score-clips
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct ScoreClips {
+    pub into: Option<String>,
+    /// The `Into` / `Out` state's `playBackSpeed` (`None` = 1).
+    pub into_speed: Option<f32>,
+    pub out_speed: Option<f32>,
+    /// A ground grab's `<X>Cyc` blend time (`PlayAnimation time`): the hold an air grab lands into.
+    pub cyc_seconds: Option<f32>,
+    /// The `Out` state's blend time (`PlayAnimation time`).
+    pub out_seconds: Option<f32>,
+    /// The Out leaves for InAir this long before its clip ends (`WillExpire InTime`).
+    pub out_expire: Option<f32>,
+    /// The grab landing a Cyc still active at touchdown plays (`Land.GrabLanding.<X>`).
+    pub landing: Option<GrabLanding>,
+    pub cyc: String,
+    pub out: Option<String>,
+    /// The `ScoringGrabs` direction attribute that names it (`up` / `left` / `down` / `right`); `None` = the base name.
+    pub direction: Option<&'static str>,
+    /// The `Cyc` state's tweak easing, when it has one (air grabs).
+    pub tweak: Option<TweakFilter>,
+}
+
+/// An air grab `Cyc`'s `FilterMotionGraphIntent` TweakX / TweakY and whether `TweakProject` (abs(x) + abs(y) <= 1)
+/// or a raw `SetBlend` writes `tweak_x` / `tweak_y`: docs/hails-additions/26c-living-world-npc-skaters.md#npc-grab-tweaks
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct TweakFilter {
+    pub x: skate_core::animation::intent_filter::Settings,
+    pub y: skate_core::animation::intent_filter::Settings,
+    pub project: bool,
+    /// Cyc -> Out: the filtered tweak below this (`HasTweak less`, the x / y magnitude; or `HasFilteredMotionGraphIntent`
+    /// TweakY `abs less`, `y_only`).
+    pub release: Option<Release>,
+}
+
+/// `Land.GrabLanding.<X>`: its tree, blend time and how long before its end `Land` leaves for OnBoard (`WillExpire`).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct GrabLanding {
+    pub tree: String,
+    pub seconds: f32,
+    pub expire: f32,
+}
+
+/// The tweak level an air grab's Cyc leaves for its Out at (research b708).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Release {
+    pub below: f32,
+    pub y_only: bool,
+}
+
+/// Every `ScoringGrabs` / `ScoringTrick` name of a motion graph (lower case) -> the trees of the state that scores it
+/// (first in graph order wins, a transition state last), so a graph mod changes NPC grabs like the player's: docs/hails-additions/26c-living-world-npc-skaters.md#score-clips
+pub(crate) fn stock_score_clips(graph: &skate_data::state_graph::StateGraph) -> BTreeMap<String, ScoreClips> {
+    let e = &graph.elements;
+    let mut parent = vec![usize::MAX; e.len()];
+    for (i, el) in e.iter().enumerate() {
+        for &c in &el.children {
+            parent[c] = i;
+        }
+    }
+    let attr = |i: usize, n: &str| e[i].attributes.iter().find(|a| a.name.eq_ignore_ascii_case(n)).map(|a| a.text.as_str());
+    let is_state = |i: usize| e[i].tag.eq_ignore_ascii_case("state");
+    let is_behaviour = |i: usize, n: &str| e[i].tag.eq_ignore_ascii_case("behaviour") && attr(i, "name").is_some_and(|v| v.eq_ignore_ascii_case(n));
+    let ends = |i: usize, suffix: &str| attr(i, "name").is_some_and(|n| n.len() >= suffix.len() && n[n.len() - suffix.len()..].eq_ignore_ascii_case(suffix));
+    // A state's own PlayAnimation, else the first one of its sub-states (a cycle split by speed).
+    let anim = |s: usize| -> Option<String> {
+        let direct = e[s].children.iter().find(|&&c| is_behaviour(c, "PlayAnimation")).and_then(|&c| attr(c, "anim"));
+        direct.or_else(|| (s + 1..e.len()).take_while(|&i| is_inside(&parent, s, i)).find(|&i| is_behaviour(i, "PlayAnimation")).and_then(|i| attr(i, "anim"))).map(str::to_owned)
+    };
+    let cycle = |i: usize| ends(i, "Cyc") || ends(i, "Cycle");
+    let phase = |p: usize, suffix: &str| e[p].children.iter().copied().find(|&c| is_state(c) && ends(c, suffix)).and_then(anim);
+    let cyc_seconds = |p: usize| {
+        let s = e[p].children.iter().copied().find(|&c| is_state(c) && cycle(c))?;
+        let play = e[s].children.iter().copied().find(|&c| is_behaviour(c, "PlayAnimation"))?;
+        attr(play, "time")?.trim().parse::<f32>().ok()
+    };
+    let speed = |p: usize, suffix: &str| {
+        let s = e[p].children.iter().copied().find(|&c| is_state(c) && ends(c, suffix))?;
+        let play = e[s].children.iter().copied().find(|&c| is_behaviour(c, "PlayAnimation"))?;
+        attr(play, "playBackSpeed")?.trim().parse::<f32>().ok().filter(|v| v.is_finite() && *v > 0.0 && *v != 1.0)
+    };
+    let cyc_phase = |p: usize| e[p].children.iter().copied().find(|&c| is_state(c) && cycle(c)).and_then(anim);
+    let filter = |s: usize, intent: &str| {
+        let c = e[s].children.iter().copied().find(|&c| is_behaviour(c, "FilterMotionGraphIntent") && attr(c, "filteredIntent").is_some_and(|v| v.eq_ignore_ascii_case(intent)))?;
+        Some(super::motion_intent_filter::Operation::parse(&skate_data::state_graph::attributes::Attributes::new(&e[c].attributes)).settings)
+    };
+    let release = |s: usize| {
+        let t = e[s].children.iter().copied().find(|&c| e[c].tag.eq_ignore_ascii_case("transition") && attr(c, "target").is_some_and(|v| v.eq_ignore_ascii_case("Out")))?;
+        let is_condition = |i: usize, n: &str| e[i].tag.eq_ignore_ascii_case("condition") && attr(i, "name").is_some_and(|v| v.eq_ignore_ascii_case(n));
+        (t + 1..e.len()).take_while(|&i| is_inside(&parent, t, i)).find_map(|i| {
+            let y_only = if is_condition(i, "HasTweak") {
+                false
+            } else if is_condition(i, "HasFilteredMotionGraphIntent") && attr(i, "intent").is_some_and(|v| v.eq_ignore_ascii_case("TweakY")) {
+                true
+            } else {
+                return None;
+            };
+            Some(Release { below: attr(i, "less")?.trim().parse().ok()?, y_only })
+        })
+    };
+    let tweak = |s: usize| Some(TweakFilter { x: filter(s, "TweakX")?, y: filter(s, "TweakY")?, project: e[s].children.iter().any(|&c| is_behaviour(c, "TweakProject")), release: release(s) });
+    // A state's transition to `target` (last path segment) that fires on `WillExpire`: its InTime.
+    let expire = |s: usize, target: &str| {
+        let t = e[s].children.iter().copied().find(|&c| e[c].tag.eq_ignore_ascii_case("transition") && attr(c, "target").is_some_and(|v| v.rsplit('.').next().is_some_and(|l| l.eq_ignore_ascii_case(target))))?;
+        (t + 1..e.len()).take_while(|&i| is_inside(&parent, t, i)).find(|&i| e[i].tag.eq_ignore_ascii_case("condition") && attr(i, "name").is_some_and(|v| v.eq_ignore_ascii_case("WillExpire"))).and_then(|i| attr(i, "InTime")?.trim().parse::<f32>().ok())
+    };
+    let out_expire = |p: usize| expire(e[p].children.iter().copied().find(|&c| is_state(c) && ends(c, "Out"))?, "InAir");
+    let name_is = |i: usize, n: &str| attr(i, "name").is_some_and(|v| v.eq_ignore_ascii_case(n));
+    // The Cyc's `...GrabLanding.<X>` target: the state X under a `GrabLanding` state, and its parent's (`Land`) OnBoard exit.
+    let landing = |s: usize| {
+        let target = e[s].children.iter().copied().filter(|&c| e[c].tag.eq_ignore_ascii_case("transition")).filter_map(|c| attr(c, "target")).find(|t| t.split('.').rev().nth(1).is_some_and(|g| g.eq_ignore_ascii_case("GrabLanding")))?;
+        let x = target.rsplit('.').next()?;
+        let st = (0..e.len()).find(|&i| is_state(i) && name_is(i, x) && parent[i] != usize::MAX && is_state(parent[i]) && name_is(parent[i], "GrabLanding"))?;
+        let play = e[st].children.iter().copied().find(|&c| is_behaviour(c, "PlayAnimation"))?;
+        let land = parent[parent[st]];
+        Some(GrabLanding { tree: attr(play, "anim")?.to_owned(), seconds: attr(play, "time")?.trim().parse().ok()?, expire: (land != usize::MAX).then(|| expire(land, "OnBoard")).flatten()? })
+    };
+    let out_seconds = |p: usize| {
+        let s = e[p].children.iter().copied().find(|&c| is_state(c) && ends(c, "Out"))?;
+        let play = e[s].children.iter().copied().find(|&c| is_behaviour(c, "PlayAnimation"))?;
+        attr(play, "time")?.trim().parse::<f32>().ok()
+    };
+    let mut out = BTreeMap::new();
+    let mut weak = std::collections::BTreeSet::new();
+    for i in 0..e.len() {
+        let names: Vec<(&str, Option<&'static str>)> = if is_behaviour(i, "ScoringGrabs") {
+            [("grabName", None), ("up", Some("up")), ("left", Some("left")), ("down", Some("down")), ("right", Some("right"))]
+                .into_iter()
+                .filter_map(|(a, d)| attr(i, a).map(|n| (n, d)))
+                .collect()
+        } else if is_behaviour(i, "ScoringTrick") {
+            attr(i, "trick").map(|n| (n, None)).into_iter().collect()
+        } else {
+            continue;
+        };
+        let s = parent[i];
+        if s == usize::MAX {
+            continue;
+        }
+        // Grinds, slides: the scoring state's own tree; air grabs: that state is the `Cyc` between `Into` and `Out`;
+        // ground grabs: no own tree, it holds `<X>Into` / `<X>Cyc` / `<X>Out`.
+        let own = e[s].children.iter().find(|&&c| is_behaviour(c, "PlayAnimation")).and_then(|&c| attr(c, "anim")).map(str::to_owned);
+        let clips = match own {
+            Some(cyc) if cycle(s) && parent[s] != usize::MAX => Some(ScoreClips { into: phase(parent[s], "Into"), into_speed: speed(parent[s], "Into"), cyc, out: phase(parent[s], "Out"), out_speed: speed(parent[s], "Out"), cyc_seconds: None, out_seconds: out_seconds(parent[s]), out_expire: out_expire(parent[s]), landing: landing(s), direction: None, tweak: tweak(s) }),
+            Some(cyc) => Some(ScoreClips { cyc, ..Default::default() }),
+            None if e[s].children.iter().any(|&c| is_state(c) && cycle(c)) => cyc_phase(s).map(|cyc| ScoreClips { into: phase(s, "Into"), into_speed: speed(s, "Into"), cyc, out: phase(s, "Out"), out_speed: speed(s, "Out"), cyc_seconds: cyc_seconds(s), out_seconds: out_seconds(s), out_expire: None, landing: None, direction: None, tweak: None }),
+            None => anim(s).map(|cyc| ScoreClips { cyc, ..Default::default() }),
+        };
+        let Some(clips) = clips else { continue };
+        // A grind's grab `Into` also scores the grind: a transition state names a score only when no other does.
+        let transition = ends(s, "Into") || ends(s, "Out");
+        for (name, direction) in names {
+            let key = name.to_ascii_lowercase();
+            let free = !out.contains_key(&key);
+            if transition && free {
+                weak.insert(key.clone());
+            }
+            if free || (!transition && weak.remove(&key)) {
+                out.insert(key, ScoreClips { direction, ..clips.clone() });
+            }
+        }
+    }
+    out
+}
+
+/// Whether element `i` lies under `root` (walks `i`'s parents).
+fn is_inside(parent: &[usize], root: usize, mut i: usize) -> bool {
+    while i != usize::MAX {
+        if i == root {
+            return true;
+        }
+        i = parent[i];
+    }
+    false
+}
+
 /// A motion animation over stock metadata alone (no graph), for building stock trees outside the
 /// player's host (tests, the NPC puppet's channel).
 pub(crate) fn metadata_animation(metadata: skate_data::animation_metadata::AnimationMetadata) -> super::motion_animation::MotionAnimation {
@@ -176,13 +352,101 @@ pub(crate) fn tree_commands(
     attributes: &[SettableAttribute],
     time: f32,
 ) -> Result<Vec<skate_core::animation::playback_tree::PoseCommand>, String> {
+    let mut out = Vec::new();
+    tree_commands_into(animation, name, attributes, time, &mut out)?;
+    Ok(out)
+}
+
+/// [`tree_commands`] into `out` (cleared first).
+pub(crate) fn tree_commands_into(
+    animation: &super::motion_animation::MotionAnimation,
+    name: &str,
+    attributes: &[SettableAttribute],
+    time: f32,
+    out: &mut Vec<skate_core::animation::playback_tree::PoseCommand>,
+) -> Result<(), String> {
+    out.clear();
     let mut tree = animation.build_tree(name)?;
     tree.set_attributes(attributes)?;
     let length = tree.length();
     tree.set_time(if length > 0.0 { time.max(0.0).rem_euclid(length) } else { 0.0 });
-    let mut out = Vec::new();
-    tree.evaluate(skate_core::animation::playback_tree::Evaluation { cull_threshold: 0.0, update_history: false }, true, &mut out)?;
-    Ok(out)
+    tree.evaluate(skate_core::animation::playback_tree::Evaluation { cull_threshold: 0.0, update_history: false }, true, out)?;
+    Ok(())
+}
+
+/// A built stock tree kept for [`cached_tree_commands_into`] with the inputs it was built and set with.
+pub(crate) struct TreeCache {
+    name: String,
+    construction: Vec<(skate_core::animation::output::attributes::AttributeName, skate_core::animation::output::attributes::AttributeName)>,
+    attributes: Vec<SettableAttribute>,
+    tree: skate_core::animation::playback_tree::PlaybackTree,
+}
+
+/// [`tree_commands_into`] on a reused tree: same output while the name, construction values and
+/// attributes match (docs/hails-additions/34-physics-performance.md "Fakie channel tree cache").
+/// Drop the cache when `animation` is replaced.
+pub(crate) fn cached_tree_commands_into(
+    animation: &super::motion_animation::MotionAnimation,
+    cache: &mut Option<TreeCache>,
+    name: &str,
+    attributes: &[SettableAttribute],
+    time: f32,
+    out: &mut Vec<skate_core::animation::playback_tree::PoseCommand>,
+) -> Result<(), String> {
+    out.clear();
+    let hit = cache.as_ref().is_some_and(|c| c.name == name && c.construction == animation.construction_values && c.attributes == attributes);
+    if !hit {
+        *cache = None;
+        let mut tree = animation.build_tree(name)?;
+        tree.set_attributes(attributes)?;
+        *cache = Some(TreeCache { name: name.to_owned(), construction: animation.construction_values.clone(), attributes: attributes.to_vec(), tree });
+    }
+    let c = cache.as_mut().expect("cache filled");
+    let result = (|| {
+        if hit {
+            c.tree.set_attributes(attributes)?;
+        }
+        let length = c.tree.length();
+        c.tree.set_time(if length > 0.0 { time.max(0.0).rem_euclid(length) } else { 0.0 });
+        c.tree.evaluate(skate_core::animation::playback_tree::Evaluation { cull_threshold: 0.0, update_history: false }, true, out).map(|_| ())
+    })();
+    if result.is_err() {
+        *cache = None;
+    }
+    result
+}
+
+/// [`tree_commands_into`] on one reused tree per name (attributes set every call, for values that move each frame
+/// like an NPC grab's tweaks). Clear `caches` when `animation` is replaced.
+pub(crate) fn named_tree_commands_into(
+    animation: &super::motion_animation::MotionAnimation,
+    caches: &mut Vec<TreeCache>,
+    name: &str,
+    attributes: &[SettableAttribute],
+    time: f32,
+    out: &mut Vec<skate_core::animation::playback_tree::PoseCommand>,
+) -> Result<(), String> {
+    out.clear();
+    caches.retain(|c| c.construction == animation.construction_values);
+    let i = match caches.iter().position(|c| c.name == name) {
+        Some(i) => i,
+        None => {
+            let tree = animation.build_tree(name)?;
+            caches.push(TreeCache { name: name.to_owned(), construction: animation.construction_values.clone(), attributes: Vec::new(), tree });
+            caches.len() - 1
+        }
+    };
+    let c = &mut caches[i];
+    let result = (|| {
+        c.tree.set_attributes(attributes)?;
+        let length = c.tree.length();
+        c.tree.set_time(if length > 0.0 { time.max(0.0).rem_euclid(length) } else { 0.0 });
+        c.tree.evaluate(skate_core::animation::playback_tree::Evaluation { cull_threshold: 0.0, update_history: false }, true, out).map(|_| ())
+    })();
+    if result.is_err() {
+        caches.remove(i);
+    }
+    result
 }
 
 impl MotionHost {
@@ -195,6 +459,17 @@ impl MotionHost {
             }
         }
         self.gesture_publication = None;
+    }
+
+    /// The grind's rest board-to-CoG height with no crouch (`ControlGrindCrouch`): `max_grind_disttocog`.
+    pub(crate) fn grind_rest_disttocog(&self) -> f32 {
+        self.grind_settings.height[1]
+    }
+
+    /// `SetManualAngle`'s target for a held `Manual` intent (`anim_motion/manual` balance graph, signed).
+    pub(crate) fn manual_rest_angle(&self, manual: f32) -> f32 {
+        let t = self.manual.balance.evaluate(manual.abs());
+        if manual >= 0.0 { t } else { -t }
     }
 
     pub fn from_graph(

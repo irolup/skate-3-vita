@@ -128,11 +128,11 @@ fn skater_data() -> SkaterData {
             let mut id = [0u8; 16];
             id[0] = r_i as u8;
             id[1] = a as u8;
-            lines.push(SkaterLine { id, start: [r * t.cos(), 0.0, r * t.sin()], heading: t, valid: true, allowed_skaters: u64::MAX, flags: 0 });
+            lines.push(SkaterLine { id, start: [r * t.cos(), 0.0, r * t.sin()], heading: t, valid: true, allowed_skaters: u64::MAX, flags: 1 });
         }
     }
     let characters = (0..8)
-        .map(|i| SkaterCharacter { key: format!("pro_{i}"), pro_index: Some(i), capabilities: [false; 3], community: false })
+        .map(|i| SkaterCharacter { key: format!("pro_{i}"), pro_index: Some(i), capabilities: [true; 3], community: false })
         .collect();
     SkaterData { lines, characters }
 }
@@ -586,7 +586,7 @@ fn skaters_never_spawn_within_5_m_of_another_skater() {
     // Two lines only: one 3 m from a standing player 75 m out, one free.
     let mut data = skater_data();
     data.lines.truncate(0);
-    let mk = |b: u8, p: Vec3| SkaterLine { id: [b; 16], start: p, heading: 0.0, valid: true, allowed_skaters: u64::MAX, flags: 0 };
+    let mk = |b: u8, p: Vec3| SkaterLine { id: [b; 16], start: p, heading: 0.0, valid: true, allowed_skaters: u64::MAX, flags: 1 };
     data.lines.push(mk(1, [75.0, 0.0, 0.0]));
     data.lines.push(mk(2, [0.0, 0.0, 75.0]));
     let obs = [still(0.0, 0.0), still(77.0, 2.0)]; // a second skater (remote player later) near line 1

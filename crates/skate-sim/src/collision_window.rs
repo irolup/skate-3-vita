@@ -193,6 +193,10 @@ pub(crate) struct ClusterSet {
     material: RetailContactMaterial,
     /// The broadphase paddings of the whole world, carried by every window.
     limits: (f32, f32),
+    /// The map's rails as the off-board searches' query edges (`skate_world::map_rail_edges`, PR #52 `3d14a7bb`): a
+    /// window carries the ones that touch its regions, the whole world all of them.
+    /// As start and end points (24 bytes an edge; DownTown has 28,855): each window builds its segments from these.
+    edges: Vec<[f32; 6]>,
 }
 
 /// The whole world's broadphase paddings (`BoardWorld::new`) from its widest triangle: a world
@@ -240,6 +244,28 @@ impl ClusterSet {
         Ok(Self::from_parts(&infos, Arc::new(ArchiveSource::new(archive, locs)), broadphase_limits(index.widest)?, material))
     }
 
+    /// The rail edges that touch `regions` (all of them for the whole world).
+    fn edges_in(&self, regions: Option<&[Bounds]>) -> Vec<skate_core::physics::board_world::query_metadata::EdgeSegment> {
+        self.edges
+            .iter()
+            .filter_map(|e| {
+                let (start, end) = (Vector3::new(e[0], e[1], e[2]), Vector3::new(e[3], e[4], e[5]));
+                let local_bounds = Bounds::from_points([start, end])?;
+                regions.is_none_or(|r| r.iter().any(|r| local_bounds.overlaps(*r))).then_some(skate_core::physics::board_world::query_metadata::EdgeSegment { start, end, local_bounds })
+            })
+            .collect()
+    }
+
+    /// The map's rail edges the windows carry.
+    pub(crate) fn with_edges(mut self, edges: Vec<skate_core::physics::board_world::query_metadata::EdgeSegment>) -> Self {
+        self.set_edges(edges);
+        self
+    }
+
+    fn set_edges(&mut self, edges: Vec<skate_core::physics::board_world::query_metadata::EdgeSegment>) {
+        self.edges = edges.iter().map(|e| [e.start.x, e.start.y, e.start.z, e.end.x, e.end.y, e.end.z]).collect();
+    }
+
     pub(crate) fn from_parts(infos: &[ClusterInfo], source: Arc<dyn ClusterSource>, limits: (f32, f32), material: RetailContactMaterial) -> Self {
         let clusters = infos
             .iter()
@@ -249,7 +275,7 @@ impl ClusterSet {
                 params: i.params,
             })
             .collect();
-        Self { source, cache: Default::default(), clusters, material, limits }
+        Self { source, cache: Default::default(), clusters, material, limits, edges: Vec::new() }
     }
 
     /// The query meshes of one cluster (runs of one group in cluster order), decoded.
@@ -397,7 +423,7 @@ impl ClusterSet {
         let t_decode = t0.elapsed();
         let world = BoardWorld::with_query_metadata_prebuilt(
             triangles,
-            QueryMetadata { packed_surfaces, meshes, static_edges: vec![], island_flags: 0 },
+            QueryMetadata { packed_surfaces, meshes, static_edges: self.edges_in(regions), island_flags: 0 },
             triangle_bounds,
             trees,
         )
@@ -485,14 +511,14 @@ mod lead_tests {
 
 impl Window {
     /// A window over an RWCM archive in memory.
-    pub(crate) fn from_archive(archive: Vec<u8>, material: RetailContactMaterial, half: f32, trigger: f32, at: [f32; 3]) -> Result<(Self, BoardWorld), String> {
-        Self::over(ClusterSet::from_archive(archive, material)?, half, trigger, at)
+    pub(crate) fn from_archive(archive: Vec<u8>, material: RetailContactMaterial, half: f32, trigger: f32, at: [f32; 3], edges: Vec<skate_core::physics::board_world::query_metadata::EdgeSegment>) -> Result<(Self, BoardWorld), String> {
+        Self::over(ClusterSet::from_archive(archive, material)?.with_edges(edges), half, trigger, at)
     }
 
     /// A window over the district collision installed for this session.
-    pub(crate) fn from_installed(material: RetailContactMaterial, half: f32, trigger: f32, at: [f32; 3]) -> Option<Result<(Self, BoardWorld), String>> {
+    pub(crate) fn from_installed(material: RetailContactMaterial, half: f32, trigger: f32, at: [f32; 3], edges: Vec<skate_core::physics::board_world::query_metadata::EdgeSegment>) -> Option<Result<(Self, BoardWorld), String>> {
         let d = INSTALLED.lock().unwrap().take()?;
-        Some(Self::over(ClusterSet::from_parts(&d.clusters, d.source, d.limits, material), half, trigger, at))
+        Some(Self::over(ClusterSet::from_parts(&d.clusters, d.source, d.limits, material).with_edges(edges), half, trigger, at))
     }
 
     fn over(set: ClusterSet, half: f32, trigger: f32, at: [f32; 3]) -> Result<(Self, BoardWorld), String> {
@@ -501,6 +527,16 @@ impl Window {
         // The first window is built around the spawn for both foci (deck and skater).
         let world = window.build(&[at, at])?;
         Ok((window, world))
+    }
+
+    /// The map's rail edges, given once the grind provider has them (it builds the rails anyway; building them a second
+    /// time for the edges took a 4.4 MB block during the load): every later window carries the ones near it, and the
+    /// current window gets its share now.
+    pub(crate) fn attach_edges(&mut self, edges: Vec<skate_core::physics::board_world::query_metadata::EdgeSegment>, world: &mut BoardWorld) -> Result<(), String> {
+        let set = std::sync::Arc::get_mut(&mut self.set).ok_or("the window's cluster set is shared")?;
+        set.set_edges(edges);
+        let regions = self.regions(&self.centres);
+        world.set_static_edges(self.set.edges_in(Some(&regions))).map_err(str::to_owned)
     }
 
     fn regions(&self, foci: &[[f32; 3]]) -> Vec<Bounds> {

@@ -108,6 +108,10 @@ impl SkaterAnimation {
     pub(crate) fn regular_stance(&self) -> bool {
         self.state.publication.natural_stance == 0
     }
+    /// Riding switch (relative stance 1; SkaterAnim vt+0x18 `82B97128`, the Trick Guide's swap input, b672).
+    pub(crate) fn riding_switch(&self) -> bool {
+        self.state.switch()
+    }
     pub(crate) fn set_customisation(&mut self, natural: u32, style: u32) {
         if natural <= 1 && self.state.publication.natural_stance != natural as i32 {
             self.state.publication.natural_stance = natural as i32;

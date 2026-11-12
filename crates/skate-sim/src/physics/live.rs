@@ -252,6 +252,9 @@ impl Session {
 
     pub fn start_living_world(&mut self, settings: crate::living_world::LivingWorldSettings) -> bool {
         self.living = self.map_name.as_deref().and_then(|map| crate::living_world::LivingWorldState::load(&self.asset_root, map, settings));
+        if let Some(living) = &mut self.living {
+            living.npcs.scores = crate::living_world::npc_skaters::NpcScoreClips(crate::graph_host::motion::stock_score_clips(&self.graphs.motion.source));
+        }
         self.living.is_some()
     }
     /// Changes the living world's settings (the menu); in effect from the next tick.
@@ -623,6 +626,16 @@ impl Session {
     /// One fixed tick with this pad state.
     pub fn step(&mut self, state: XboxState) -> StepReport {
         let _tick = skate_core::profile::scope("z_tick");
+        // A slow tick names the phase that took the time (always on: the profiled builds never showed the 75 ms tick
+        // of 11 Nov 2026). `lap` is the time since the last call, in ms.
+        let mut mark = std::time::Instant::now();
+        let started = mark;
+        let mut laps = [0.0f32; 8];
+        let mut lap = |slot: usize| {
+            let now = std::time::Instant::now();
+            laps[slot] = (now - mark).as_secs_f32() * 1000.0;
+            mark = now;
+        };
         // skate_vita (Object Dropper): an asked-for editor waits for the skater to stop (retail's flow `8270A5F0`:
         // input locked, the editor opens once the skater no longer moves, at most 4 s); meanwhile the skater holds the
         // brake (B: brake, then off the board). NOT RETAIL YET: retail's lock message (`0x7949dac1`) is not decoded.
@@ -657,6 +670,7 @@ impl Session {
             }
             None => state,
         };
+        lap(0);
         // 1. PreUpdate customiser preferences.
         crate::customiser::apply_preferences(&self.profile, &mut self.physics, &mut self.skater.animation);
         // 2. Input.
@@ -682,17 +696,20 @@ impl Session {
             self.physics.animation_profile.physics_mode,
             self.skater.player_input.physical.state.state_16,
         );
+        lap(1);
         // 4. Physics: body of the advance system (vehicles are never occupied here).
         // Streamed collision follows the deck (a no-op for whole worlds).
         if let Err(error) = self.physics.follow_window(&self.skater) {
             self.physics.failed = true;
             report.error = Some(error);
         }
+        lap(2);
         // The car proxies and grab splines between the controls and the physics (skate-game
         // runs `multiplayer::prepare`, `push_vehicle_proxies` and `push_vehicle_grab_splines` there).
         if let Some(living) = &mut self.living {
             living.before_physics(&mut self.physics, &self.skater);
         }
+        lap(3);
         if !self.physics.failed {
             let mut actions = published.0.actions();
             let input_available = published.0.controller_available();
@@ -709,6 +726,7 @@ impl Session {
                 report.error = Some(error);
             }
         }
+        lap(4);
         // 5. Presentation capture (skate-game runs it after the fixed tick, with the
         // period as it stands after the tick).
         crate::presentation::capture(&self.skater, &self.camera, self.physics.period(), &mut self.presentation);
@@ -720,6 +738,7 @@ impl Session {
             let _dmo = skate_core::profile::scope("z_dmo_stream");
             crate::living_world::dmo_stream::stream(self.dmo_settings, &self.asset_root, 0, &observers, camera, &mut self.physics, &mut self.dmo);
         }
+        lap(5);
         // The population and the traffic after the fixed tick (skate-game's `FixedUpdate`
         // systems after `SimulationSet::Physics`).
         if report.error.is_none() {
@@ -730,6 +749,7 @@ impl Session {
                 living.after_physics(&mut self.physics, &mut self.skater, period, camera);
             }
         }
+        lap(6);
         // The career stats after the population (skate-game's `track` after `SimulationSet::Physics`; the ped hits are
         // the ones `advance_peds` reported this tick).
         if report.error.is_none() {
@@ -765,6 +785,17 @@ impl Session {
         if self.ticks % 60 == 0 {
             self.animation_bytes = self.skater.animation.evaluator.frames.trim_decoded(self.animation_budget);
         }
+        lap(7);
+        let total = (std::time::Instant::now() - started).as_secs_f32() * 1000.0;
+        if total > 40.0 {
+            static SLOW: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if SLOW.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 20 == 0 {
+                println!(
+                    "SLOW_TICK {total:.1} ms (tick {}): dropper and customiser {:.1}, input and controls {:.1}, window {:.1}, before-physics {:.1}, physics {:.1}, props census {:.1}, living world {:.1}, rest and animation trim {:.1}; state {:?}",
+                    self.ticks, laps[0], laps[1], laps[2], laps[3], laps[4], laps[5], laps[6], laps[7], self.state_name()
+                );
+            }
+        }
         report
     }
 
@@ -773,6 +804,14 @@ impl Session {
     /// The presentation's snaps so far (teleports, camera cuts): the audio host's cut signal.
     pub fn presentation_cuts(&self) -> u64 {
         self.presentation.cuts
+    }
+
+    /// The awake props' audio entries since the last call (impacts keep their strongest contact), for the audio host.
+    pub fn take_prop_audio(&mut self, out: &mut Vec<crate::PropAudioSample>) {
+        match self.physics.prop_dynamics_mut() {
+            Some(dynamics) => dynamics.take_audio_samples(out),
+            None => out.clear(),
+        }
     }
 
     pub fn take_audio(&mut self) -> (crate::AudioRiding, u32) {

@@ -82,6 +82,7 @@ const CAC_UNLOCK_ALL: &str = "VITA_CAC_UNLOCK_ALL";
 const DROPPER_FREE_CAMERA: &str = "VITA_DROPPER_FREE_CAMERA";
 const PHYSICS: &str = "VITA_PHYSICS";
 const AUDIO: &str = "VITA_AUDIO";
+const PROP_SOUNDS: &str = "VITA_PROP_SOUNDS";
 const DEBUG_HUD: &str = "VITA_DEBUG_HUD";
 const MENU_STYLE: &str = "VITA_MENU_STYLE";
 
@@ -243,6 +244,7 @@ pub fn customize(c: Customize, worlds: &Worlds) {
             "Vita system",
             vec![
                 setting(AUDIO, "Board sounds", Widget::Selector),
+                setting(PROP_SOUNDS, "Prop sounds", Widget::Selector),
                 setting(DEBUG_HUD, "Debug overlay", Widget::Selector),
                 setting(MENU_STYLE, "Menu style", Widget::Selector),
             ],
@@ -287,7 +289,7 @@ pub fn register(registry: &mut MenuRegistry, settings: &Settings) {
     let pedestrians: Vec<&str> = PEDESTRIANS.iter().map(|t| t.0).collect();
     let difficulty: Vec<String> = ["EASY", "NORMAL", "HARDCORE"].iter().map(|l| format!("ID_GAMESETTINGS_DIFFICULTY_{l}")).collect();
     let units = skate_core::menu_values::retail_rule(UNITS).unwrap_or_else(toggle);
-    let rules: [(&str, ValueRule); 17] = [
+    let rules: [(&str, ValueRule); 18] = [
         (DIFFICULTY, cycle(&difficulty.iter().map(String::as_str).collect::<Vec<_>>())),
         (SFX_VOLUME, ValueRule::retail_slider()),
         (MINIMAP, toggle()),
@@ -303,6 +305,7 @@ pub fn register(registry: &mut MenuRegistry, settings: &Settings) {
         (CAC_UNLOCK_ALL, toggle()),
         (PHYSICS, cycle(&["Fast", "Retail"])),
         (AUDIO, cycle(&["Retail", "Synth"])),
+        (PROP_SOUNDS, toggle()),
         (DEBUG_HUD, toggle()),
         (MENU_STYLE, cycle(&["Retail", "Plain"])),
     ];
@@ -341,6 +344,7 @@ pub fn write_settings(registry: &mut MenuRegistry, s: &Settings) {
         (CAC_UNLOCK_ALL, flag(s.cac_unlock_all)),
         (PHYSICS, flag(!s.fast_physics)),
         (AUDIO, flag(!s.retail_audio)),
+        (PROP_SOUNDS, flag(s.prop_sounds)),
         (DEBUG_HUD, flag(s.debug_hud)),
         (MENU_STYLE, flag(!s.retail_menus)),
     ];
@@ -374,6 +378,7 @@ pub fn read_setting(registry: &MenuRegistry, id: &str, s: &mut Settings) -> bool
         CAC_UNLOCK_ALL => s.cac_unlock_all = on,
         PHYSICS => s.fast_physics = !on,
         AUDIO => s.retail_audio = !on,
+        PROP_SOUNDS => s.prop_sounds = on,
         DEBUG_HUD => s.debug_hud = on,
         MENU_STYLE => s.retail_menus = !on,
         _ => return false,
@@ -386,6 +391,12 @@ pub fn read_setting(registry: &MenuRegistry, id: &str, s: &mut Settings) -> bool
 pub fn set_main_menu(context: &mut MenuContext, main: bool, park: bool) {
     // Save Park is selectable in a park (retail IsItemEnabled 8261FB18 reads the park's state; every park here).
     context.facts.insert(skate_core::menus::facts::PARK_SAVEABLE.into(), f64::from(u8::from(park && !main)));
+    // Career / Free Play are off in a world flagged as a skate park (`82511168`, b673): the park worlds here. The San Van
+    // party pack (DLC `CCF000C`) is not owned (PartyPlay greyed, as retail without it), and no career progression holds the
+    // skate.Park locked yet.
+    context.facts.insert(skate_core::menus::facts::WORLD_IS_SKATE_PARK.into(), f64::from(u8::from(park)));
+    context.facts.insert(skate_core::menus::facts::PARTY_PACK_OWNED.into(), 0.0);
+    context.facts.insert(skate_core::menus::facts::SKATE_PARK_LOCKED.into(), 0.0);
     context.mode = if main {
         MAIN_MODE
     } else if park {

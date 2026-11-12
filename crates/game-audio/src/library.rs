@@ -612,6 +612,8 @@ struct MaterialJson {
     scale: f32,
     #[serde(default)]
     bands: Vec<f32>,
+    /// The `+57` alternate window / band records (absent before that export, or when the material has none).
+    alt: Option<CollisionRecordsJson>,
     /// The footstep layer (`player::footsteps::FootstepMaterial`; absent before that export).
     #[serde(default)]
     footsteps: bool,
@@ -621,6 +623,16 @@ struct MaterialJson {
 
 fn no_kind() -> i32 {
     -1
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct CollisionRecordsJson {
+    #[serde(default)]
+    windows: Vec<i32>,
+    #[serde(default)]
+    scale: f32,
+    #[serde(default)]
+    bands: Vec<f32>,
 }
 
 impl CollisionJson {
@@ -642,6 +654,11 @@ impl CollisionJson {
                     windows: std::array::from_fn(|i| m.windows.get(i).copied().unwrap_or(0)),
                     scale: m.scale,
                     bands: std::array::from_fn(|i| m.bands.get(i).copied().unwrap_or(0.0)),
+                    alt: m.alt.as_ref().map(|a| skate_audio::player::collision::Records {
+                        windows: std::array::from_fn(|i| a.windows.get(i).copied().unwrap_or(0)),
+                        scale: a.scale,
+                        bands: std::array::from_fn(|i| a.bands.get(i).copied().unwrap_or(0.0)),
+                    }),
                 })
                 .collect(),
             // AudioSurfaceMap word 7 (+28): the collision class.

@@ -21,6 +21,8 @@ pub struct StaticScene<'a> {
     metadata: &'a QueryMetadata,
     /// The DMO prop world, queried as pool bit 2 (`82764AB0`: world+0x5580, "DMOPool"; b218 / b221).
     props: Option<(&'a BoardWorld, &'a QueryMetadata)>,
+    /// The traffic cars (`BipedWorld::vehicles`), answered with the Ground pool after the map's external solids.
+    vehicles: Option<&'a crate::modding::bridge::MovingQueries>,
 }
 impl<'a> StaticScene<'a> {
     ///82C20728/82764AB0: caller-sized lines, poolmask7, facing3, no mesh or
@@ -118,7 +120,7 @@ impl<'a> StaticScene<'a> {
         let world = world.into();
         let metadata = world.map.query_metadata()?;
         let props = world.props.and_then(|props| props.query_metadata().ok().map(|metadata| (props, metadata)));
-        Ok(Self { world: world.map, metadata, props })
+        Ok(Self { world: world.map, metadata, props, vehicles: world.vehicles })
     }
     /// The worlds that answer `pool`: the map's meshes of that pool, then for pool 2 the prop world's (tagged Ground
     /// there). Earlier sources win ties (`8276EE88`).
@@ -231,10 +233,15 @@ impl<'a> StaticScene<'a> {
             }
         }
         }
-        if pool == QueryPool::Ground
-            && let Some(hit) = self.world.external_line(start, vec3(probe.end), probe.radius)
-        {
+        let solids = if pool == QueryPool::Ground {
+            use skate_core::physics::board_world::ExternalQueries;
+            [self.world.external_line(start, vec3(probe.end), probe.radius), self.vehicles.and_then(|v| v.line(start, vec3(probe.end), probe.radius))]
+        } else {
+            [None, None]
+        };
+        for hit in solids.into_iter().flatten() {
             if hit.hit.geometry.fraction < nearest {
+                nearest = hit.hit.geometry.fraction;
                 output = Some(LineHit {
                     position: lanes(hit.hit.geometry.position),
                     normal: lanes(hit.hit.geometry.normal),
@@ -255,9 +262,12 @@ impl<'a> StaticScene<'a> {
         group: i32,
     ) -> Result<Vec<[Vector; 3]>, &'static str> {
         let mut output = if pool == QueryPool::Ground {
+            use skate_core::physics::board_world::ExternalQueries;
+            let cars = self.vehicles.map_or_else(Vec::new, |v| v.nearby(vec3(center), radius));
             self.world
                 .external_nearby(vec3(center), radius)
                 .into_iter()
+                .chain(cars)
                 .take(64)
                 .map(|triangle| triangle.map(lanes))
                 .collect::<Vec<_>>()

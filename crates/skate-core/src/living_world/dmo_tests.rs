@@ -58,19 +58,18 @@ fn the_score_follows_the_retail_weights() {
     assert!(s(&near) >= 2f32.powi(30), "the keep flag scores like keepalways");
 }
 
-/// The pool cap: with 49 live objects one is evicted per pass, and a new placement only spawns when it outscores
-/// the lowest live one; held props are never culled or evicted.
+/// The pool cap: with 49 live objects one is evicted per pass; a live prop scores with s1 = 2^31 whatever its
+/// placement priority (retail `82C55160`, b657), so the farthest goes first; held props are never culled or evicted.
 #[test]
 fn the_pool_cap_evicts_the_lowest_score_once_per_pass() {
     let s = DmoStreamSettings { cap: 3, ..Default::default() };
-    let mut d = DmoStream::new(vec![placement(1, 10.0, Some(1)), placement(2, 20.0, Some(200)), placement(3, 30.0, Some(200)), placement(4, 40.0, Some(450))], &s);
+    let mut d = DmoStream::new(vec![placement(1, 10.0, Some(1)), placement(2, 20.0, Some(450)), placement(3, 30.0, Some(450)), placement(4, 40.0, Some(1))], &s);
     let held = |id: u32| id == 1;
     let out = d.step(&[at(0.0)], &s, false, &held);
-    // 4 (priority 450) outscores the farther of the two priority-200 props, which makes room.
-    assert_eq!(out, vec![DmoDecision::Spawn(1), DmoDecision::Spawn(2), DmoDecision::Spawn(3), DmoDecision::Evict(3), DmoDecision::Spawn(4)]);
-    // Next pass, still at the cap: one eviction, the lowest live one that is not held (2, priority 200).
+    assert_eq!(out, vec![DmoDecision::Spawn(1), DmoDecision::Spawn(2), DmoDecision::Spawn(3)], "a non-keep candidate never outscores a live prop");
+    // Next pass, at the cap: one eviction, the farthest live one that is not held (3, despite its priority 450).
     let out = d.step(&[at(0.0)], &s, false, &held);
-    assert_eq!(out[0], DmoDecision::Evict(2));
+    assert_eq!(out[0], DmoDecision::Evict(3));
     assert!(d.live.contains(&1), "held: never evicted");
 }
 
@@ -117,4 +116,19 @@ fn a_kept_live_object_is_never_evicted_while_others_can_go() {
     assert!(!evicted.is_empty(), "the full pool still evicts");
     assert!(!evicted.contains(&kept_id), "the kept prop stays: {evicted:?}");
     assert!(d.live.contains(&kept_id));
+}
+
+/// b651 / ask 394: a live object pushed away culls by where it is now (retail `826BAD98` vfunc +16), not by its
+/// placement; once culled it respawns at the placement.
+#[test]
+fn a_moved_object_culls_by_its_current_position() {
+    let s = DmoStreamSettings::default();
+    let mut d = DmoStream::new(vec![placement(1, 50.0, Some(100))], &s);
+    assert_eq!(d.step(&[at(0.0)], &s, false, &NONE), vec![DmoDecision::Spawn(1)]);
+    // Pushed next to the player standing 120 m from its placement: it stays.
+    d.live_at.insert(1, [-70.0, 0.0, 0.0]);
+    assert!(d.step(&[at(-70.0)], &s, false, &NONE).is_empty(), "near the player where it is now");
+    // Left there, the player goes back to its placement (now 120 m from the object): it is culled and the same pass
+    // spawns it again at the placement, next to the player.
+    assert_eq!(d.step(&[at(50.0)], &s, false, &NONE), vec![DmoDecision::Cull(1), DmoDecision::Spawn(1)]);
 }

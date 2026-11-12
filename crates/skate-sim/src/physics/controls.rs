@@ -202,6 +202,7 @@ impl PlayerControls {
                     value: intent.value,
                 }),
         );
+        step_off_for_test(&mut self.intents);
         //GenerateActionGraphIntents82594310 clears the AG map through82BC1B68
         //before Listener::Fill. MG lifecycle intents use a different persistent map.
         self.action_intents.clear();
@@ -296,3 +297,20 @@ mod offboard_tests;
 #[cfg(test)]
 #[path = "controls/bail_tests.rs"]
 mod bail_tests;
+
+/// `SKATE_TEST_STEP_OFF=<tick>`: the player presses the off-board toggle once at that tick, so an idle test run stays at
+/// its teleport spot. Unset in play.
+fn step_off_for_test(intents: &mut Vec<RidingIntent>) {
+    use std::sync::{atomic::{AtomicU32, Ordering}, OnceLock};
+    static AT: OnceLock<Option<u32>> = OnceLock::new();
+    static TICK: AtomicU32 = AtomicU32::new(0);
+    let Some(at) = *AT.get_or_init(|| std::env::var("SKATE_TEST_STEP_OFF").ok().and_then(|v| v.parse().ok())) else { return };
+    if crate::physics::log_actor() != "player" {
+        return;
+    }
+    if TICK.fetch_add(1, Ordering::Relaxed) == at {
+        tracing::info!("SKATE_TEST_STEP_OFF tick {at}");
+        intents.push(RidingIntent { name: "NewToggleOffBoardState", value: 1.0 });
+        intents.push(RidingIntent { name: "ToggleOffBoardState", value: 1.0 });
+    }
+}

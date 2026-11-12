@@ -20,6 +20,13 @@ struct Asset {
     indices: Vec<usize>,
     tree: Octree,
 }
+/// skate_vita: the map rail primitives' chords (start, end), for the off-board searches' query edges.
+impl StaticProvider {
+    pub(crate) fn chords(&self) -> impl Iterator<Item = ([f32; 3], [f32; 3])> + '_ {
+        self.primitives.iter().map(|p| ([p.start[0], p.start[1], p.start[2]], [p.end[0], p.end[1], p.end[2]]))
+    }
+}
+
 pub(crate) struct StaticProvider {
     primitives: Vec<Primitive>,
     metadata: Vec<spline::PrimitiveMetadata>,

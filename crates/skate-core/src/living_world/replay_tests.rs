@@ -36,7 +36,7 @@ fn lines(v: Vec<ReplayLine>) -> BTreeMap<[u8; 16], ReplayLine> {
 }
 
 fn ctx<'a>(position: Vec3, players: &'a [Vec3]) -> BranchContext<'a> {
-    BranchContext { position, forward: [0.0, 0.0, 1.0], speed: 8.0, players, others: &[], in_use: &[], preferred_skill: -1, online: false, chain: ChainConfig::retail(), tricks: Default::default() }
+    BranchContext { position, forward: [0.0, 0.0, 1.0], speed: 8.0, players, others: &[], in_use: &[], preferred_skill: -1, online: false, chain: ChainConfig::retail(), tricks: Default::default(), body: None, valid_lines: None }
 }
 
 #[test]
@@ -192,7 +192,7 @@ fn replay_branch_taken_only_when_it_scores_lower_and_mirrors_on_a_client() {
         let mut ev = Vec::new();
         for _ in 0..30 {
             let s = c.sample(&ls, 0.0).unwrap();
-            let ctx = BranchContext { position: s.position, forward: [0.0, 0.0, 1.0], speed: 9.0, players, others: &[], in_use, preferred_skill: -1, online: false, chain: ChainConfig::retail(), tricks: Default::default() };
+            let ctx = BranchContext { position: s.position, forward: [0.0, 0.0, 1.0], speed: 9.0, players, others: &[], in_use, preferred_skill: -1, online: false, chain: ChainConfig::retail(), tricks: Default::default(), body: None, valid_lines: None };
             c.step(&ls, &mut Decider::Decide(ctx), &mut ev);
         }
         (c, ev)
@@ -309,12 +309,10 @@ fn npc_skater_chains_to_a_line_starting_within_4_m_like_sub_8246c7f8() {
     let mut m = LineCursor::spawn(&ls, id(1), 0);
     m.advance(250, &ls, &mut Decider::Mirror(&chained, &[]), &mut Vec::new());
     assert_eq!(m, c);
-    // The only near line in use by another skater: dead end (line 3 is beyond the radius).
-    let (busy, bev) = run(ChainConfig::retail(), &[id(2)]);
-    assert!(busy.finished && bev.iter().any(|e| matches!(e, CursorEvent::Finished)));
-    // Data-driven: a mod's 8 m radius also reaches line 3; radius 0 never chains.
-    let wide = ChainConfig { radius: 8.0, ..ChainConfig::retail() };
-    assert_eq!(run(wide, &[id(2)]).0.line, id(3));
+    // A line another skater rides is still taken: retail skips no line for being in use (b715 trace, `82458968`).
+    assert_eq!(run(ChainConfig::retail(), &[id(2)]).0.line, id(2));
+    // Data-driven: under a mod's 0.5 m radius line 2 (1 m) is out of reach; radius 0 never chains.
+    assert!(run(ChainConfig { radius: 0.5, ..ChainConfig::retail() }, &[]).0.finished);
     assert!(run(ChainConfig { radius: 0.0, ..ChainConfig::retail() }, &[]).0.finished);
 }
 
@@ -353,12 +351,60 @@ fn the_physics_tier_falls_back_to_the_nearest_free_start_at_any_distance_like_su
     assert_eq!(choose_next_line(&ls, &ls[&id(1)], &at), None, "off by default (the replay tier ends there)");
     let fb = BranchContext { chain: ChainConfig { fallback: true, ..ChainConfig::retail() }, ..at };
     assert_eq!(choose_next_line(&ls, &ls[&id(1)], &fb), Some((id(2), 0)));
-    // Lines in use are skipped; the current line is never its own fallback.
+    // No in-use skip and the skater's own line is a candidate (b715: `82458968` / `8246C7F8` exclude neither).
     let busy = [id(2)];
     let fb_busy = BranchContext { in_use: &busy, ..fb };
-    assert_eq!(choose_next_line(&ls, &ls[&id(1)], &fb_busy), Some((id(3), 0)));
+    assert_eq!(choose_next_line(&ls, &ls[&id(1)], &fb_busy), Some((id(2), 0)));
     let alone = lines(vec![along(1, [0.0; 3], [0.0, 1.0], 21)]);
-    assert_eq!(choose_next_line(&alone, &alone[&id(1)], &fb), None);
+    assert_eq!(choose_next_line(&alone, &alone[&id(1)], &fb), Some((id(1), 0)), "alone: back to its own line's start");
+}
+
+/// b701 R9 / R10: a simulated skater searches from its body point; with no hit the nearest invalid start wins over a
+/// valid one at least 6 m away, a valid one nearer than 6 m wins, and with no valid line the nearest invalid.
+#[test]
+fn the_line_end_search_starts_at_the_body_and_falls_back_like_mode_1() {
+    let players: [Vec3; 0] = [];
+    let end = along(1, [0.0; 3], [0.0, 1.0], 21);
+    // Line 2 starts 3.9 m from the body point (0, 0, 24) but 6 m from the last node (0, 0, 20).
+    let ahead = along(2, [0.0, 0.0, 26.0], [0.0, 1.0], 10);
+    let ls = lines(vec![end.clone(), ahead]);
+    let at = ctx([0.0, 0.0, 20.0], &players);
+    assert_eq!(choose_next_line(&ls, &ls[&id(1)], &at), None, "6 m from the last node");
+    let body = BranchContext { body: Some(BodyGate { point: [0.0, 0.0, 22.2], may_branch: true, heading: None }), ..at };
+    assert_eq!(choose_next_line(&ls, &ls[&id(1)], &body), Some((id(2), 0)), "3.8 m from the body point");
+    // Fallback: line 3 (valid) 10 m away, line 5 (invalid) 8 m away.
+    let valid = [id(3)];
+    let fb = BranchContext { chain: ChainConfig { fallback: true, ..ChainConfig::retail() }, valid_lines: Some(&valid), ..at };
+    let far = lines(vec![end.clone(), along(3, [10.0, 0.0, 20.0], [0.0, 1.0], 10), along(5, [8.0, 0.0, 20.0], [0.0, 1.0], 10)]);
+    assert_eq!(choose_next_line(&far, &far[&id(1)], &fb), Some((id(5), 0)), "invalid nearer, valid >= 6 m");
+    let near = lines(vec![end.clone(), along(3, [5.0, 0.0, 20.0], [0.0, 1.0], 10), along(5, [4.5, 0.0, 20.0], [0.0, 1.0], 10)]);
+    assert_eq!(choose_next_line(&near, &near[&id(1)], &fb), Some((id(3), 0)), "valid under 6 m");
+    let none_valid = lines(vec![end, along(5, [9.0, 0.0, 20.0], [0.0, 1.0], 10)]);
+    assert_eq!(choose_next_line(&none_valid, &none_valid[&id(1)], &fb), Some((id(5), 0)), "no valid line");
+}
+
+/// b701 2d: a simulated cursor (body gate set) holds on the last node with nothing to chain to; the replay tier ends.
+#[test]
+fn a_simulated_cursor_holds_at_a_dead_end_and_the_replay_tier_finishes() {
+    let players: [Vec3; 0] = [];
+    // Its own start 9 m back, beyond the 4 m radius (its own line is a candidate, b715), and no fallback here.
+    let ls = lines(vec![along(1, [0.0; 3], [0.0, 1.0], 10)]);
+    let at = ctx([0.0, 0.0, 9.0], &players);
+    let body = BranchContext { body: Some(BodyGate { point: [0.0, 0.0, 9.0], may_branch: true, heading: None }), ..at };
+    let mut held = LineCursor::new(id(1), 0);
+    let mut out = Vec::new();
+    for _ in 0..400 {
+        held.step(&ls, &mut Decider::Decide(body), &mut out);
+    }
+    assert!(!held.finished && !out.iter().any(|e| matches!(e, CursorEvent::Finished)));
+    let frames = held.frames;
+    held.step(&ls, &mut Decider::Decide(body), &mut out);
+    assert_eq!(held.frames, frames, "no progress while held");
+    let mut replay = LineCursor::new(id(1), 0);
+    for _ in 0..400 {
+        replay.step(&ls, &mut Decider::Decide(at), &mut out);
+    }
+    assert!(replay.finished);
 }
 
 #[test]
@@ -533,11 +579,7 @@ fn render_ride(ls: &BTreeMap<[u8; 16], ReplayLine>, start: [u8; 16], records: Op
     (max_move, max_turn, times, made)
 }
 
-/// Fix 14 (jitter): a branch moves the root onto a line 0.8 m to the side with another
-/// orientation, a chain onto a start 1.5 m off the end. Rendered at 144 Hz between the 60 Hz
-/// ticks, the root never jumps (each step stays near the 6 m/s line speed plus the decaying
-/// switch offset), the clip time grows by the render step, and a client mirroring the records
-/// draws the identical ride.
+/// Fix 14 (jitter): branch and chain roots never jump at 144 Hz; a mirroring client draws the same.
 #[test]
 fn npc_skater_render_is_smooth_across_branches_and_chains() {
     let turned = [128, 128 + 33, 128, 128 + 123]; // about 30 deg about +Y
@@ -553,8 +595,8 @@ fn npc_skater_render_is_smooth_across_branches_and_chains() {
     let ls = lines(vec![a, b, c3]);
     // Branch at node 10 (frame 100), chain at line 2's last node (frame 100 + 20 x 10).
     let all = [
-        BranchRecord { frame: 100, from_line: id(1), from_node: 10, to_line: id(2), to_node: 10 },
-        BranchRecord { frame: 300, from_line: id(2), from_node: 30, to_line: id(3), to_node: 0 },
+        BranchRecord { frame: 100, from_line: id(1), from_node: 10, to_line: id(2), to_node: 10, respawn: false },
+        BranchRecord { frame: 300, from_line: id(2), from_node: 30, to_line: id(3), to_node: 0, respawn: false },
     ];
     let speed_step = 6.0 / 144.0;
     let (moved, turned_by, times, _) = render_ride(&ls, id(1), Some(&all), SWITCH_BLEND_SECONDS, 6.0, 144.0);
@@ -601,13 +643,7 @@ fn npc_skater_render_is_smooth_on_a_seeded_line_network() {
     }
 }
 
-/// Fix 16 rule, now a mod option (`keep_facing = true`, not retail): the skater keeps the way it
-/// faces across a chain or branch. Line 2 was recorded riding the other way round (its skater
-/// frame faces -Z while it travels +Z, fakie), and then turns forward again with a recorded revert.
-/// With the option the NPC keeps facing +Z there and the recorded revert turns it into fakie (the
-/// source of the backwards riding, see the next test). Retail default (`keep_facing = false`): the
-/// recorded facing, the path frame of the node. Deterministic: a client mirroring the record derives
-/// the same flip.
+/// Fix 16 rule as mod option (`keep_facing`, not retail) vs the retail recorded facing: docs/hails-additions/26c-living-world-npc-skaters.md#test-keep-facing-option
 #[test]
 fn npc_skater_keeps_its_facing_across_a_line_switch() {
     const BACKWARD: [u8; 4] = [128, 255, 128, 128]; // (0, 1, 0, 0): +Z turned to -Z.
@@ -663,15 +699,7 @@ fn npc_skater_keeps_its_facing_across_a_line_switch() {
     assert!((rotate(q, [0.0, 0.0, 1.0])[2] + 1.0).abs() < 1e-5 && (rotate(q, [0.0, 1.0, 0.0])[1] - 1.0).abs() < 1e-5);
 }
 
-/// Fix 23 (NPC skaters riding backwards, user test 6), now under the retail rule (fix 23
-/// corrected): a switch stores line `+592/+600` and node `+816` only ([code] `sub_8246C7F8`) and
-/// leaves the latched flip alone; spawned forward, the flip is clear on every line here. Ride:
-/// line 1 forward, chain onto line 2 (recorded fakie for 15 nodes, then a
-/// recorded revert to forward), chain onto line 3 (forward). With the retail rule the drawn skater
-/// never faces against its travel outside a recorded fakie stretch, on any frame once the switch
-/// blend is over, and it rides line 3 forward. The fix 16 option reproduces the bug: it carries the
-/// turn on and rides the forward-recorded part of line 2 and all of line 3 backwards. Host and a
-/// mirroring client agree frame by frame.
+/// Fix 23 under the retail rule: switches leave the latched flip alone; fix 16 reproduces the bug: docs/hails-additions/26c-living-world-npc-skaters.md#test-retail-facing-over-switches
 #[test]
 fn npc_skater_never_rides_a_forward_recorded_line_backwards_across_switches() {
     const BACKWARD: [u8; 4] = [128, 255, 128, 128];
@@ -755,13 +783,7 @@ fn path_frame_turns_the_board_when_the_node_is_board_flipped_like_sub_82453a58()
     assert!((rotate(path_frame(&n), [0.0, 0.0, 1.0])[0] - 1.0).abs() < 1e-3);
 }
 
-/// Fix 23 rule, now the NOT RETAIL [`FacingRule::PerNode`] mod option: the drawn skater faces the
-/// path frame's riding direction per node. A recorder riding
-/// switch (skater frame turned round, board rolling nose first, flag clear) is drawn forward; a
-/// board-flipped node (board turned round, flag set, skater forward) stays forward; a recorded fakie
-/// node (path frame against travel) is drawn fakie. Airborne nodes keep the last grounded turn, so a
-/// shove-it spinning the board in the air does not turn the skater. A cursor ride over a switch
-/// stretch is never drawn against its travel.
+/// Fix 23 rule as the NOT RETAIL `PerNode` mod option: per-node facing of the path frame: docs/hails-additions/26c-living-world-npc-skaters.md#test-per-node-facing
 #[test]
 fn drawn_skater_faces_the_retail_path_frame_direction() {
     const BACKWARD: [u8; 4] = [128, 255, 128, 128];
@@ -821,15 +843,7 @@ fn drawn_skater_faces_the_retail_path_frame_direction() {
     assert!(!retail.flip && retail_backwards > 50, "{retail_backwards}");
 }
 
-/// Retail facing rule (fix 23 corrected, [`FacingRule::RidingEntry`], a mod option until the stance
-/// mirror lands): spawn latch. The character
-/// spawns with the node world frame ([code] `sub_8245C548` -> `sub_82453C58`, the path frame on
-/// a riding node) and the flip latches on that first riding entry ([code] `sub_8246A700`:
-/// `dot(recorded skater row 2, character row 2) < 0`). A recorder riding switch at the spawn node
-/// (skater frame turned round, board forward) sets the flip; the drawn skater is the recorded
-/// frame turned 180 deg about up (rows 0 and 2 negated, [code] `sub_8246B358`). Spawned in the
-/// air, retail's first update sees the takeoff edge (b354); off board, nothing is latched; on the
-/// ground the same test is a stand-in.
+/// Retail facing rule: spawn latch (8245C548 -> 82453C58, 8246A700, 8246B358; b354): docs/hails-additions/26c-living-world-npc-skaters.md#test-spawn-latch
 #[test]
 fn retail_flip_latches_at_spawn_against_the_node_world_frame() {
     const BACKWARD: [u8; 4] = [128, 255, 128, 128];
@@ -866,11 +880,7 @@ fn retail_flip_latches_at_spawn_against_the_node_world_frame() {
     assert!(c.flip && fz(c.sample(&ls, 0.0).unwrap().skater) < -0.99);
 }
 
-/// Retail facing rule: the flip is held across a line switch ([code] `sub_8246C7F8` /
-/// `sub_8246BEE0` store line and node only) and latched again only at takeoff (b354: `+928` is
-/// the airborne byte; here a chain onto a line that starts in the air), against the character's
-/// forward (the drawn body, still the old line's at the edge); the landing keeps it. Host and a
-/// mirroring client agree on the flip frame by frame.
+/// Retail facing rule: the flip holds across switches and relatches only at takeoff (b354).
 #[test]
 fn retail_flip_is_held_across_a_switch_and_relatched_at_takeoff() {
     const BACKWARD: [u8; 4] = [128, 255, 128, 128];
@@ -899,10 +909,7 @@ fn retail_flip_is_held_across_a_switch_and_relatched_at_takeoff() {
     assert!(flips.iter().all(|f| f.3), "held across the switch");
     assert_eq!(c.sample(&ls, 0.0).unwrap().skater, turn_about_up(target_skater(&ls[&id(2)], c.node as usize, c.node as usize + 1, c.frame_in_segment as f32 / 10.0)));
     assert!(fz(c.sample(&ls, 0.0).unwrap().skater) < -0.99);
-    // Relatched at takeoff: line 1 forward, chain onto line 3 whose first nodes are airborne and
-    // recorded turned round (the recorder jumped in fakie). At the edge the body still faces the
-    // old way (+Z): dot < 0 sets the flip, however long the air lasts, and the landing keeps it,
-    // so the landed line is drawn on the body's side.
+    // Relatched at takeoff: chain onto an airborne fakie start; the flip sets and the landing keeps it.
     let air_line = |frames: u8| {
         let mut l = along(3, [0.0, 0.0, 21.0], [0.0, 1.0], 31);
         for (k, n) in l.nodes.iter_mut().enumerate() {
@@ -1004,15 +1011,16 @@ fn replay_cursor_keeps_a_phase_history_with_the_span_trick() {
     let mut c = LineCursor::spawn(&ls, id(1), 0);
     c.advance(29, &ls, &mut Decider::Stay, &mut Vec::new());
     let h: Vec<(PhaseEntry, u64)> = c.phase_history().collect();
-    let e = |phase, since, trick| PhaseEntry { phase, since, trick };
+    // `trick_since` = the frame the span's START_TRICK was crossed (kept after the span).
+    let e = |phase, since, trick, trick_since| PhaseEntry { phase, since, trick, trick_since };
     assert_eq!(
         h,
         vec![
-            (e(ReplayPhase::Rolling, 28, -1), 1),
-            (e(ReplayPhase::Air, 20, -1), 9),
-            (e(ReplayPhase::AirTrick, 14, 96), 15),
-            (e(ReplayPhase::GroundTrick, 10, 96), 19),
-            (e(ReplayPhase::Rolling, 0, -1), 29),
+            (e(ReplayPhase::Rolling, 28, -1, 10), 1),
+            (e(ReplayPhase::Air, 20, -1, 10), 9),
+            (e(ReplayPhase::AirTrick, 14, 96, 10), 15),
+            (e(ReplayPhase::GroundTrick, 10, 96, 10), 19),
+            (e(ReplayPhase::Rolling, 0, -1, 0), 29),
         ]
     );
     // Spawned inside the span: the trick comes from the span's START_TRICK node.
@@ -1024,10 +1032,7 @@ fn replay_cursor_keeps_a_phase_history_with_the_span_trick() {
     assert_eq!(c, d);
 }
 
-/// Retail riding-fakie bit on the drawn body (`UpdateRidingFakie82BB2330`): a body drawn against
-/// travel on the ground sets it once the spawn window (`after_teleport_seconds`) is over, the air
-/// clears it, the landing sets it again; the fakie channel fades in and out over 0.3 s. The
-/// per-node rule draws the same line forward and never sets it. Settings are data.
+/// Retail riding-fakie bit on the drawn body (82BB2330): set, air clears, landing sets; channel fades 0.3 s.
 #[test]
 fn retail_fakie_bit_follows_the_drawn_body_against_travel() {
     const BACKWARD: [u8; 4] = [128, 255, 128, 128];
@@ -1091,4 +1096,222 @@ fn steering_target_at_cursor_b_matches_the_cursor_pose_like_sub_8246de38() {
     let last = line_target_at(line, (7, 0.9)).unwrap();
     assert!((last.position[2] - 3.5).abs() < 1e-5);
     assert!(line_target_at(line, (8, 0.0)).is_none());
+}
+
+/// b674: a simulated skater (`body`) takes no branch while retail's gate is shut (airborne, a perform / grind trick),
+/// and is scored from its body point when it is open.
+#[test]
+fn a_simulated_skater_branches_only_through_the_gate() {
+    let ls = branching();
+    let players = [[4.85, 0.0, 8.4]];
+    let run = |gate: Option<bool>| {
+        let mut c = LineCursor::spawn(&ls, id(1), 0);
+        let mut ev = Vec::new();
+        for _ in 0..30 {
+            let s = c.sample(&ls, 0.0).unwrap();
+            let body = gate.map(|may_branch| BodyGate { point: s.position, may_branch, heading: None });
+            let ctx = BranchContext { position: s.position, speed: 9.0, body, ..ctx(s.position, &players) };
+            c.step(&ls, &mut Decider::Decide(ctx), &mut ev);
+        }
+        ev.iter().filter(|e| matches!(e, CursorEvent::Branch(_))).count()
+    };
+    assert_eq!(run(None), 1, "the replay tier branches as before");
+    assert_eq!(run(Some(true)), 1, "an open gate branches from the body");
+    assert_eq!(run(Some(false)), 0, "a shut gate keeps the line");
+}
+
+/// Stage 3 (b701 2e, b712): the simulated skater's line end chains on the trigger tick from mid-segment, then the
+/// 4.5 m lost test runs on the line it is on; a client applies the host's mid-segment record at the top of `step`.
+mod line_end_stage_3 {
+    use super::*;
+    use crate::living_world::path_follow::{PathFollow, PathTuning};
+
+    fn body_ctx<'a>(pos: Vec3, players: &'a [Vec3]) -> BranchContext<'a> {
+        let at = ctx(pos, players);
+        BranchContext { body: Some(BodyGate { point: pos, may_branch: true, heading: None }), chain: ChainConfig { fallback: true, ..ChainConfig::retail() }, ..at }
+    }
+
+    /// Line 1 (nodes 1 m apart on +z, 0..9), the cursor 5 frames into node 8, the follower on the path at A = (8, 0.85).
+    fn at_the_trigger(ls: &BTreeMap<[u8; 16], ReplayLine>) -> (LineCursor, PathFollow, Vec3) {
+        let mut c = LineCursor::new(id(1), 8);
+        for _ in 0..5 {
+            c.step(ls, &mut Decider::Stay, &mut Vec::new());
+        }
+        let t = PathTuning::default();
+        let f = PathFollow { a: (8, 0.85), b: (8, 0.85), on_path: true, search_start: 8, ..PathFollow::start(8, &t) };
+        (c, f, [0.0, 0.0, 8.85])
+    }
+
+    #[test]
+    fn a_simulated_line_end_chains_on_the_trigger_tick_from_mid_segment() {
+        let players: [Vec3; 0] = [];
+        let ls = lines(vec![along(1, [0.0; 3], [0.0, 1.0], 10), along(2, [0.0, 0.0, 11.0], [0.0, 1.0], 10)]);
+        let (mut c, mut f, pos) = at_the_trigger(&ls);
+        let t = PathTuning::default();
+        assert!(f.search(&ls[&id(1)], pos, 0.0, &t), "past 0.8 of the second-last segment");
+        let mut out = Vec::new();
+        assert_eq!(c.line_end_chain(&ls, &body_ctx(pos, &players), &mut out), Some((id(2), 0)));
+        assert_eq!(out, vec![CursorEvent::Branch(BranchRecord { frame: 5, from_line: id(1), from_node: 8, to_line: id(2), to_node: 0, respawn: false })]);
+        assert!(c.line == id(2) && c.node == 0 && c.frame_in_segment == 0 && !c.finished);
+        let mut f = f.switch_to(0);
+        f.line_end_lost(&ls[&id(2)], pos, 0.0, &t);
+        assert!(!f.on_path && f.search_start == 0 && !f.lost, "2.15 m from the new line: not lost");
+    }
+
+    #[test]
+    fn a_far_fallback_chain_raises_the_line_end_lost() {
+        let players: [Vec3; 0] = [];
+        // Line 2 starts 7.15 m away (beyond 4 m), nearer than the skater's own start (8.85 m back).
+        let ls = lines(vec![along(1, [0.0; 3], [0.0, 1.0], 10), along(2, [0.0, 0.0, 16.0], [0.0, 1.0], 10)]);
+        let t = PathTuning::default();
+        for (speed, lost) in [(0.0, true), (14.1, false)] {
+            let (mut c, f, pos) = at_the_trigger(&ls);
+            assert_eq!(c.line_end_chain(&ls, &body_ctx(pos, &players), &mut Vec::new()), Some((id(2), 0)), "mode 1 fallback beyond the radius");
+            let mut f = f.switch_to(0);
+            f.line_end_lost(&ls[&id(2)], pos, speed, &t);
+            assert_eq!(f.lost, lost, "7.15 m away at {speed} m/s");
+        }
+    }
+
+    #[test]
+    fn alone_the_fallback_takes_its_own_lines_start_and_tests_lost_there() {
+        let players: [Vec3; 0] = [];
+        let ls = lines(vec![along(1, [0.0; 3], [0.0, 1.0], 10)]);
+        let (mut c, f, _) = at_the_trigger(&ls);
+        let mut out = Vec::new();
+        // Retail excludes no line from the mode 1 search, its own neither (b715): the start 10 m back.
+        assert_eq!(c.line_end_chain(&ls, &body_ctx([5.0, 0.0, 9.0], &players), &mut out), Some((id(1), 0)));
+        assert!(c.line == id(1) && c.node == 0 && out.len() == 1);
+        let mut f = f.switch_to(0);
+        f.line_end_lost(&ls[&id(1)], [5.0, 0.0, 9.0], 0.0, &PathTuning::default());
+        assert!(f.lost, "10.3 m from its own start: lost at 4.5 m");
+    }
+
+    #[test]
+    fn two_skaters_at_one_line_end_take_different_lines_in_id_order() {
+        let players: [Vec3; 0] = [];
+        let ls = lines(vec![along(1, [0.0; 3], [0.0, 1.0], 10), along(2, [0.0, 0.0, 10.5], [0.0, 1.0], 10), along(3, [1.5, 0.0, 10.0], [0.0, 1.0], 10)]);
+        let (mut first, _, pos) = at_the_trigger(&ls);
+        let (mut second, ..) = at_the_trigger(&ls);
+        let a = first.line_end_chain(&ls, &body_ctx(pos, &players), &mut Vec::new()).expect("a line");
+        // The first skater's own entry moved (b620): the second sees its line in use.
+        let in_use = [a.0];
+        let others = [(a.0, a.1)];
+        let b = second.line_end_chain(&ls, &BranchContext { in_use: &in_use, others: &others, ..body_ctx(pos, &players) }, &mut Vec::new()).expect("another line");
+        assert_ne!(a.0, b.0, "{a:?} {b:?}");
+    }
+
+    #[test]
+    fn a_mirrored_cursor_applies_a_switch_recorded_between_nodes_once() {
+        let players: [Vec3; 0] = [];
+        let ls = lines(vec![along(1, [0.0; 3], [0.0, 1.0], 10), along(2, [0.0, 0.0, 11.0], [0.0, 1.0], 10)]);
+        let (mut host, _, pos) = at_the_trigger(&ls);
+        let mut records = Vec::new();
+        host.line_end_chain(&ls, &body_ctx(pos, &players), &mut records);
+        let records: Vec<BranchRecord> = records.into_iter().filter_map(|e| if let CursorEvent::Branch(r) = e { Some(r) } else { None }).collect();
+        host.step(&ls, &mut Decider::Stay, &mut Vec::new());
+        let mut client = LineCursor::new(id(1), 8);
+        let mut out = Vec::new();
+        for _ in 0..6 {
+            client.step(&ls, &mut Decider::Mirror(&records, &[]), &mut out);
+        }
+        assert_eq!((client.line, client.node, client.frame_in_segment, client.frames), (host.line, host.node, host.frame_in_segment, host.frames));
+        for _ in 0..30 {
+            client.step(&ls, &mut Decider::Mirror(&records, &[]), &mut out);
+        }
+        assert_eq!(out.iter().filter(|e| matches!(e, CursorEvent::Branch(_))).count(), 1, "applied once");
+    }
+}
+
+/// b706: the branch / line-end angle is taken about the skater frame's up row (`824536C8` projects both vectors onto
+/// the plane across the axis): the same as world Y on flat ground, different on a bank.
+#[test]
+fn the_branch_angle_is_taken_about_the_skaters_up_axis() {
+    for (a, b) in [([0.0, 0.0, 1.0], [1.0, 0.0, 1.0]), ([0.3, 0.2, 1.0], [-1.0, 0.5, 0.2]), ([1.0, 0.0, 0.0], [0.0, 0.0, -1.0])] {
+        assert_eq!(angle_about(a, b, [0.0, 1.0, 0.0]).to_bits(), yaw_angle(a, b).to_bits(), "{a:?} {b:?}");
+    }
+    // Banked 45 degrees about the forward (+z): a node ahead and raised along the skater's up is dead ahead about that
+    // up, but about 35 degrees off about world Y.
+    let s = std::f32::consts::FRAC_1_SQRT_2;
+    let up = [-s, s, 0.0];
+    let ahead_on_bank = [-s, s, 1.0];
+    assert!(angle_about([0.0, 0.0, 1.0], ahead_on_bank, up).abs() < 1e-6);
+    assert!((yaw_angle([0.0, 0.0, 1.0], ahead_on_bank).abs() - s.atan()).abs() < 1e-5);
+    // The skater heading comes from the body gate when set.
+    let players: [Vec3; 0] = [];
+    let ls = lines(vec![along(1, [0.0; 3], [0.0, 1.0], 10)]);
+    let at = ctx([0.0, 0.0, 2.0], &players);
+    let facing_away = BranchContext { forward: [0.0, 0.0, -1.0], ..at };
+    assert_eq!(branch_score(&ls[&id(1)], 2, &facing_away), None, "180 degrees off");
+    let gated = BranchContext { body: Some(BodyGate { point: [0.0, 0.0, 2.0], may_branch: true, heading: Some(([0.0, 0.0, 1.0], [0.0, 1.0, 0.0])) }), ..facing_away };
+    assert!(branch_score(&ls[&id(1)], 2, &gated).is_some(), "the deck's forward from the gate wins");
+}
+
+/// b711 O1 / item 2: a client following a simulated NPC from the replicated state (the host's follow clock per tick,
+/// its branch / restart records, the hold flag) has the host's cursor every tick: across a mid-segment line end
+/// chain, a restart (frames keep running, so records stay unique) and a hold at a dead end.
+#[test]
+fn a_client_follows_a_simulated_cursor_through_a_chain_a_restart_and_a_hold() {
+    let players: [Vec3; 0] = [];
+    let ls = lines(vec![along(1, [0.0; 3], [0.0, 1.0], 10), along(2, [0.0, 0.0, 11.0], [0.0, 1.0], 10)]);
+    let drive = |c: &mut LineCursor, target: u64, decider: &mut Decider, out: &mut Vec<CursorEvent>| {
+        while c.frames < target && !c.finished {
+            let before = c.frames;
+            c.step(&ls, decider, out);
+            if c.frames == before && !c.finished {
+                break;
+            }
+        }
+    };
+    let mut host = LineCursor::spawn(&ls, id(1), 0);
+    let mut client = LineCursor::spawn(&ls, id(1), 0);
+    host.hold_at_end = true;
+    client.hold_at_end = true;
+    let mut records: Vec<BranchRecord> = Vec::new();
+    let mut target = 0u64;
+    let (mut chained, mut restarted) = (false, false);
+    for tick in 0..400u64 {
+        // The projection holds the clock back now and then (B not ahead).
+        if tick % 7 != 3 {
+            target += 1;
+        }
+        drive(&mut host, target, &mut Decider::Stay, &mut Vec::new());
+        client.apply_records(&ls, &Decider::Mirror(&records, &[]), &mut Vec::new());
+        drive(&mut client, target, &mut Decider::Mirror(&records, &[]), &mut Vec::new());
+        assert_eq!((client.line, client.node, client.frame_in_segment, client.frames, client.finished), (host.line, host.node, host.frame_in_segment, host.frames, host.finished), "tick {tick}");
+        assert_eq!(client.phase_history().collect::<Vec<_>>(), host.phase_history().collect::<Vec<_>>(), "tick {tick}");
+        // After the step, as `simulate` does: the line end chain mid-segment, later a restart (re-snap) back on line 2.
+        let mut out = Vec::new();
+        if !chained && host.line == id(1) && host.node == 8 && host.frame_in_segment >= 5 {
+            let pos = [0.0, 0.0, 8.0 + host.frame_in_segment as f32 / 10.0];
+            let ctx = BranchContext { body: Some(BodyGate { point: pos, may_branch: true, heading: None }), chain: ChainConfig { fallback: true, ..ChainConfig::retail() }, ..ctx(pos, &players) };
+            chained = host.line_end_chain(&ls, &ctx, &mut out).is_some();
+        } else if chained && !restarted && host.line == id(2) && host.node == 5 {
+            host.respawn(&ls, id(2), 3, &mut out);
+            restarted = true;
+        }
+        records.extend(out.into_iter().filter_map(|e| if let CursorEvent::Branch(r) = e { Some(r) } else { None }));
+    }
+    assert!(chained && restarted && records.len() == 2 && records[1].respawn, "{records:?}");
+    assert!(host.line == id(2) && host.node == 9 && !host.finished && !client.finished, "both hold at the dead end");
+    // Without the hold flag a mirrored cursor finishes there (the old behaviour).
+    let mut free = LineCursor::spawn(&ls, id(1), 0);
+    drive(&mut free, target, &mut Decider::Mirror(&records, &[]), &mut Vec::new());
+    assert!(free.finished);
+}
+
+/// b715 (recomp trace of an ambient bail): solid for 4 s, a 1 s fade out (timer +0x750 at 0.983 one tick before the
+/// place at 5.0 s), and a mod can turn it off or move it.
+#[test]
+fn a_bailed_skater_fades_out_over_the_last_second_before_its_respawn() {
+    use crate::living_world::leave_fade::LeaveFadeConfig;
+    let c = LeaveFadeConfig::retail();
+    assert_eq!(c.bail_alpha(0, 300), 1.0);
+    assert_eq!(c.bail_alpha(240, 300), 1.0, "the fade starts 1 s before the respawn");
+    assert!((c.bail_alpha(270, 300) - 0.5).abs() < 1e-6);
+    assert!((c.bail_alpha(299, 300) - (1.0 - 59.0 / 60.0)).abs() < 1e-6, "retail's timer reads 0.983 at the place");
+    assert_eq!(c.bail_alpha(400, 300), 0.0);
+    assert_eq!(LeaveFadeConfig { bail_fade: false, ..c }.bail_alpha(299, 300), 1.0);
+    assert_eq!(LeaveFadeConfig { bail_fade_lead_seconds: 2.0, ..c }.bail_alpha(180, 300), 1.0);
+    assert!(LeaveFadeConfig { bail_fade_lead_seconds: 2.0, ..c }.bail_alpha(200, 300) < 1.0);
 }

@@ -121,6 +121,9 @@ pub(crate) struct SkaterRuntime {
     pub collision_maximum_error: Option<f32>,
     /// Ticks left of the SKITCH_RELEASE_TRACE log after leaving Skitching (the stopped-car release bail, 2026-10-17).
     pub skitch_release_trace: u8,
+    /// The highest pose error logged in this skitch hold (SKITCH_HOLD_POSE, research b687: the stopped-car release
+    /// bail's error builds up during the hold).
+    pub skitch_hold_peak: f32,
     /// A new actor's trajectory selector reset waits for its placement (b310): the placement runs the old state's Exit
     /// first (`frame.rs`, after `enter_after_teleport`), and KnownAir's Exit reads the selection.
     pub trajectory_reset_pending: bool,
@@ -165,6 +168,7 @@ impl SkaterRuntime {
         self.takedown = None;
         self.ai_physics = None;
         self.skitch_release_trace = 0;
+        self.skitch_hold_peak = 0.0;
         Ok(())
     }
     /// Prepare all settings before committing; never replace active physics state.
@@ -459,6 +463,7 @@ impl SkaterRuntime {
             collision_extra_errors: [[0.0; 4]; 2],
             collision_maximum_error: None,
             skitch_release_trace: 0,
+            skitch_hold_peak: 0.0,
             trajectory_reset_pending: false,
             solved_drives: None,
             foot_ik,

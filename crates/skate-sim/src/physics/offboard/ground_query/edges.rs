@@ -1,7 +1,7 @@
 use skate_core::madd::Madd as _;
 use super::{Bounds, EdgeBody, PrimaryEdges, Scene, Segment, transform};
 use skate_core::player::offboard::ground_query::{Edge, EdgeSearch, Frame};
-fn append(output: &mut Vec<Edge>, segments: &[Segment], frame: Frame, query: Bounds) {
+fn append(output: &mut Vec<Edge>, segments: impl IntoIterator<Item = Segment>, frame: Frame, query: Bounds) {
     for segment in segments {
         if output.len() == 40 {
             break;
@@ -19,7 +19,7 @@ fn body(output: &mut Vec<Edge>, body: &EdgeBody<'_>, query: Bounds) {
         transform::bounds(body.local_to_world, body.local_bounds),
         query,
     ) {
-        append(output, body.segments, body.local_to_world, query);
+        append(output, body.segments.iter().copied(), body.local_to_world, query);
     }
 }
 pub(super) fn candidates(scene: &Scene<'_>, search: &EdgeSearch) -> Vec<Edge> {
@@ -28,7 +28,8 @@ pub(super) fn candidates(scene: &Scene<'_>, search: &EdgeSearch) -> Vec<Edge> {
         max: search.max,
     };
     let mut output = Vec::with_capacity(40);
-    append(&mut output, scene.static_edges, Frame::IDENTITY, query);
+    append(&mut output, scene.static_edges.iter().copied(), Frame::IDENTITY, query);
+    append(&mut output, scene.static_metadata.iter().map(|s| Segment { edge: Edge { start: s.start, end: s.end }, local_bounds: Bounds { min: s.local_bounds.min, max: s.local_bounds.max } }), Frame::IDENTITY, query);
     match &scene.primary_edges {
         PrimaryEdges::Normal { dynamic, vehicles } => {
             let center = transform::scale(transform::add(query.min, query.max), 0.5);
@@ -40,7 +41,7 @@ pub(super) fn candidates(scene: &Scene<'_>, search: &EdgeSearch) -> Vec<Edge> {
                         continue;
                     }
                     //82C4C4E0 checks individual segment bounds, no asset bound gate.
-                    append(&mut output, entry.segments, entry.local_to_world, query);
+                    append(&mut output, entry.segments.iter().copied(), entry.local_to_world, query);
                     if output.len() == 40 {
                         break;
                     }

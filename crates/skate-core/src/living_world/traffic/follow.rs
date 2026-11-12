@@ -87,8 +87,11 @@ pub struct FollowParams {
     /// The lead standoff, a factor of the car's length (`+3664` = s x `Hash_73A1989BB90C93BA`, 0.5, family 0.6); the
     /// state update passes half of it to the lead rule (`82C38390` -> `82C41120`; b162 M1).
     pub lead_standoff_factor: f32,
-    /// Standoff of the obstacle look-ahead and the junction query's exit-room check, m. Engine value (the retail
-    /// source of these two is not read): 2.0.
+    /// The obstacle standoff, a factor of the car's length (`+3668` = s x `Hash_30313EA6F282C874`, 0.5, `82C3CDD0`;
+    /// read by `82C412D8` and the look-ahead quad; b688).
+    pub obstacle_standoff_factor: f32,
+    /// Engine spacing value, m (2.0): no longer read by the driver (the junction room check uses `+3664` since
+    /// 2026-10-29, b696); kept for the spacing test.
     pub min_gap: f32,
     /// The skater-behind rule (scan range, speeds, braking distances, release grace; b63).
     pub skater: super::skater_scan::SkaterFollowParams,
@@ -133,6 +136,7 @@ impl Default for FollowParams {
             jerk: 0.8,
             stop_standoff_factor: 0.5,
             lead_standoff_factor: 0.5,
+            obstacle_standoff_factor: 0.5,
             min_gap: 2.0,
             skater: Default::default(),
             manoeuvre: Default::default(),
@@ -252,8 +256,13 @@ impl Car {
         0.5 * self.length * self.params.lead_standoff_factor
     }
 
-    /// The query's look-ahead: the junction standoff (the window is `look_ahead + speed`). Whether the query's own
-    /// Approach test (`remaining >= look_ahead`) reads the same value is not read [inferred].
+    /// The obstacle standoff: `+3668` (mover vt+108), m.
+    pub fn obstacle_standoff(&self) -> f32 {
+        self.length * self.params.obstacle_standoff_factor
+    }
+
+    /// The query's look-ahead: the junction standoff (the window is `look_ahead + speed`); the query's Approach test
+    /// reads the same `+3660` (`82E11E90`, b696).
     pub fn look_ahead(&self) -> f32 {
         self.junction_standoff()
     }
@@ -266,7 +275,8 @@ impl Car {
             place: self.cursor.place,
             distance: self.cursor.distance,
             look_ahead: self.look_ahead(),
-            min_gap: self.params.min_gap,
+            // The junction query's room check reads mover vt+104 = `+3664` in full (`82E11E90`, b696).
+            min_gap: self.length * self.params.lead_standoff_factor,
             // Mover getter 82C34598: +3424 bit 0x04 or held (+4402 bit 0x02); the entered-on-red half is open.
             flagged: self.held,
         }
@@ -591,7 +601,10 @@ pub fn step(net: &RoadNetwork, signals: &SignalClock, cars: &mut [Car], dt: f32,
         let range = me.speed + lead_standoff;
         let mut limit: Option<f32> = None; // max distance the centre may reach along the current place
         let mut lead_close = None;
+        // `+3752`: the gap to the lead alone (the lane-change gate reads it, `82C39F78`; b696).
+        let mut lead_gap = f32::INFINITY;
         if let Some((l, gap, _)) = lead(net, cars, i, range) {
+            lead_gap = gap;
             accel = accel.min(stop_accel(me.speed, gap, lead_standoff));
             // "Close" = inside the standoff (`+4402` bit 0x04 cleared, `82C41120`).
             lead_close = Some(gap <= lead_standoff);
@@ -630,8 +643,8 @@ pub fn step(net: &RoadNetwork, signals: &SignalClock, cars: &mut [Car], dt: f32,
                 accel = accel.min(a);
             }
         }
-        // The obstacle ahead (`sub_82C412D8` -> `sub_82C3FA08`, standoff = the car's min gap).
-        let accel = match me.obstacle.and_then(|o| super::obstacles::obstacle_accel(me.speed, o.distance, p.min_gap)) {
+        // The obstacle ahead (`sub_82C412D8` -> `sub_82C3FA08`, standoff `+3668`).
+        let accel = match me.obstacle.and_then(|o| super::obstacles::obstacle_accel(me.speed, o.distance, me.obstacle_standoff())) {
             Some(a) => accel.min(a),
             None => accel,
         };
@@ -664,7 +677,7 @@ pub fn step(net: &RoadNetwork, signals: &SignalClock, cars: &mut [Car], dt: f32,
             let d = me.cursor.distance;
             let d1 = d + pass;
             let seg_len = net.segments[segment].length;
-            if me.speed > h && best > h && d > ext && d1 < seg_len - ext && lane_change_gap(net, cars, i, segment, target) {
+            if me.speed > h && lead_gap > h && d > ext && d1 < seg_len - ext && lane_change_gap(net, cars, i, segment, target) {
                 let from = net.lane_frame(segment, lane as f32, d);
                 let to = net.lane_frame(segment, target as f32, d1);
                 passage = super::passage::Passage::begin(lane, target, d, d1, (from.position, from.forward), (to.position, to.forward), &p.passage);

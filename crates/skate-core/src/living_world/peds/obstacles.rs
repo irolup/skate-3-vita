@@ -1,47 +1,5 @@
-//! Dynamic objects as navigation obstacles for peds (doc 26, fix 11): props (DMOs) and mod bodies
-//! cut out of the walkable area while they rest, so peds plan their paths round them.
-//!
-//! What retail does [code, TU3; addresses are evidence only]:
-//! - Every world object has an obstacle interface on its vtable: register `sub_82595140` (via the
-//!   base slot `sub_82595010`, vtable + 4) and update `sub_82595298`. Slot +68 says whether the
-//!   object is an obstacle at all. It returns 1 for the DynamicObject class (vtable `0x82322D50`,
-//!   the string `dynamicobject` sits at `0x82322D2C`), the player skater (`0x82300910`) and one
-//!   more class (`0x823220E0`); peds (`0x8232BE80`) and the other actor classes return 0.
-//! - A DynamicObject gets its obstacle record from the pool `DynamicObject Obstacle MemStore`
-//!   (slot +76 `sub_82C57268`, record ctor `sub_82C46778`, record vtable `0x82322D10`). The box
-//!   comes from its collision body (slot +96 `sub_82C486F8` -> body vfunc 160 = half extents;
-//!   slot +92 `sub_82C48688` = orientation from the collision shape). Slot +88 `sub_82C48648`
-//!   switches the obstacle off while the object's state word `+144+4252` equals 1. That word is set
-//!   to 1 only by the component's slot 32 (`sub_82C56B00`, which also moves every collision element
-//!   of the object to collision group 13; slots 33/34 set it back to 0 with group 12 or 14). It means
-//!   "attached to a ped's hand" (b349: slot 32 is the hand attach, slot 34 `82C56C70` the release that
-//!   `82E3EBE0` calls for a drop or throw), so a ped's hand prop is no obstacle while held and a normal cut
-//!   from its release on. It is NOT the Move Object hold: the hold's keep-alive (interface slot
-//!   10 -> DMO handler slot 6 `sub_82C4C450` -> component slot 30 `sub_82C485D0`) only sets the
-//!   held bit `DMO+4464 & 0x20`, which the obstacle code never reads. So a held prop stays an
-//!   obstacle: cut while slower than 0.4 m/s, a moving avoider while faster (2026-10-08).
-//! - Placement `sub_82C477B0`, called on every update: half extents below 0.2 m are raised to
-//!   0.2 (`0x82099280`); while the object moves faster than 0.4 m/s (`0x82181B90`, slot +24 =
-//!   velocity) its cut is removed and NavPower's moving avoider (`+64`, `sub_82E99998`) takes
-//!   over; at rest the box is cut into the NavPower mesh (`sub_8293EF28` with the record
-//!   `{-1, 15.0, type 4}`, then `sub_8293F340`), and re-cut only after the object moved more than
-//!   0.25 (`0x820C6D98`) x its smallest half extent from where it was cut.
-//! - NavPower then plans every bot's path on the cut mesh (`dynAreas` in its planner), so a
-//!   resting prop is walked round, a prop the player moved counts where it lies now, and
-//!   a rolling prop (or a held one being moved faster than 0.4 m/s) is not part of the mesh but a
-//!   NavPower moving avoider.
-//!
-//! Ours (stated): NavPower's polygon cutting and its moving avoider are not decoded. A cut is an
-//! oriented rectangle in xz (the box projected onto the ground); a path leg that crosses a cut
-//! (grown by the agent radius plus [`ObstacleParams::detour_margin`]) gets a detour corner at the
-//! cheapest free rectangle corner on the mesh; a target inside a cut does not fit (retail: its
-//! end point no longer snaps to the cut mesh). Whether the record's `-1` / 15.0 mean "blocks
-//! every mover" / "penalty x15" is not decoded; cuts block here. Bodies (cut or moving) are also
-//! solid for a ped's step ([`NavObstacles::step_ok`]), standing in for the physical contact.
-//!
-//! Deterministic: obstacles are kept by stable id in a `BTreeMap`, the grid is a `BTreeMap`, ties
-//! are broken by id; [`NavObstacles::version`] changes only when a cut changes, so nothing is
-//! rebuilt per tick while props rest.
+//! Dynamic objects (props, mod bodies) as ped navigation obstacles (fix 11): cut out while at rest.
+//! Retail mechanism and our stand-ins: docs/hails-additions/26f-living-world-peds.md#ped-navigation-obstacles
 
 use std::collections::BTreeMap;
 
@@ -76,12 +34,7 @@ pub struct ObstacleParams {
     /// does not set the obstacle-off word, see the module docs). `false` = the earlier port's rule
     /// (held objects are ignored), kept as a mod option.
     pub held_is_obstacle: bool,
-    /// A moving (uncut) object is solid for a ped's step ([`NavObstacles::step_ok`]). NOT RETAIL
-    /// YET: retail hands a moving object to NavPower's moving avoider instead (`sub_82E99998`:
-    /// an 88-byte record in the planner's obstacle database, position and velocity refreshed every
-    /// tick by `sub_82E998C8`, radius = 0.35 x a planner-wide value, independent of the box); how
-    /// NavPower's bots steer round it is middleware internals, not decoded. `false` = moving
-    /// objects do not block a ped's step (the switch a decoded avoider port would replace).
+    /// A moving object is solid for a ped's step (NOT RETAIL YET: NavPower moving avoider 82E99998): docs/hails-additions/26f-living-world-peds.md#moving-obstacle-solid
     pub moving_solid: bool,
     /// Player skaters are obstacles for peds (research b135: the skater's obstacle interface `0x82300910` slot
     /// +104 returns 1, so `sub_82C477B0` always takes the moving-avoider branch, at any speed, standing included).
@@ -89,6 +42,59 @@ pub struct ObstacleParams {
     /// A skater obstacle's half extents (x, y, z), m. NOT RETAIL YET: retail's avoider is `{a, 0.2a, 0.2a}`,
     /// `a = 0.25 R` with `R` a planner-wide value not read yet; this is a body-sized stand-in.
     pub skater_half_extents: Vec3,
+    /// Contact slide round a moving body (`82E9D0C0`, b698): tangential step as this fraction of the push
+    /// [code `0x821161AC` = 0.7]; 0 = the face clamp only.
+    pub contact_slide: f32,
+    /// The slide needs the step heading into the body: `dot(dir, n)` below this [code `0x822F862C` = -0.3].
+    pub contact_slide_dot: f32,
+    /// Predictive side-step round a moving body (`82E9CE90` / `82E9CBD0`, b698 / b699): look-ahead, s [code
+    /// `0x82063B08` = 3.0]; 0 = off.
+    pub avoid_horizon: f32,
+    /// Contact ray against this x the combined radius [code `0x820ED5E8` = 0.99].
+    pub avoid_ray_scale: f32,
+    /// Side-step acceleration base [code `0x82063B08` = 3.0] times the NavPower global scale [data `0x82099484` = 1.3,
+    /// set by `8292E230`], m/s^2.
+    pub avoid_accel: f32,
+    pub avoid_scale: f32,
+    /// Head-on below this velocity dot, same direction above `avoid_crossing_dot` [code `0x822F8F80` = -0.7,
+    /// `0x821161AC` = 0.7].
+    pub avoid_head_on_dot: f32,
+    pub avoid_crossing_dot: f32,
+    /// A moving avoider's extents `{a, t a, t a}`, `a = avoid_scale x avoider_extent`, summed into its radius whatever
+    /// the box (`82C477B0`: [code `0x820C6D98` = 0.25, `0x82099280` = 0.2], sum 0.455 at scale 1.3).
+    pub avoider_extent: f32,
+    pub avoider_extent_tail: f32,
+    /// The path turn term that pulls a ped's sideways velocity back every controller step (`82E9DF70`, research
+    /// b716): m/s^2 (`settings+0x2C`, retail 40).
+    pub path_turn_accel: f32,
+    /// Full turn from this heading error, degrees (5); below it the turn scales with the error.
+    pub path_turn_full_deg: f32,
+    /// Above this error the turn is boosted (10 degrees) by `path_turn_boost_rate` per radian (4.5837) up to
+    /// `path_turn_boost_max` times (5); no turn at or above `path_turn_max_deg` (120).
+    pub path_turn_boost_deg: f32,
+    pub path_turn_boost_rate: f32,
+    pub path_turn_boost_max: f32,
+    pub path_turn_max_deg: f32,
+    /// The turn never exceeds the centripetal limit `v^2 / (2 r)` (`settings+0x08`, 0.35 m).
+    pub path_turn_radius: f32,
+    /// The controller's fixed step (`f1`, 1 / 30 s): the turn removes at most the sideways speed over one step.
+    pub controller_step: f32,
+    /// The contact slide's speed tests (`82E9D0C0`, research b717 / b718): a ped at or below this fraction (0.5,
+    /// `0x8209975C`) of its path speed slides toward its steer target, faster along its velocity; and a body moving
+    /// away along that direction at this fraction of the path speed or more gets no slide (push-out only).
+    pub contact_slow_fraction: f32,
+    /// The ped's path speed `S` (`settings+0` x agent `+0x14C` x `+0x144`): 2.0 m/s for walking peds (1.0 on some legs;
+    /// run / flee not traced).
+    pub contact_max_speed: f32,
+    /// Braking for a blocker at the path end (`82E9FC20` / `82E9F9F0`, research b716): within `brake_goal_radius` of
+    /// the steer target (2.0 m; retail sets it per path leg, 0.75 / 0.31 also seen) a moving body ahead closer than the
+    /// stopping distance `v^2 / (2 brake_decel)` (80 m/s^2) stops the ped and skips its side-step. The ray tests
+    /// `brake_body_radius` (1.225 m = settings +0x08 + 0x0C + 0x10) plus the body's avoider extents; bodies moving away
+    /// at `brake_away_fraction` (0.25) of the ped's speed or more are left out. 0 decel = off.
+    pub brake_decel: f32,
+    pub brake_goal_radius: f32,
+    pub brake_body_radius: f32,
+    pub brake_away_fraction: f32,
 }
 
 /// Obstacle ids of player skaters (`SKATER_OBSTACLE_BASE + player index`); always moving avoiders.
@@ -110,7 +116,7 @@ impl Ignore {
 
 impl Default for ObstacleParams {
     fn default() -> Self {
-        Self { enabled: true, min_half_extent: 0.2, moving_speed: 0.4, recut_fraction: 0.25, detour_margin: 0.1, max_detours: 8, target_snap: 0.5, step_height: 0.0, held_is_obstacle: true, moving_solid: true, skaters: true, skater_half_extents: [0.3, 0.9, 0.3] }
+        Self { enabled: true, min_half_extent: 0.2, moving_speed: 0.4, recut_fraction: 0.25, detour_margin: 0.1, max_detours: 8, target_snap: 0.5, step_height: 0.0, held_is_obstacle: true, moving_solid: true, skaters: true, skater_half_extents: [0.3, 0.9, 0.3], contact_slide: 0.7, contact_slide_dot: -0.3, avoid_horizon: 3.0, avoid_ray_scale: 0.99, avoid_accel: 3.0, avoid_scale: 1.3, avoid_head_on_dot: -0.7, avoid_crossing_dot: 0.7, avoider_extent: 0.25, avoider_extent_tail: 0.2, path_turn_accel: 40.0, path_turn_full_deg: 5.0, path_turn_boost_deg: 10.0, path_turn_boost_rate: 4.5837, path_turn_boost_max: 5.0, path_turn_max_deg: 120.0, path_turn_radius: 0.35, controller_step: 1.0 / 30.0, contact_slow_fraction: 0.5, contact_max_speed: 2.0, brake_decel: 80.0, brake_goal_radius: 2.0, brake_body_radius: 1.225, brake_away_fraction: 0.25 }
     }
 }
 
@@ -237,6 +243,8 @@ pub struct ObstacleState {
     pub inactive: bool,
     /// Held this tick (diagnostics; an obstacle unless `held_is_obstacle` is off).
     pub held: bool,
+    /// Ground velocity (x, z) this tick, m/s.
+    pub velocity: [f32; 2],
 }
 
 const CELL: f32 = 4.0;
@@ -255,6 +263,14 @@ pub struct NavObstacles {
 
 fn cell_of(x: f32) -> i32 {
     (x / CELL).floor() as i32
+}
+
+
+/// The ped's own motion for the contact slide's tests: its velocity (x, z) and its steer target (x, z).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Contact {
+    pub velocity: Option<[f32; 2]>,
+    pub target: Option<[f32; 2]>,
 }
 
 impl NavObstacles {
@@ -289,8 +305,9 @@ impl NavObstacles {
             // A skater is always a moving avoider (never a cut), whatever its speed.
             let moving = speed > p.moving_speed || input.id >= SKATER_OBSTACLE_BASE;
             let inactive = input.inactive || (input.held && !p.held_is_obstacle) || !p.enabled;
-            let state = self.states.entry(input.id).or_insert(ObstacleState { cut: None, cut_at: input.center, now, moving, inactive, held: input.held });
+            let state = self.states.entry(input.id).or_insert(ObstacleState { cut: None, cut_at: input.center, now, moving, inactive, held: input.held, velocity: [0.0; 2] });
             state.now = now;
+            state.velocity = [input.velocity[0], input.velocity[2]];
             state.moving = moving;
             state.inactive = inactive;
             state.held = input.held;
@@ -422,10 +439,7 @@ impl NavObstacles {
         best
     }
 
-    /// Bend a corner list (the path after `start`) round the cuts: every leg that enters a cut
-    /// grown by `radius + detour_margin` gets the cheapest corner of that rectangle (grown a little
-    /// more) that is on the mesh, outside every other cut and not itself blocked from the leg start.
-    /// Legs with no such corner stay (the step check then holds the ped and it re-plans).
+    /// Bend a corner list round the cuts (cheapest free grown corner); legs without one stay.
     pub fn detour(&self, mesh: &NavMesh, start: Vec3, corners: &[Vec3], radius: f32) -> Vec<Vec3> {
         if self.grid.is_empty() || corners.is_empty() {
             return corners.to_vec();
@@ -487,10 +501,7 @@ impl NavObstacles {
         out
     }
 
-    /// The step a ped body of `radius` takes from `from` toward `to`: `to` when free
-    /// ([`Self::step_ok`]); else slid along the face of the obstacle it would enter (the move into
-    /// the face removed), when that slide is free; else `None` (the ped stays). Ours: stands in
-    /// for the physical contact that keeps a retail ped out of a prop.
+    /// A ped body's step: `to` when free, else slid along the obstacle face, else `None` (ours).
     pub fn resolve_step(&self, from: Vec3, to: Vec3, radius: f32) -> Option<Vec3> {
         self.resolve_step_ignoring(from, to, radius, Ignore::default())
     }
@@ -499,13 +510,25 @@ impl NavObstacles {
     /// `DisableCollisionsWithBehaviourSource` (`826A7378`, `82E3DB68` -> `ped+5916`) lets a ped reach a seat whose
     /// waypoint lies inside its own bench.
     pub fn resolve_step_ignoring(&self, from: Vec3, to: Vec3, radius: f32, ignore: Ignore) -> Option<Vec3> {
+        self.resolve_step_contact(from, to, radius, ignore, Contact::default())
+    }
+
+    /// [`NavObstacles::resolve_step_ignoring`] with the ped's own motion for the contact slide's tests.
+    pub fn resolve_step_contact(&self, from: Vec3, to: Vec3, radius: f32, ignore: Ignore, contact: Contact) -> Option<Vec3> {
         if self.step_ok_ignoring(from, to, radius, ignore) {
             return Some(to);
         }
         let r = radius + 0.01;
-        let mut blocking: Vec<Footprint> = self.cuts_near([to[0] - r, to[2] - r], [to[0] + r, to[2] + r]).into_iter().filter(|(id, _)| !ignore.skips(*id)).map(|(_, f)| f).collect();
-        blocking.extend(self.loose.iter().filter(|id| !ignore.skips(**id)).filter_map(|id| self.states.get(id).map(|s| s.now)));
-        let f = blocking.into_iter().find(|f| f.applies(to[1], self.params.step_height) && f.contains(to, radius) && !f.contains(from, radius))?;
+        let mut blocking: Vec<(Footprint, Option<[f32; 2]>)> = self.cuts_near([to[0] - r, to[2] - r], [to[0] + r, to[2] + r]).into_iter().filter(|(id, _)| !ignore.skips(*id)).map(|(_, f)| (f, None)).collect();
+        blocking.extend(self.loose.iter().filter(|id| !ignore.skips(**id)).filter_map(|id| self.states.get(id).map(|s| (s.now, Some(s.velocity)))));
+        let (f, loose) = blocking.into_iter().find(|(f, _)| f.applies(to[1], self.params.step_height) && f.contains(to, radius) && !f.contains(from, radius))?;
+        let to = match loose {
+            Some(v) => self.contact_slide(&f, from, to, v, contact).unwrap_or(to),
+            None => to,
+        };
+        if !f.contains(to, radius) {
+            return self.step_ok_ignoring(from, to, radius, ignore).then_some(to);
+        }
         // Keep `to` on the face `from` is outside of (the axis where `from` is beyond the grown half).
         let (lf, lt) = (f.local([from[0], from[2]]), f.local([to[0], to[2]]));
         let mut l = lt;
@@ -515,6 +538,165 @@ impl NavObstacles {
         let w = f.world(l);
         let slid = [w[0], to[1], w[1]];
         self.step_ok_ignoring(from, slid, radius, ignore).then_some(slid)
+    }
+
+    /// The moving bodies (no cut, active) in id order, without those `ignore` skips.
+    pub fn moving_avoiders(&self, ignore: Ignore) -> impl Iterator<Item = (u64, &ObstacleState)> + '_ {
+        self.loose.iter().filter(move |id| !ignore.skips(**id)).filter_map(|id| self.states.get(id).map(|s| (*id, s)))
+    }
+
+    /// Retail's predictive side-step (`82E9CE90` picks the avoider, `82E9CBD0` the force): the lateral acceleration
+    /// (x, z) for a ped at `p` moving with `v`: docs/hails-additions/26f-living-world-peds.md#predictive-side-step
+    pub fn side_step(&self, p: Vec3, v: [f32; 2], radius: f32, ignore: Ignore) -> [f32; 2] {
+        let pr = &self.params;
+        let speed = v[0].hypot(v[1]);
+        if pr.avoid_horizon <= 0.0 || speed < 1e-4 {
+            return [0.0; 2];
+        }
+        let cross = |a: [f32; 2], b: [f32; 2]| a[0] * b[1] - a[1] * b[0];
+        let me = [p[0], p[2]];
+        let r_sum = radius + pr.avoid_scale * pr.avoider_extent * (1.0 + 2.0 * pr.avoider_extent_tail);
+        let mut best: Option<(f32, [f32; 2], [f32; 2])> = None;
+        for (_, s) in self.moving_avoiders(ignore) {
+            if !s.now.applies(p[1], pr.step_height) {
+                continue;
+            }
+            let dv = [s.velocity[0] - v[0], s.velocity[1] - v[1]];
+            let dvl = dv[0].hypot(dv[1]);
+            let rel = [s.now.center[0] - me[0], s.now.center[1] - me[1]];
+            let dist2 = rel[0] * rel[0] + rel[1] * rel[1];
+            if dvl <= 0.0 || dist2 < r_sum * r_sum {
+                continue;
+            }
+            // Ray from the avoider along the relative velocity against the ped's circle.
+            let dir = [dv[0] / dvl, dv[1] / dvl];
+            let along = -(rel[0] * dir[0] + rel[1] * dir[1]);
+            let rr = pr.avoid_ray_scale * r_sum;
+            let off2 = dist2 - along * along;
+            if along < 0.0 || off2 > rr * rr {
+                continue;
+            }
+            let t = (along - (rr * rr - off2).sqrt()) / dvl;
+            if (0.0..pr.avoid_horizon).contains(&t) && best.is_none_or(|(b, _, _)| t < b) {
+                best = Some((t, s.now.center, s.velocity));
+            }
+        }
+        let Some((t, c, va)) = best else { return [0.0; 2] };
+        let u = [v[0] / speed, v[1] / speed];
+        let val = va[0].hypot(va[1]);
+        let at = [c[0] + va[0] * t, c[1] + va[1] * t];
+        // Retail's (x, y) is our (x, -z), so its `cross <= 0` is ours `>= 0` and its left perpendicular is (u.z, -u.x).
+        let left = if val <= 0.0 || (u[0] * va[0] + u[1] * va[1]) / val < pr.avoid_head_on_dot {
+            cross(u, [at[0] - me[0], at[1] - me[1]]) >= 0.0
+        } else if (u[0] * va[0] + u[1] * va[1]) / val <= pr.avoid_crossing_dot {
+            // Skaters and props weigh FLT_MAX (`82E99998`): the ped never has right of way.
+            cross(u, va) >= 0.0
+        } else {
+            let ua = [va[0] / val, va[1] / val];
+            let mine = [me[0] + v[0] * t, me[1] + v[1] * t];
+            cross(u, [at[0] - me[0], at[1] - me[1]]) >= cross(ua, [mine[0] - c[0], mine[1] - c[1]])
+        };
+        let k = pr.avoid_accel * pr.avoid_scale * if left { 1.0 } else { -1.0 };
+        [u[1] * k, -u[0] * k]
+    }
+
+    /// Whether a ped at `p` moving with `v` brakes this step (`82E9FC20`, research b716): within the goal radius of
+    /// its steer target `target`, the nearest moving body along `v` (not moving away) is closer than the stopping
+    /// distance: docs/hails-additions/26f-living-world-peds.md#predictive-side-step
+    pub fn brakes(&self, p: Vec3, v: [f32; 2], target: [f32; 2], ignore: Ignore) -> bool {
+        let pr = &self.params;
+        let speed = v[0].hypot(v[1]);
+        if pr.brake_decel <= 0.0 || speed < 1e-4 || (target[0] - p[0]).hypot(target[1] - p[2]) >= pr.brake_goal_radius {
+            return false;
+        }
+        let stop = speed * speed / (2.0 * pr.brake_decel);
+        let u = [v[0] / speed, v[1] / speed];
+        let r = pr.brake_body_radius + pr.avoid_scale * pr.avoider_extent * (1.0 + 2.0 * pr.avoider_extent_tail);
+        self.moving_avoiders(ignore).any(|(_, s)| {
+            if s.velocity[0] * u[0] + s.velocity[1] * u[1] >= pr.brake_away_fraction * speed {
+                return false;
+            }
+            // The ray from the ped along `u` against a circle of `r` round the body: the first hit distance.
+            let c = [s.now.center[0] - p[0], s.now.center[1] - p[2]];
+            let along = c[0] * u[0] + c[1] * u[1];
+            let off2 = c[0] * c[0] + c[1] * c[1] - along * along;
+            if off2 > r * r {
+                return false;
+            }
+            let hit = along - (r * r - off2).sqrt();
+            hit < stop && along >= 0.0
+        })
+    }
+
+    /// Retail's path turn term (`82E9DF70`, research b716) on the sideways velocity `sv` of a ped moving `speed` along
+    /// `base`: the heading error of `base * speed + sv` against `base` turns it back at `path_turn_accel` (scaled below
+    /// `path_turn_full_deg`, boosted above `path_turn_boost_deg`), never more than the sideways speed over one
+    /// controller step nor the centripetal limit. Returns the new `sv`: docs/hails-additions/26f-living-world-peds.md#predictive-side-step
+    pub fn path_turn(&self, sv: [f32; 2], base: [f32; 2], speed: f32, dt: f32) -> [f32; 2] {
+        let p = &self.params;
+        let l = sv[0].hypot(sv[1]);
+        if l <= 0.0 {
+            return sv;
+        }
+        let want = [base[0] * speed + sv[0], base[1] * speed + sv[1]];
+        let wl = want[0].hypot(want[1]);
+        let angle = if wl > 1e-6 { ((want[0] * base[0] + want[1] * base[1]) / wl).clamp(-1.0, 1.0).acos() } else { std::f32::consts::PI };
+        if angle >= p.path_turn_max_deg.to_radians() {
+            return sv;
+        }
+        let boost = ((angle - p.path_turn_boost_deg.to_radians()) * p.path_turn_boost_rate + 1.0).clamp(1.0, p.path_turn_boost_max.max(1.0));
+        let full = p.path_turn_full_deg.to_radians();
+        let scale = if full > 0.0 { (angle / full).min(1.0) } else { 1.0 };
+        let mut turn = p.path_turn_accel * boost * scale;
+        if p.controller_step > 0.0 {
+            turn = turn.min(l / p.controller_step);
+        }
+        if p.path_turn_radius > 0.0 {
+            turn = turn.min(speed * speed / (2.0 * p.path_turn_radius));
+        }
+        let cut = (turn * dt).min(l);
+        [sv[0] - sv[0] / l * cut, sv[1] - sv[1] / l * cut]
+    }
+
+    /// Retail's contact slide round a moving body (`82E9D0C0`): docs/hails-additions/26f-living-world-peds.md#contact-slide
+    fn contact_slide(&self, f: &Footprint, from: Vec3, to: Vec3, avoider: [f32; 2], contact: Contact) -> Option<Vec3> {
+        let (dx, dz) = (to[0] - from[0], to[2] - from[2]);
+        let len = dx.hypot(dz);
+        let (nx, nz) = (from[0] - f.center[0], from[2] - f.center[1]);
+        let nl = nx.hypot(nz);
+        if self.params.contact_slide <= 0.0 || len < 1e-6 || nl < 1e-6 {
+            return None;
+        }
+        let unit = |v: [f32; 2]| {
+            let l = v[0].hypot(v[1]);
+            (l > 1e-6).then(|| [v[0] / l, v[1] / l])
+        };
+        // The direction (b717 / b718): toward the steer target at or below the slow fraction of the path speed, else
+        // along the velocity; the step itself without the ped's motion.
+        let slow = self.params.contact_slow_fraction * self.params.contact_max_speed;
+        let step = [dx / len, dz / len];
+        let d = match contact.velocity {
+            Some(v) if v[0].hypot(v[1]) <= slow => contact.target.and_then(|t| unit([t[0] - from[0], t[1] - from[2]])).unwrap_or(step),
+            Some(v) => unit(v).unwrap_or(step),
+            None => step,
+        };
+        let n = [nx / nl, nz / nl];
+        let into = d[0] * n[0] + d[1] * n[1];
+        if into >= self.params.contact_slide_dot {
+            return None;
+        }
+        // A body moving away along it at the slow fraction of the path speed or more: push-out only.
+        if avoider[0] * d[0] + avoider[1] * d[1] >= slow {
+            return None;
+        }
+        // Tangent on the side the step already leans to; dead centre takes retail's fixed side.
+        let mut t = [n[1], -n[0]];
+        let along = d[0] * t[0] + d[1] * t[1];
+        if along < 0.0 {
+            t = [-t[0], -t[1]];
+        }
+        let s = (along.abs() + self.params.contact_slide * -into) * len;
+        Some([from[0] + t[0] * s, to[1], from[2] + t[1] * s])
     }
 
     /// Whether a ped body of `radius` may step from `from` to `to`: no obstacle (cut or moving,

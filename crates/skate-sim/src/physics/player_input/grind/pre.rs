@@ -1,6 +1,29 @@
 use super::*;
 use skate_core::physics::grind_contact::{admission::Admission, investigator};
 
+/// One airborne NPC tick near a rail: why it does or does not catch (doc 26e, "Recorded grinds").
+fn log_air_try(p: &ProcessedPhysicsInput, board: &[[f32; 4]; 4], edges: &[skate_core::physics::grind_contact::Primitive], result: &investigator::Investigation, disabled: bool, history: impl core::fmt::Debug, cooldown: impl core::fmt::Debug) {
+    let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    let v3 = |a: &[f32; 4]| [a[0], a[1], a[2]];
+    let at = v3(&board[3]);
+    let nearest = edges.iter().map(|e| {
+        let (s, t) = ([e.start[0], e.start[1], e.start[2]], [e.end[0] - e.start[0], e.end[1] - e.start[1], e.end[2] - e.start[2]]);
+        let len2 = dot(t, t).max(1e-6);
+        let u = (dot([at[0] - s[0], at[1] - s[1], at[2] - s[2]], t) / len2).clamp(0.0, 1.0);
+        let c = [s[0] + t[0] * u, s[1] + t[1] * u, s[2] + t[2] * u];
+        let d = [at[0] - c[0], at[1] - c[1], at[2] - c[2]];
+        let l = len2.sqrt();
+        (dot(d, d).sqrt(), d[1], [t[0] / l, t[1] / l, t[2] / l])
+    }).min_by(|a, b| a.0.total_cmp(&b.0));
+    let Some((dist, above, tangent)) = nearest else { return };
+    let w = p.vectors_400_416[0];
+    tracing::info!(
+        "NPC_GRIND_TRY #{} state={} family={:?} proximity={} disabled={} history={:?} cooldown={:?} rails={} dist={:.2} above={:.2} fwd.rail={:.2} right.rail={:.2} up.rail={:.2} vy={:.2} speed={:.2} at=[{:.1}, {:.1}, {:.1}]",
+        crate::physics::log_npc(), p.state_2508, result.candidate.map(|c| c.kind), result.proximity.is_some(), disabled, history, cooldown, edges.len(), dist, above,
+        dot(v3(&board[2]), tangent), dot(v3(&board[0]), tangent), dot(v3(&board[1]), tangent), float(w)[1], p.scalar_2652, at[0], at[1], at[2],
+    );
+}
+
 impl GrindInputState {
     ///82D8A828: permission -> bounded static query -> materials -> investigator
     ///-> directed tangent -> previous velocity -> friction -> geometry probes.
@@ -59,6 +82,9 @@ impl GrindInputState {
             },
             &edges,
         );
+        if p.category_2512 == 200 && crate::physics::log_actor() == "npc" {
+            log_air_try(p, &context.board, &edges, &result, self.disabled, self.grind_history, self.cooldown);
+        }
         let mut fields = GrindInvestigationFields::default();
         let mut metadata = None;
         let mut geometry = None;

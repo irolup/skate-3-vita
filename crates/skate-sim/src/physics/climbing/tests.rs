@@ -180,6 +180,13 @@ fn run_climb(drop_board: bool, miss: bool) {
         !drop_board
     );
     physics.world = (world(2.2, 4., 8., false, true)).into();
+    install_fixture_clips(&mut skater);
+    if drop_board {
+        // The fixture teleports the skater, so keep the dropped board off the run-up.
+        let mut board = physics.board.part_transforms()[6];
+        board.translation.x += 6.;
+        physics.board.set_transform(board);
+    }
     // Put the real skeleton's feet at the fixture origin before entering Biped.
     let c = &skater.climbing.clips.as_ref().unwrap().reach;
     let g: Vec<_> = skater
@@ -409,6 +416,61 @@ fn run_climb(drop_board: bool, miss: bool) {
     assert_eq!(skater.player_state.current(), PhysicalStateId::BipedGround);
 }
 
+// private/custom/climbing.json is optional and no setup writes it: hold the stock pose as both clips.
+fn install_fixture_clips(skater: &mut SkaterRuntime) {
+    let frames = &skater.animation.evaluator.frames;
+    let names: Vec<_> = frames.bone_names.iter().map(|n| n.to_ascii_uppercase()).collect();
+    let parents = frames.parents.clone();
+    // A hanging clip has its arms overhead: swing each arm up about its shoulder.
+    let mut globals: Vec<Mat4> = skater.render_pose.iter().map(|&m| matrix(m)).collect();
+    for side in ["LEFT", "RIGHT"] {
+        let arm = names.iter().position(|n| *n == format!("{side}ARM")).unwrap();
+        let hand = names.iter().position(|n| *n == format!("{side}HAND")).unwrap();
+        let elbow = names.iter().position(|n| *n == format!("{side}FOREARM")).unwrap();
+        let pivot = globals[elbow].w_axis.truncate();
+        let bend = Mat4::from_translation(pivot) * Mat4::from_rotation_x(-0.8) * Mat4::from_translation(-pivot);
+        for i in 0..globals.len() {
+            let mut bone = i as i32;
+            while bone >= 0 && bone != elbow as i32 {
+                bone = parents[bone as usize];
+            }
+            if bone == elbow as i32 {
+                globals[i] = bend * globals[i];
+            }
+        }
+        let pivot = globals[arm].w_axis.truncate();
+        let reach = (globals[hand].w_axis.truncate() - pivot).normalize();
+        let swing = Mat4::from_translation(pivot)
+            * Mat4::from_quat(Quat::from_rotation_arc(reach, Vec3::new(0., 0.97, 0.24).normalize()))
+            * Mat4::from_translation(-pivot);
+        for i in 0..globals.len() {
+            let mut bone = i as i32;
+            while bone >= 0 && bone != arm as i32 {
+                bone = parents[bone as usize];
+            }
+            if bone == arm as i32 {
+                globals[i] = swing * globals[i];
+            }
+        }
+    }
+    let pose: Vec<[f32; 10]> = (0..globals.len())
+        .map(|i| {
+            let local = if parents[i] < 0 { globals[i] } else { globals[parents[i] as usize].inverse() * globals[i] };
+            let t = Transform::from_matrix(local);
+            let (s, r, p) = (t.scale, t.rotation, t.translation);
+            [s.x, s.y, s.z, r.x, r.y, r.z, r.w, p.x, p.y, p.z]
+        })
+        .collect();
+    let clip = |name: &str| super::clip::Clip {
+        name: name.into(),
+        fps: 30.,
+        names: names.clone(),
+        parents: parents.clone(),
+        frames: vec![pose.clone(); 31],
+    };
+    skater.climbing.indices = (0..names.len()).collect();
+    skater.climbing.clips = Some(super::clip::Clips { reach: clip("reach"), mantle: clip("mantle") });
+}
 fn capture(skater: &SkaterRuntime, name: &str) {
     if skater.skateboard_controller.fields.state_448 != 1 {
         return;

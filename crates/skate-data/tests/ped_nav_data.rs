@@ -1,10 +1,5 @@
-//! Data-gated checks of the ped navmesh (peds milestone M3) on the user's own export. Skips (passes
-//! with a note) without data. `SKATE3_ASSET_ROOT`: one or more asset roots joined like PATH; reads
-//! `private/living_world/navmesh.bin` (+ `roads.bin` and `tables.json` for the road and
-//! crosswalk checks).
-//!
-//! Expected values are the shipped DownTown NavPower graphs as decoded for M3 (asserted here, not
-//! embedded in the engine): 36443 polygons (24991 area 0x11, 8997 area 0xA1, 2455 area 0xF1).
+//! Data-gated checks of the ped navmesh on the local export (skip without data).
+//! Inputs and expected values: docs/hails-additions/26f-living-world-peds.md#navmesh-data-tests
 
 use skate_core::living_world::peds::anim::{Intent, Locomotion};
 use skate_core::living_world::peds::crosswalk::{RoadWalkSignals, signalled_arms};
@@ -92,7 +87,7 @@ fn run(m: &NavMesh, bodies: &mut [Body], ticks: u32, rule: CrosswalkRule, signal
             let out = b.nav.step(m, &p, rule, signals, b.id, b.pos, b.heading, b.state, &others, dt);
             b.heading += out.turn;
             match out.intent {
-                Intent::Walk | Intent::Run => {
+                Intent::Walk | Intent::Run | Intent::Shuffle => {
                     b.state = Locomotion::Walk;
                     let f = forward(b.heading);
                     let (next, ok) = constrain_step(m, b.pos, [b.pos[0] + f[0] * 1.325 * dt, b.pos[1], b.pos[2] + f[1] * 1.325 * dt]);
@@ -183,12 +178,7 @@ fn downtown_crosswalk_rule_crosses_only_on_walk() {
     assert!(signalled > 0 && waits > 0, "the rule was exercised");
 }
 
-/// fix 17 (user: peds "get lined up and start walking in place in specific spots", one standing
-/// on a wall top): every tile seam of the shipped DownTown mesh (NavPower tiles stop short of
-/// their shared border; setup links the two sides) is walked across at the walk clip's speed.
-/// The old step rule (locate the step's end on its own) snaps a ped in the gap back to the edge
-/// it left, so it walks in place there; the surface move crosses and never changes component
-/// (no step onto an unconnected wall-top layer).
+/// fix 17: every DownTown tile seam is walkable across by the surface move without changing component.
 #[test]
 fn downtown_tile_seams_are_crossed_without_layer_jumps() {
     let Some(m) = downtown() else {
@@ -256,10 +246,7 @@ fn downtown_tile_seams_are_crossed_without_layer_jumps() {
     assert!(crossed as f32 >= 0.93 * seams as f32, "seams crossed: {crossed} of {seams}");
 }
 
-/// fix 17 end to end at the user's spot (the DownTown ramp with the long blue rail, player near
-/// [-254, 41, 100], on a tile border): 30 peds wander 120 s with the game's step rules (surface
-/// moves, separation, re-plan after 3 s of refused or no-progress steps). No ped may walk in
-/// place (walking 4 s without getting 0.3 m anywhere) or leave its connected surface.
+/// fix 17 end to end on a DownTown tile border: 30 peds for 120 s never walk in place or leave their surface.
 #[test]
 fn downtown_peds_at_the_ramp_never_walk_in_place() {
     let Some(m) = downtown() else {
@@ -301,7 +288,7 @@ fn downtown_peds_at_the_ramp_never_walk_in_place() {
             let out = x.b.nav.step(&m, &params, CrosswalkRule::Off, &NoSignals, x.b.id, x.b.pos, x.b.heading, x.b.state, &others, dt);
             x.b.heading += out.turn;
             match out.intent {
-                Intent::Walk | Intent::Run => {
+                Intent::Walk | Intent::Run | Intent::Shuffle => {
                     x.b.state = Locomotion::Walk;
                     let f = forward(x.b.heading);
                     let to = [x.b.pos[0] + f[0] * 1.325 * dt, x.b.pos[1], x.b.pos[2] + f[1] * 1.325 * dt];

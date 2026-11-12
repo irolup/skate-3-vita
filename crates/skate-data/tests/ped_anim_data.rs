@@ -1,8 +1,5 @@
-//! Data-gated checks of the ped body data (doc 26, peds M2) on the user's own files. Skips (passes
-//! with a note) without data. `SKATE3_ASSET_ROOT`: one or more asset roots joined like PATH; the
-//! test reads `private/stock/data/anim/PedestrianSkeletonPres.abin` and
-//! `private/living_world/{tables.json, models/*.glb}` from the first root that has each.
-//! Expected values are shipped data the research measured; they are asserted, not embedded.
+//! Data-gated (skips without `SKATE3_ASSET_ROOT` data): ped body data (bank `PedestrianSkeletonPres.abin`, tables, model GLBs);
+//! expected values are measured shipped data, asserted not embedded.
 
 use skate_core::living_world::peds::anim::{PedAnimPlayer, names, root_motion};
 use skate_core::living_world::peds::{PedOverrides, match_bones};
@@ -115,6 +112,16 @@ fn every_census_entity_resolves_a_look_and_animation() {
     assert!(c("default").ground_restart.iter().zip([0.667, 0.833, 0.833]).all(|(a, b)| (a - b).abs() < 1e-3), "{:?}", c("default").ground_restart);
     for name in skate_core::living_world::peds::skater_contact::REACTION_ANIMS {
         assert!(t.anim_sets["default"].entries.contains_key(*name), "default set: {name} missing");
+    }
+    // The speed rows (b682): seven in the default set (Brisk walk, Slow / default / Fast run), the female set runs
+    // Slow only; the tier cycles resolve.
+    use skate_core::living_world::peds::anim::Tier;
+    let tiers = |k: &str| t.anim_sets[k].speed_rows.iter().map(|r| (r.threshold, r.state.clone(), r.tier)).collect::<Vec<_>>();
+    assert_eq!(tiers("default").len(), 7, "{:?}", tiers("default"));
+    assert_eq!(tiers("default")[3], (4.0, "Walk".into(), Tier::Brisk));
+    assert_eq!(tiers("female").last(), Some(&(8.0, "ChaseRun".into(), Tier::Slow)));
+    for name in ["FwdBriskWalkCyc", "FwdChaseRunSlowCyc", "FwdChaseRunFastCyc", "Stand2ChaseRun", "ChaseRun2Stand", "ChaseRunTurnR45", "ChaseRunTurnR90", "ChaseRunTurnR135", "ChaseRunTurnR180", "ChaseTiredInto", "ChaseTiredCyc", "ChaseTiredOut", "Stand2Shuffle", "FwdShuffleCyc", "Shuffle2Stand", "ShuffleTurnR45", "ShuffleTurnR180", "Stand2Strafe", "Chase2Strafe", "StrafeIdle", "Strafe2ChaseRun", "StrafeTurnR45", "StrafeTurnR90", "StrafeForwards", "StrafeBackwards", "StrafeR45", "StrafeR90", "StrafeR135"] {
+        assert!(t.anim_sets["default"].entries.contains_key(name), "default set: {name} missing");
     }
     // The idle hand prop actions (`82E3F1D8` / `82E3F470`) resolve in the default set too.
     for name in ["HandPropEat", "HandPropDrink", "HandPropReadInto", "HandPropReadCyc", "HandPropReadOut", "HandPropPhoneAnswer", "HandPropPhoneTalk", "HandPropPhoneHangup", "HandPropLitter"] {
@@ -241,10 +248,7 @@ fn ped_glb_bind_frames_are_the_rig_reference_frames() {
     let mut locals = rig.reference.clone();
     locals[0] = skate_core::living_world::peds::anim::IDENTITY;
     let globals = skate_core::living_world::peds::PedEvaluator::globals(rig, &locals);
-    // Angle between the reference global (row-vector native matrix, rows = bone axes) and the
-    // Rotation angle between the two frames, axes normalised (the reference carries small bone
-    // scales, e.g. hands about 0.996). GLB bind = inverse of the inverse bind = its transpose for
-    // the orthonormal bind rotations (column-major array).
+    // Rotation angle between the reference global (rows = bone axes, normalised) and the GLB bind (transposed IBM).
     let angle = |native: &[[f32; 4]; 4], ibm: &[f32; 16], basis: [[f32; 3]; 3]| {
         // bind(r, c) = ibm[r * 4 + c]; reference(r, c) = sum_k native[k][r] * basis[k][c] (G x basis).
         let reference = |r: usize, c: usize| (0..3).map(|k| native[k][r] * basis[k][c]).sum::<f32>();

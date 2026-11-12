@@ -104,6 +104,11 @@ impl Prefetch {
         self.slots.get(stem).is_some_and(|slot| slot.stage.try_lock().is_ok_and(|s| matches!(*s, Stage::Done(..))))
     }
 
+    /// Whether the bank was requested and not taken or dropped since.
+    pub(crate) fn requested(&self, stem: &str) -> bool {
+        self.slots.contains_key(stem)
+    }
+
     /// Forget a requested bank (queued: the worker skips it; done: its memory is freed).
     pub(crate) fn drop_bank(&mut self, stem: &str) {
         if let Some(slot) = self.slots.remove(stem) {
@@ -177,7 +182,18 @@ fn spawn() -> Sender<Job> {
             }
             // A failed or panicking load is left to the game thread, which then fails the same
             // way it always did.
-            let result = std::panic::catch_unwind(|| source.load()).ok().and_then(Result::ok);
+            let stem = source.stem().to_owned();
+            let result = match std::panic::catch_unwind(|| source.load()) {
+                Ok(Ok(loaded)) => Some(loaded),
+                Ok(Err(error)) => {
+                    println!("PREFETCH bank {stem} failed: {error}");
+                    None
+                }
+                Err(_) => {
+                    println!("PREFETCH bank {stem} panicked");
+                    None
+                }
+            };
             let mut stage = match slot.stage.lock() {
                 Ok(stage) => stage,
                 Err(poisoned) => poisoned.into_inner(),

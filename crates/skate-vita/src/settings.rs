@@ -3,7 +3,8 @@
 use vita_platform::controls::{self, StickGain};
 
 pub const PATH: &str = "ux0:data/SKATEVITA/settings.bin";
-const MAGIC: &[u8; 8] = b"SKVSET14";
+const MAGIC: &[u8; 8] = b"SKVSET15";
+const MAGIC_V14: &[u8; 8] = b"SKVSET14";
 /// Version 13 (before the customisation's unlock-all setting): the same record without its byte.
 const MAGIC_V13: &[u8; 8] = b"SKVSET13";
 /// Version 12 (before the Object Dropper's "Free camera" setting): the same record without its byte.
@@ -118,6 +119,9 @@ pub struct Settings {
     /// store (+0x24), every lock open and nothing new (owner decision 2 Nov: retail locks with a debug unlock-all; off
     /// by default).
     pub cac_unlock_all: bool,
+    /// The dynamic props' sounds (impacts, rolling and sliding loops; Vita system settings > Prop sounds): on by
+    /// default, off frees their voices and keeps their banks from loading.
+    pub prop_sounds: bool,
     /// The zombie cheat (Extras > Enter Cheat Code `zombie`): for the session only, never saved (retail keeps it on
     /// the simulation, not in the profile, b304).
     pub zombie: bool,
@@ -217,6 +221,7 @@ impl Default for Settings {
             dropper_all: false,
             dropper_free_camera: false,
             cac_unlock_all: false,
+            prop_sounds: true,
             zombie: false,
         }
     }
@@ -247,6 +252,7 @@ impl Settings {
             u8::from(self.dropper_all),
             u8::from(self.dropper_free_camera),
             u8::from(self.cac_unlock_all),
+            u8::from(self.prop_sounds),
         ]);
         for g in [c.left_gain.x, c.left_gain.y, c.right_gain.x, c.right_gain.y] {
             b.extend_from_slice(&g.to_le_bytes());
@@ -273,7 +279,8 @@ impl Settings {
         let v11 = b.len() == 8 + 17 + 16 && &b[..8] == MAGIC_V11;
         let v12 = b.len() == 8 + 18 + 16 && &b[..8] == MAGIC_V12;
         let v13 = b.len() == 8 + 19 + 16 && &b[..8] == MAGIC_V13;
-        if !v1 && !v2 && !v3 && !v4 && !v5 && !v6 && !v7 && !v8 && !v9 && !v10 && !v11 && !v12 && !v13 && (b.len() != 8 + 20 + 16 || &b[..8] != MAGIC) {
+        let v14 = b.len() == 8 + 20 + 16 && &b[..8] == MAGIC_V14;
+        if !v1 && !v2 && !v3 && !v4 && !v5 && !v6 && !v7 && !v8 && !v9 && !v10 && !v11 && !v12 && !v13 && !v14 && (b.len() != 8 + 21 + 16 || &b[..8] != MAGIC) {
             return None;
         }
         let shift = if v1 {
@@ -300,8 +307,10 @@ impl Settings {
             11
         } else if v13 {
             12
-        } else {
+        } else if v14 {
             13
+        } else {
+            14
         };
         let f = |at: usize| f32::from_le_bytes(b[at..at + 4].try_into().unwrap());
         let gain = |v: f32| if v.is_finite() && (0.5..=2.0).contains(&v) { v } else { 1.0 };
@@ -332,6 +341,7 @@ impl Settings {
             dropper_all: !(v1 || v2 || v3 || v4 || v5 || v6 || v7 || v8 || v9 || v10 || v11) && b[25] != 0,
             dropper_free_camera: !(v1 || v2 || v3 || v4 || v5 || v6 || v7 || v8 || v9 || v10 || v11 || v12) && b[26] != 0,
             cac_unlock_all: !(v1 || v2 || v3 || v4 || v5 || v6 || v7 || v8 || v9 || v10 || v11 || v12 || v13) && b[27] != 0,
+            prop_sounds: v1 || v2 || v3 || v4 || v5 || v6 || v7 || v8 || v9 || v10 || v11 || v12 || v13 || v14 || b[28] != 0,
             zombie: false,
         })
     }
@@ -365,14 +375,14 @@ mod tests {
         // A version 1 file (no menu-style byte) still loads, with the default for it.
         let mut v1 = b"SKVSET01".to_vec();
         v1.extend_from_slice(&s.encode()[8..8 + 7]);
-        v1.extend_from_slice(&s.encode()[8 + 20..]);
+        v1.extend_from_slice(&s.encode()[8 + 21..]);
         let loaded = Settings::decode(&v1).unwrap();
         assert!(loaded.retail_menus && !loaded.manual_meter);
         assert_eq!((loaded.volume, loaded.world, loaded.controls.left_gain.y), (3, 6, 1.1));
         // A version 2 file (no meter byte) loads with the meter off.
         let mut v2 = b"SKVSET02".to_vec();
         v2.extend_from_slice(&s.encode()[8..8 + 8]);
-        v2.extend_from_slice(&s.encode()[8 + 20..]);
+        v2.extend_from_slice(&s.encode()[8 + 21..]);
         let loaded = Settings::decode(&v2).unwrap();
         assert!(!loaded.retail_menus && !loaded.manual_meter);
         assert_eq!(loaded.controls.left_gain.y, 1.1);
@@ -381,7 +391,7 @@ mod tests {
         // A version 3 file (no physics byte) loads with fast physics.
         let mut v3 = b"SKVSET03".to_vec();
         v3.extend_from_slice(&s.encode()[8..8 + 10]);
-        v3.extend_from_slice(&s.encode()[8 + 20..]);
+        v3.extend_from_slice(&s.encode()[8 + 21..]);
         let loaded = Settings::decode(&v3).unwrap();
         assert!(loaded.fast_physics && loaded.manual_meter);
         assert_eq!(loaded.controls.left_gain.y, 1.1);
@@ -391,7 +401,7 @@ mod tests {
         s.retail_audio = false;
         let mut v4 = b"SKVSET04".to_vec();
         v4.extend_from_slice(&s.encode()[8..8 + 11]);
-        v4.extend_from_slice(&s.encode()[8 + 20..]);
+        v4.extend_from_slice(&s.encode()[8 + 21..]);
         let loaded = Settings::decode(&v4).unwrap();
         assert!(loaded.retail_audio && !loaded.fast_physics);
         assert_eq!(loaded.controls.left_gain.y, 1.1);
@@ -402,7 +412,7 @@ mod tests {
         s.traffic = 3;
         let mut v5 = b"SKVSET05".to_vec();
         v5.extend_from_slice(&s.encode()[8..8 + 12]);
-        v5.extend_from_slice(&s.encode()[8 + 20..]);
+        v5.extend_from_slice(&s.encode()[8 + 21..]);
         let loaded = Settings::decode(&v5).unwrap();
         assert_eq!((loaded.traffic, loaded.controls.left_gain.y), (TRAFFIC_DEFAULT, 1.1));
         assert_eq!(Settings::decode(&s.encode()), Some(s));
@@ -410,7 +420,7 @@ mod tests {
         s.ai_skaters = false;
         let mut v6 = b"SKVSET06".to_vec();
         v6.extend_from_slice(&s.encode()[8..8 + 13]);
-        v6.extend_from_slice(&s.encode()[8 + 20..]);
+        v6.extend_from_slice(&s.encode()[8 + 21..]);
         let loaded = Settings::decode(&v6).unwrap();
         assert!(loaded.ai_skaters && loaded.traffic == 3);
         assert_eq!(Settings::decode(&s.encode()), Some(s));
@@ -418,7 +428,7 @@ mod tests {
         s.pedestrians = 3;
         let mut v7 = b"SKVSET07".to_vec();
         v7.extend_from_slice(&s.encode()[8..8 + 14]);
-        v7.extend_from_slice(&s.encode()[8 + 20..]);
+        v7.extend_from_slice(&s.encode()[8 + 21..]);
         let loaded = Settings::decode(&v7).unwrap();
         assert_eq!(loaded.pedestrians, PEDESTRIANS_DEFAULT);
         assert_eq!(Settings::decode(&s.encode()), Some(s));
@@ -426,7 +436,7 @@ mod tests {
         s.minimap = false;
         let mut v9 = b"SKVSET09".to_vec();
         v9.extend_from_slice(&s.encode()[8..8 + 15]);
-        v9.extend_from_slice(&s.encode()[8 + 20..]);
+        v9.extend_from_slice(&s.encode()[8 + 21..]);
         let loaded = Settings::decode(&v9).unwrap();
         assert!(loaded.minimap && loaded.pedestrians == 3);
         assert_eq!(Settings::decode(&s.encode()), Some(s));
@@ -434,7 +444,7 @@ mod tests {
         s.imperial = true;
         let mut v10 = b"SKVSET10".to_vec();
         v10.extend_from_slice(&s.encode()[8..8 + 16]);
-        v10.extend_from_slice(&s.encode()[8 + 20..]);
+        v10.extend_from_slice(&s.encode()[8 + 21..]);
         let loaded = Settings::decode(&v10).unwrap();
         assert!(!loaded.imperial && !loaded.minimap);
         assert_eq!(loaded.controls.left_gain.y, 1.1);
@@ -443,7 +453,7 @@ mod tests {
         s.dropper_all = true;
         let mut v11 = b"SKVSET11".to_vec();
         v11.extend_from_slice(&s.encode()[8..8 + 17]);
-        v11.extend_from_slice(&s.encode()[8 + 20..]);
+        v11.extend_from_slice(&s.encode()[8 + 21..]);
         let loaded = Settings::decode(&v11).unwrap();
         assert!(loaded.imperial && !loaded.dropper_all);
         assert_eq!(loaded.controls.left_gain.y, 1.1);
@@ -452,7 +462,7 @@ mod tests {
         s.dropper_free_camera = true;
         let mut v12 = b"SKVSET12".to_vec();
         v12.extend_from_slice(&s.encode()[8..8 + 18]);
-        v12.extend_from_slice(&s.encode()[8 + 20..]);
+        v12.extend_from_slice(&s.encode()[8 + 21..]);
         let loaded = Settings::decode(&v12).unwrap();
         assert!(loaded.dropper_all && !loaded.dropper_free_camera);
         assert_eq!(loaded.controls.left_gain.y, 1.1);
@@ -462,14 +472,24 @@ mod tests {
         s.cac_unlock_all = true;
         let mut v13 = b"SKVSET13".to_vec();
         v13.extend_from_slice(&s.encode()[8..8 + 19]);
-        v13.extend_from_slice(&s.encode()[8 + 20..]);
+        v13.extend_from_slice(&s.encode()[8 + 21..]);
         let loaded = Settings::decode(&v13).unwrap();
         assert!(loaded.dropper_free_camera && !loaded.cac_unlock_all);
         assert_eq!(loaded.controls.left_gain.y, 1.1);
         assert_eq!(Settings::decode(&s.encode()), Some(s));
+        // A version 14 file (no prop sounds byte) loads with them on; the setting round-trips.
+        s.prop_sounds = false;
+        let mut v14 = b"SKVSET14".to_vec();
+        v14.extend_from_slice(&s.encode()[8..8 + 20]);
+        v14.extend_from_slice(&s.encode()[8 + 21..]);
+        let loaded = Settings::decode(&v14).unwrap();
+        assert!(loaded.prop_sounds && loaded.cac_unlock_all);
+        assert_eq!(loaded.controls.left_gain.y, 1.1);
+        assert!(!Settings::decode(&s.encode()).unwrap().prop_sounds);
+        s.prop_sounds = true;
         assert_eq!(Settings::decode(b"garbage"), None);
         let mut bad = s.encode();
-        bad[28..32].copy_from_slice(&f32::NAN.to_le_bytes());
+        bad[29..33].copy_from_slice(&f32::NAN.to_le_bytes());
         assert_eq!(Settings::decode(&bad).unwrap().controls.left_gain.x, 1.0);
     }
 

@@ -61,6 +61,18 @@ impl AirTrajectoryRuntime {
         props: Option<&BoardWorld>,
     ) -> Result<bool, String> {
         let launched = self.selector.launch(info, input, &self.settings)?;
+        // AIR_RECORDED_TAKEOFF (research b813): an AI take-off with a recorded arc, the inputs of the accept test
+        // (`82D67B50`) and whether it passed, so a short NPC jump shows whether it flew our arc or the recording's.
+        if let (true, Some(arc), Some(info), Some(origin)) = (launched, input.recorded_arc, self.selector.launch_info(), self.selector.query_origin()) {
+            let v = info.start_velocity;
+            let next = [origin[0] + v[0] * info.timestep - arc.position[0], origin[1] + v[1] * info.timestep - arc.position[1], origin[2] + v[2] * info.timestep - arc.position[2]];
+            let len = |a: [f32; 4]| (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt();
+            tracing::info!(
+                "AIR_RECORDED_TAKEOFF accepted={} velocity=[{:.2}, {:.2}, {:.2}] speed={:.2} recorded_velocity=[{:.2}, {:.2}, {:.2}] recorded_speed={:.2} start_error_sq={:.3} origin=[{:.2}, {:.2}, {:.2}] recorded_start=[{:.2}, {:.2}, {:.2}]",
+                self.selector.recorded(), v[0], v[1], v[2], len(v), arc.velocity[0], arc.velocity[1], arc.velocity[2], len(arc.velocity),
+                next[0] * next[0] + next[1] * next[1] + next[2] * next[2], origin[0], origin[1], origin[2], arc.position[0], arc.position[1], arc.position[2]
+            );
+        }
         if launched {
             self.submit(world, props)?;
         }

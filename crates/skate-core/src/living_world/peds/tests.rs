@@ -709,3 +709,228 @@ fn a_seated_step_avoid_returns_to_the_held_sit_cycle() {
     run(&mut p, 0.2);
     assert_eq!(p.reaction_anim(), Some("Sit2Stand"));
 }
+
+fn rows(spec: &[(f32, &str, anim::Tier)]) -> Vec<anim::SpeedRow> {
+    spec.iter().map(|&(threshold, state, tier)| anim::SpeedRow { threshold, state: state.into(), tier, turn_from: Vec::new() }).collect()
+}
+
+/// The stock default and female rows (b682): a speed above 1.0 gets +0.25, then the highest row at or below it.
+#[test]
+fn the_speed_rows_pick_state_and_tier_after_the_bump() {
+    use anim::Tier::*;
+    let default = rows(&[(0.0, "Idle", Default), (1.0, "Shuffle", Default), (2.0, "Walk", Default), (4.0, "Walk", Brisk), (6.0, "ChaseRun", Slow), (8.0, "ChaseRun", Default), (10.0, "ChaseRun", Fast)]);
+    let bump = anim::SpeedBump::default();
+    let pick = |r: &[anim::SpeedRow], s| anim::speed_row(r, s, bump).map(|r| (r.state.clone(), r.tier));
+    assert_eq!(pick(&default, 0.5), Some(("Idle".into(), Default)));
+    assert_eq!(pick(&default, 1.0), Some(("Shuffle".into(), Default)), "no bump at 1.0");
+    assert_eq!(pick(&default, 1.7), Some(("Shuffle".into(), Default)));
+    assert_eq!(pick(&default, 1.75), Some(("Walk".into(), Default)));
+    assert_eq!(pick(&default, 3.8), Some(("Walk".into(), Brisk)));
+    assert_eq!(pick(&default, 5.8), Some(("ChaseRun".into(), Slow)));
+    assert_eq!(pick(&default, 7.8), Some(("ChaseRun".into(), Default)));
+    assert_eq!(pick(&default, 9.8), Some(("ChaseRun".into(), Fast)));
+    let female = rows(&[(0.0, "Idle", Default), (1.0, "Shuffle", Default), (2.0, "Walk", Default), (4.0, "Walk", Brisk), (8.0, "ChaseRun", Slow)]);
+    assert_eq!(pick(&female, 6.0), Some(("Walk".into(), Brisk)));
+    assert_eq!(pick(&female, 10.0), Some(("ChaseRun".into(), Slow)));
+    // Intents: a speed decides; a flee without one runs the untiered run row, else the first one.
+    assert_eq!(anim::moving_intent(Intent::Walk, true, Some(3.0), &default, bump), (Intent::Walk, Default));
+    assert_eq!(anim::moving_intent(Intent::Walk, false, Some(9.8), &default, bump), (Intent::Run, Fast));
+    assert_eq!(anim::moving_intent(Intent::Walk, true, None, &default, bump), (Intent::Run, Default));
+    assert_eq!(anim::moving_intent(Intent::Walk, true, None, &female, bump), (Intent::Run, Slow));
+    assert_eq!(anim::moving_intent(Intent::Walk, true, Some(9.0), &[], bump), (Intent::Run, Default));
+    assert_eq!(anim::moving_intent(Intent::TurnLeft, true, Some(9.0), &default, bump), (Intent::TurnLeft, Default));
+}
+
+/// `WalkCyc.Brisk` / `Default`: a tier change waits for the walk's branch window, then swaps the cycle.
+#[test]
+fn a_tier_change_swaps_the_walk_cycle_at_the_branch_window() {
+    let (_, mut set, mut clips) = fixture();
+    let walk = clips["WALK"].clone();
+    clips.insert("BRISK".into(), PedClip { name: "BRISK".into(), ..walk });
+    set.entries.insert(anim::names::BRISK_WALK.into(), vec![RemapClip { clip: "BRISK".into(), windows: vec![(0.0, 0.051, 1), (0.4166, 0.584, -1), (1.0, 1.1, 1)] }]);
+    let mut p = PedAnimPlayer::new(&set, 3).unwrap();
+    let dt = 1.0 / 30.0;
+    p.intent = Intent::Walk;
+    for _ in 0..60 {
+        p.step(dt, &set, &clips);
+    }
+    assert_eq!((p.state, p.current_clip()), (Locomotion::Walk, "WALK"));
+    p.tier = anim::Tier::Brisk;
+    for _ in 0..60 {
+        p.step(dt, &set, &clips);
+    }
+    assert_eq!((p.state, p.current_clip()), (Locomotion::Walk, "BRISK"));
+    p.tier = anim::Tier::Slow;
+    for _ in 0..60 {
+        p.step(dt, &set, &clips);
+    }
+    assert_eq!(p.current_clip(), "WALK", "Slow is a run tier: the walk plays its default cycle");
+}
+
+/// `motiongraph_chaserun.xml` / `motiongraph_idle.xml` (b684): Idle -> `Stand2ChaseRun` -> the run cycle, a turn
+/// intent plays the run turn (left mirrored) back into the cycle, Idle stops through `ChaseRun2Stand`, Walk goes
+/// back through `Stand2Walk`.
+#[test]
+fn a_run_starts_turns_and_stops_through_its_own_clips() {
+    let (_, mut set, mut clips) = fixture();
+    let r = |c: &str| vec![RemapClip { clip: c.into(), windows: vec![] }];
+    for (logical, clip_name, frames, speed, looping) in [
+        (anim::names::RUN_START, "RUNSTART", 20, 2.0, false),
+        (anim::names::RUN, "RUN", 24, 6.0, true),
+        (anim::names::run_turn(90), "RUNTURN", 20, 4.0, false),
+        (anim::names::RUN_STOP, "RUNSTOP", 20, 1.0, false),
+    ] {
+        clips.insert(clip_name.into(), clip(clip_name, frames, speed, 0.0, looping, 0.1, vec![]));
+        set.entries.insert(logical.into(), r(clip_name));
+    }
+    let mut p = PedAnimPlayer::new(&set, 5).unwrap();
+    let dt = 1.0 / 30.0;
+    let mut states = vec![p.state];
+    let mut step = |p: &mut PedAnimPlayer, intent: Intent, n: usize, states: &mut Vec<Locomotion>| {
+        p.intent = intent;
+        for _ in 0..n {
+            if let Some(e) = p.step(dt, &set, &clips).entered {
+                if states.last() != Some(&e) {
+                    states.push(e);
+                }
+            }
+        }
+    };
+    step(&mut p, Intent::Run, 40, &mut states);
+    assert_eq!(p.current_clip(), "RUN");
+    p.turn_degrees = 90;
+    step(&mut p, Intent::TurnLeft, 1, &mut states);
+    assert_eq!((p.state, p.current_clip()), (Locomotion::RunTurnLeft, "RUNTURN"));
+    step(&mut p, Intent::Run, 30, &mut states);
+    step(&mut p, Intent::Idle, 40, &mut states);
+    assert_eq!(
+        states,
+        vec![Locomotion::Idle, Locomotion::RunStart, Locomotion::Run, Locomotion::RunTurnLeft, Locomotion::Run, Locomotion::Stop, Locomotion::Idle],
+    );
+    step(&mut p, Intent::Run, 40, &mut states);
+    step(&mut p, Intent::Walk, 2, &mut states);
+    assert_eq!(p.state, Locomotion::Start, "run -> walk plays Stand2Walk");
+}
+
+/// `motiongraph_tired.xml` (b684): resting from the run plays ChaseTiredInto at the run cycle's branch window, then the
+/// tired cycle until the rest ends (StopTired at a loop end), ChaseTiredOut, and a walk starts its cycle directly.
+#[test]
+fn a_rest_after_a_run_plays_the_tired_clips_then_walks_on() {
+    let (_, mut set, mut clips) = fixture();
+    let r = |c: &str| vec![RemapClip { clip: c.into(), windows: vec![] }];
+    for (logical, name, frames, looping) in [(anim::names::RUN, "RUN", 24, true), (anim::names::TIRED_INTO, "TINTO", 20, false), (anim::names::TIRED_CYCLE, "TCYC", 30, true), (anim::names::TIRED_OUT, "TOUT", 20, false)] {
+        clips.insert(name.into(), clip(name, frames, 0.0, 0.0, looping, 0.1, vec![]));
+        set.entries.insert(logical.into(), r(name));
+    }
+    let mut p = PedAnimPlayer::new(&set, 5).unwrap();
+    let dt = 1.0 / 30.0;
+    let mut states = vec![p.state];
+    let mut step = |p: &mut PedAnimPlayer, n: usize, states: &mut Vec<Locomotion>| {
+        for _ in 0..n {
+            if let Some(e) = p.step(dt, &set, &clips).entered {
+                if states.last() != Some(&e) {
+                    states.push(e);
+                }
+            }
+        }
+    };
+    p.intent = Intent::Run;
+    step(&mut p, 20, &mut states);
+    p.resting = true;
+    p.intent = Intent::Idle;
+    step(&mut p, 120, &mut states);
+    assert_eq!(p.state, Locomotion::TiredCycle, "tired until rested: {states:?}");
+    p.resting = false;
+    p.intent = Intent::Walk;
+    step(&mut p, 60, &mut states);
+    assert_eq!(&states[..], &[Locomotion::Idle, Locomotion::Run, Locomotion::TiredInto, Locomotion::TiredCycle, Locomotion::TiredOut, Locomotion::Walk]);
+}
+
+/// `motiongraph_shuffle.xml` (b686): a speed in the Shuffle row shuffles: `Stand2Shuffle`, the shuffle cycle, a turn
+/// plays the shuffle turn, Idle stops through `Shuffle2Stand`; TargetWaypoint's 1.0 picks the row (no bump at 1.0).
+#[test]
+fn a_shuffle_speed_shuffles_turns_and_stops_through_its_clips() {
+    use anim::Tier::Default as D;
+    let default = rows(&[(0.0, "Idle", D), (1.0, "Shuffle", D), (2.0, "Walk", D)]);
+    assert_eq!(anim::moving_intent(Intent::Walk, false, Some(1.0), &default, anim::SpeedBump::default()), (Intent::Shuffle, D));
+    let (_, mut set, mut clips) = fixture();
+    let r = |c: &str| vec![RemapClip { clip: c.into(), windows: vec![] }];
+    for (logical, name, looping) in [(anim::names::SHUFFLE_START, "SHSTART", false), (anim::names::SHUFFLE, "SHUFFLE", true), (anim::names::shuffle_turn(45), "SHTURN", false), (anim::names::SHUFFLE_STOP, "SHSTOP", false)] {
+        clips.insert(name.into(), clip(name, 20, 0.5, 0.0, looping, 0.1, vec![]));
+        set.entries.insert(logical.into(), r(name));
+    }
+    let mut p = PedAnimPlayer::new(&set, 5).unwrap();
+    let dt = 1.0 / 30.0;
+    let mut states = vec![p.state];
+    let mut step = |p: &mut PedAnimPlayer, intent: Intent, n: usize, states: &mut Vec<Locomotion>| {
+        p.intent = intent;
+        for _ in 0..n {
+            if let Some(e) = p.step(dt, &set, &clips).entered {
+                if states.last() != Some(&e) {
+                    states.push(e);
+                }
+            }
+        }
+    };
+    step(&mut p, Intent::Shuffle, 30, &mut states);
+    p.turn_degrees = 45;
+    step(&mut p, Intent::TurnRight, 1, &mut states);
+    step(&mut p, Intent::Shuffle, 30, &mut states);
+    step(&mut p, Intent::Idle, 40, &mut states);
+    assert_eq!(states, vec![Locomotion::Idle, Locomotion::ShuffleStart, Locomotion::Shuffle, Locomotion::ShuffleTurnRight, Locomotion::Shuffle, Locomotion::Stop, Locomotion::Idle]);
+}
+
+/// `sub_82E2ADE0` / `sub_82E2A500` mask 0xCC / `sub_82E2AFC0` (b686): a target 25 degrees or more off the facing turns
+/// (90 from 70 up, nothing larger); facing it, the step is picked on the 25 / 70 / 115 / 160 edges; no speed, no step.
+#[test]
+fn the_strafe_turns_to_the_target_then_steps_by_angle() {
+    use anim::{strafe_input, StrafeMove, StrafeRules};
+    let r = StrafeRules::default();
+    // Facing +z (heading 0); +x is the ped's left (positive error = left; retail: cross(facing, dir).y > 0).
+    assert_eq!(strafe_input(0.0, [-1.0, 0.0, 0.0], None, 2.0, &r).turn, Some((90, false)));
+    assert_eq!(strafe_input(0.0, [1.0, 0.0, -1.0], None, 2.0, &r).turn, Some((90, true)), "135 off falls to 90");
+    assert_eq!(strafe_input(0.0, [0.5, 0.0, 1.0], None, 2.0, &r).turn, Some((45, true)));
+    // `sub_82E2AB18` is 3D: a chasee 0.5 m up 1 m ahead is 26.6 degrees off, a 45 turn (b695).
+    assert_eq!(strafe_input(0.0, [0.0, 0.5, 1.0], None, 2.0, &r).turn, Some((45, false)));
+    let facing = |step: [f32; 2]| strafe_input(0.0, [0.0, 0.0, 1.0], Some(step), 2.0, &r);
+    assert_eq!(facing([0.0, 1.0]).step, Some(StrafeMove::Forwards));
+    assert_eq!(facing([0.0, -1.0]).step, Some(StrafeMove::Backwards));
+    assert_eq!(facing([1.0, 0.0]).step, Some(StrafeMove::Side { degrees: 90, left: true }));
+    assert_eq!(facing([-1.0, 1.0]).step, Some(StrafeMove::Side { degrees: 45, left: false }));
+    assert_eq!(facing([-1.0, -1.0]).step, Some(StrafeMove::Side { degrees: 135, left: false }));
+    assert_eq!(strafe_input(0.0, [0.0, 0.0, 1.0], Some([1.0, 0.0]), 0.0, &r).step, None);
+}
+
+/// `motiongraph_strafe.xml` (b686): Idle -> `Stand2Strafe` -> `StrafeIdle`, a step plays its clip (left mirrored), a
+/// turn plays the strafe turn; the flag cleared goes straight back to the idle cycle (no Strafe2Stand).
+#[test]
+fn a_strafing_ped_steps_turns_and_leaves_without_a_stand_clip() {
+    use anim::{StrafeInput, StrafeMove};
+    let (_, mut set, mut clips) = fixture();
+    let r = |c: &str| vec![RemapClip { clip: c.into(), windows: vec![] }];
+    for (logical, name, looping) in [(anim::names::STRAFE_INTO, "STIN", false), (anim::names::STRAFE_IDLE, "STIDLE", true), ("StrafeR90", "STR90", true), ("StrafeTurnR45", "STTURN", false)] {
+        clips.insert(name.into(), clip(name, 20, 0.3, 0.0, looping, 0.1, vec![]));
+        set.entries.insert(logical.into(), r(name));
+    }
+    let mut p = PedAnimPlayer::new(&set, 5).unwrap();
+    let dt = 1.0 / 30.0;
+    let mut states = vec![p.state];
+    let mut step = |p: &mut PedAnimPlayer, input: Option<StrafeInput>, n: usize, states: &mut Vec<Locomotion>| {
+        p.strafe = input;
+        for _ in 0..n {
+            if let Some(e) = p.step(dt, &set, &clips).entered {
+                if states.last() != Some(&e) {
+                    states.push(e);
+                }
+            }
+        }
+    };
+    let stand = StrafeInput::default();
+    step(&mut p, Some(stand), 30, &mut states);
+    step(&mut p, Some(StrafeInput { turn: None, step: Some(StrafeMove::Side { degrees: 90, left: true }) }), 1, &mut states);
+    assert_eq!((p.state, p.current_clip()), (Locomotion::StrafeMove, "STR90"));
+    step(&mut p, Some(StrafeInput { turn: Some((45, false)), step: None }), 1, &mut states);
+    step(&mut p, Some(stand), 30, &mut states);
+    step(&mut p, None, 2, &mut states);
+    assert_eq!(states, vec![Locomotion::Idle, Locomotion::StrafeInto, Locomotion::StrafeIdle, Locomotion::StrafeMove, Locomotion::StrafeTurnRight, Locomotion::StrafeIdle, Locomotion::Idle]);
+}

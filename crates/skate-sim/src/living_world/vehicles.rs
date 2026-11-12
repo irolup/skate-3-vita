@@ -273,6 +273,7 @@ pub(crate) fn parse_vehicle_data(vehicles: &[u8], tables: Option<&[u8]>) -> Resu
                 // The junction and lead standoffs (`+3660` / `+3664` = length x these, `82C3CDD0`; b163).
                 ("Hash_2ACE3FEE16D6F7A2", &mut params.stop_standoff_factor),
                 ("Hash_73A1989BB90C93BA", &mut params.lead_standoff_factor),
+                ("Hash_30313EA6F282C874", &mut params.obstacle_standoff_factor),
             ] {
                 if let Some(v) = num(hash) {
                     *field = v;
@@ -802,7 +803,7 @@ fn look_ahead(traffic: &mut TrafficState, observers: &[skate_core::living_world:
     }));
     for (serial, frame, size) in &cars {
         let Some(car) = traffic.cars.iter_mut().find(|c| c.key == *serial) else { continue };
-        let quad = look_ahead_quad(frame, car.speed, car.params.min_gap, 0.0, None, &params);
+        let quad = look_ahead_quad(frame, car.speed, car.obstacle_standoff(), 0.0, None, &params);
         // 82C344D0: a car the player holds skips the slow-speed soft records (b57).
         car.obstacle = nearest(frame, &quad, &list, car.speed, !car.player_held, &params).map(|(i, d)| ObstacleHit { distance: d, soft: list[i].soft, id: list[i].id });
         // 82C414A8 after the look-ahead: quad B with the same widths as quad A (speed ratio 0, see above).
@@ -825,6 +826,19 @@ pub(crate) fn push_vehicle_proxies(traffic: &TrafficState, physics: &mut crate::
         proxies.append_solid(proxy_with(car, &motion.curr, motion.velocity, collision), physics, skater, false);
     }
     physics.network_proxies = proxies;
+}
+
+/// The car proxies (contact group 8) as on-foot ground this tick, unless a mod switched it off: the on-foot launch /
+/// requery arc and ground lines then land on a car roof instead of the street under it, where the body's extra
+/// volumes met the car and bailed the skater (wipeout 32, b648; retail sweeps the dynamic island pools, `82764CF8`).
+pub(crate) fn publish_on_foot_solids(physics: &mut crate::physics::GamePhysics, settings: &super::LivingWorldSettings) {
+    let group = crate::physics::VEHICLE_GROUP;
+    let cars: Vec<_> = if settings.on_foot_vehicle_ground {
+        physics.network_proxies.solids.iter().filter(|(_, s)| s.contact_group == group).map(|(_, s)| s.clone()).collect()
+    } else {
+        Vec::new()
+    };
+    physics.on_foot_vehicles = (!cars.is_empty()).then(|| std::sync::Arc::new(crate::modding::bridge::MovingQueries(cars)));
 }
 
 /// Grab-scene ids of the cars: object `CAR_GRAB_TAG | serial`, spline / geometry `CAR_GRAB_TAG | serial << 3 | index`

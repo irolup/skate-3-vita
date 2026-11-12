@@ -153,7 +153,7 @@ fn run(m: &NavMesh, bodies: &mut [Body], ticks: u32, rule: CrosswalkRule, signal
             let out = b.nav.step(m, &p, rule, signals, b.id, b.pos, b.heading, b.state, &others, dt);
             b.heading += out.turn;
             match out.intent {
-                Intent::Walk | Intent::Run => {
+                Intent::Walk | Intent::Run | Intent::Shuffle => {
                     b.state = Locomotion::Walk;
                     let f = forward(b.heading);
                     let to = [b.pos[0] + f[0] * 1.325 * dt, b.pos[1], b.pos[2] + f[1] * 1.325 * dt];
@@ -433,6 +433,34 @@ fn a_pinned_walking_ped_gives_up_and_plans_away_from_its_target() {
     assert!(next[2] < pos[2], "planned away from the old target: {next:?}");
 }
 
+/// b645: the path request (`82E957F8`) moves an off-mesh or unreachable target onto the nearest reachable point; with
+/// none in range the ped gets no corners and picks a new target, it never walks straight at the point (ask 496).
+#[test]
+fn an_unreachable_target_moves_onto_the_mesh_and_is_never_walked_at() {
+    // Two strips, x 0..5 and x 6..10 (a hole at 5..6).
+    let m = mesh(&grid(10, 1, 1.0, |i, _| (i != 5).then_some(AREA_DEFAULT)));
+    let pos = [0.5, 0.0, 0.5];
+    let dt = 1.0 / 30.0;
+    let walk = |p: &WanderParams, target: [f32; 3]| {
+        let mut nav = PedNav::default();
+        nav.set_route(Some(PedRoute { points: vec![target], looped: false }));
+        nav.step(&m, p, CrosswalkRule::Off, &NoSignals, 1, pos, 0.0, Locomotion::Walk, &[], dt);
+        nav
+    };
+    let p = WanderParams::default();
+    // Off the mesh, 1.2 m past the strip's end: the target becomes the edge point.
+    let nav = walk(&p, [-1.2, 0.0, 0.5]);
+    assert_eq!(nav.target, Some([0.0, 0.0, 0.5]));
+    assert_eq!(nav.corners.last(), Some(&[0.0, 0.0, 0.5]));
+    // On the other strip: the near edge of the ped's own strip.
+    let nav = walk(&p, [6.2, 0.0, 0.5]);
+    assert_eq!(nav.target, Some([5.0, 0.0, 0.5]));
+    // A mod range below the distance: no corners (no straight walk at the point), the short fan next.
+    let near = WanderParams { rewrite_range: 1.0, ..WanderParams::default() };
+    let nav = walk(&near, [-1.2, 0.0, 0.5]);
+    assert!(nav.corners.iter().all(|c| c[0] >= 0.0), "never a corner off the mesh: {:?}", nav.corners);
+}
+
 /// b277: the path goal is the nearest point the start can reach (retail `82933A48`, unbounded), not the peds' 0.5 m
 /// point query; B's plan acceptance (2.0 h / 1.0 v) then decides.
 #[test]
@@ -458,9 +486,48 @@ fn path_goal_snaps_to_the_nearest_reachable_point() {
     let s = ControllerBSettings::default();
     let input = BInput { position: start.position, body: [1.0, 0.0, 0.0], can_move: true, ..Default::default() };
     let path = PathService::solve(&m, start.position, [-1.2, 0.0, 0.5], s.goal_locate_radius, s.start_locate_radius).unwrap();
-    assert_eq!(path.last().unwrap().entry, [0.0, 0.0, 0.5]);
+    assert_eq!(path.last().unwrap().exit, [0.0, 0.0, 0.5]);
     assert!(ControllerB::activate(&s, &m, [-1.2, 0.0, 0.5], [1.0, 0.0, 0.0], &input).is_some());
     assert!(ControllerB::activate(&s, &m, [-2.67, 0.0, 0.5], [1.0, 0.0, 0.0], &input).is_none());
+}
+
+/// b726: one path element per polygon crossed, chained (end = next start), from the raw start to the snapped goal.
+#[test]
+fn path_elements_cross_one_polygon_each_and_chain() {
+    use super::nav::{dist_xz, NavPoint};
+    let row = mesh(&grid(20, 1, 1.0, |_, _| Some(AREA_DEFAULT)));
+    let (from, to) = (row.locate([0.5, 0.0, 0.5]).unwrap(), row.locate([19.5, 0.0, 0.5]).unwrap());
+    let path = row.find_path_elements(from.position, from, to).unwrap();
+    assert!(path.len() >= 19, "one per crossing: {}", path.len());
+    assert_eq!((path[0].0, path.last().unwrap().1), (from.position, to.position));
+    assert!(path.windows(2).all(|w| w[0].1 == w[1].0), "end = next start");
+    assert!(path.iter().all(|(a, b)| dist_xz(*a, *b) <= 1.5), "a leg is one polygon: {path:?}");
+    // A funnel corner stays on the path: the walk round a cut still turns where it did.
+    let cut = mesh(&grid(10, 10, 1.0, |i, j| (!((3..=6).contains(&i) && (3..=6).contains(&j))).then_some(AREA_DEFAULT)));
+    let (from, to) = (cut.locate([1.5, 0.0, 5.0]).unwrap(), cut.locate([8.5, 0.0, 5.0]).unwrap());
+    let path = cut.find_path_elements(from.position, from, to).unwrap();
+    for corner in cut.find_path(from, to).unwrap() {
+        assert!(path.iter().any(|(_, end)| *end == corner), "corner {corner:?} in {path:?}");
+    }
+    // Within one polygon: start to goal. A raw start off its snap point gets its own element.
+    let (a, b) = (row.locate([0.2, 0.0, 0.5]).unwrap(), row.locate([0.8, 0.0, 0.5]).unwrap());
+    assert_eq!(row.find_path_elements(a.position, a, b).unwrap(), vec![(a.position, b.position)]);
+    let raw = [0.2, 0.0, 0.9];
+    let off = NavPoint { poly: a.poly, position: [0.2, 0.0, 0.5] };
+    assert_eq!(row.find_path_elements(raw, off, b).unwrap()[0], (raw, off.position));
+}
+
+/// b725 / b726: a long straight walk resets the waypoint limit at each crossing, so it arrives instead of being wiped out.
+#[test]
+fn a_long_walk_keeps_under_the_waypoint_limit_of_one_element() {
+    use super::nav::dist_xz;
+    use crate::living_world::controller_b::{ControllerBSettings, PathService};
+    let row = mesh(&grid(80, 1, 1.0, |_, _| Some(AREA_DEFAULT)));
+    let s = ControllerBSettings::default();
+    let path = PathService::solve(&row, [0.5, 0.0, 0.5], [79.5, 0.0, 0.5], s.goal_locate_radius, s.start_locate_radius).unwrap();
+    let ticks_at_walk_speed = |a: [f32; 3], b: [f32; 3]| dist_xz(a, b) / 5.0 * 60.0;
+    assert!(path.iter().all(|e| ticks_at_walk_speed(e.entry, e.exit) < s.stuck_waypoint_ticks as f32));
+    assert!(ticks_at_walk_speed([0.5, 0.0, 0.5], [79.5, 0.0, 0.5]) > s.stuck_waypoint_ticks as f32, "the whole walk as one leg would trip it");
 }
 
 /// b324: a walk-back start off the mesh (a skater stalled on a grind block, inside the block's navmesh cut, 2-3 m up)
@@ -499,7 +566,7 @@ fn walk_back_start_snaps_from_an_obstacle_cut() {
 }
 
 /// b515 / b516: an approach goal with no path (another component) leaves the ped standing, asking again each update
-/// (retail bot mode 0), while a mod's plain route still walks straight at it (ours, unchanged).
+/// (retail bot mode 0), while a plain route walks to the nearest reachable point (the path request rewrite, b645).
 #[test]
 fn an_approach_goal_with_no_path_leaves_the_ped_standing() {
     // Two strips, x 0..5 and x 6..10 (a hole at 5..6).
@@ -520,8 +587,25 @@ fn an_approach_goal_with_no_path_leaves_the_ped_standing() {
     assert!((bodies[0].pos[0] - start[0]).hypot(bodies[0].pos[2] - start[2]) < 1e-3, "stood: {:?}", bodies[0].pos);
     assert!(planned >= 100, "asked again each update: {planned}");
     run(&m, &mut bodies[1..], 120, CrosswalkRule::Off, &lamp, |_, _| {});
-    assert!(bodies[1].pos[0] > 2.0, "a plain route walks straight at it: {:?}", bodies[1].pos);
+    assert!(bodies[1].pos[0] > 2.0, "a plain route walks to the reachable edge: {:?}", bodies[1].pos);
     // A new plain route clears the approach flag.
     bodies[0].nav.set_route(Some(PedRoute { points: vec![goal], looped: false }));
     assert!(!bodies[0].nav.hold_on_fail);
+}
+/// b650 (ask 393): a flee leg behind a wall the mesh goes round keeps its far goal (the old straight-line cut stopped
+/// it at the wall); a goal on an unconnected island moves to the nearest reachable point.
+#[test]
+fn a_flee_goal_stays_behind_a_wall_and_moves_off_an_island() {
+    use super::flee::goal_on_mesh;
+    // 20 x 3 m strip; column 5 is a wall except its top row.
+    let walled = mesh(&grid(20, 3, 1.0, |i, j| (i != 5 || j == 2).then_some(AREA_DEFAULT)));
+    let start = walled.locate([0.5, 0.0, 0.5]).unwrap();
+    let far = [15.5, 0.0, 0.5];
+    assert!(!walled.clear_line(start, far), "the straight line hits the wall");
+    assert_eq!(goal_on_mesh(&walled, start.poly, far), far, "connected round the wall: the goal stays");
+    // Column 9 is a full gap: cells 10.. are an island.
+    let split = mesh(&grid(20, 3, 1.0, |i, _| (i != 9).then_some(AREA_DEFAULT)));
+    let start = split.locate([0.5, 0.0, 0.5]).unwrap();
+    let g = goal_on_mesh(&split, start.poly, far);
+    assert!((g[0] - 9.0).abs() < 1e-3 && (g[2] - 0.5).abs() < 1e-3, "nearest reachable edge: {g:?}");
 }

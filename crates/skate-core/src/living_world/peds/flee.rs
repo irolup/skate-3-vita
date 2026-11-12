@@ -1,17 +1,5 @@
-//! Where a fleeing pedestrian runs (doc 26 "Ped behaviour runtime"). Retail (TU3, evidence only;
-//! re-implemented; `.local/research/peds/b8-ped-flee-steering.md`, main checked the leg length,
-//! the speed gate and the blend):
-//! - the Flee intent installs a goal provider (`sub_82E35E80`, provider vtable `0x8232C818`) and an
-//!   arrival radius of 2.0 m (`S.vfn136`, `0x82060C50`);
-//! - the direction (`sub_82E318F8`): `away` = flat ped position - flat threat position; when the
-//!   threat moves slower than 1 m/s (`0x8231A844`) or the ped is behind its motion, straight away;
-//!   else `0.5 x (side + normalize(away))` (`0x8209975C`; not renormalised), `side` = the threat's
-//!   motion direction x up, on the ped's side;
-//! - the goal = position + direction x 15 m (`0x820BD16C`), then a navmesh cast (`sub_82C465A8`;
-//!   a blocked goal is rewritten by `sub_82C46208`: we stop at the last clear point, inferred);
-//! - a new leg when the ped is within the arrival radius of its goal (`sub_82E2BC70`, 3D).
-//! The run speed is the ped type's chase record (`CD65`, 11 for pedestrians) turned into a gait
-//! (`sub_82E2D260`); our body plays the run cycle and moves by its root motion.
+//! Where a fleeing pedestrian runs (b8; goal provider 82E35E80, direction 82E318F8, 15 m legs).
+//! Retail rules: docs/hails-additions/26g-living-world-ped-interactions.md#ped-flee
 
 use super::super::Vec3;
 
@@ -22,11 +10,13 @@ pub struct FleeParams {
     pub arrival_radius: f32,
     pub threat_speed_gate: f32,
     pub side_blend: f32,
+    /// A new leg when the bot is done short of the goal (`82E2CB08`, b697).
+    pub releg_on_nav_done: bool,
 }
 
 impl Default for FleeParams {
     fn default() -> Self {
-        Self { leg: 15.0, arrival_radius: 2.0, threat_speed_gate: 1.0, side_blend: 0.5 }
+        Self { leg: 15.0, arrival_radius: 2.0, threat_speed_gate: 1.0, side_blend: 0.5, releg_on_nav_done: true }
     }
 }
 
@@ -63,6 +53,16 @@ pub fn goal(position: Vec3, threat: Vec3, threat_velocity: Vec3, p: &FleeParams)
 pub fn arrived(position: Vec3, goal: Vec3, p: &FleeParams) -> bool {
     let d = [position[0] - goal[0], position[1] - goal[1], position[2] - goal[2]];
     d[0] * d[0] + d[1] * d[1] + d[2] * d[2] <= p.arrival_radius * p.arrival_radius
+}
+
+/// The leg goal test (`82C465A8`, b650): a goal on a polygon reachable from the ped's polygon `from` stays, walls or
+/// rails between included (the path goes round); else it moves to the nearest reachable navmesh point (`82C46208` ->
+/// `82933E18`, unbounded); no result keeps the raw goal (retail code 3).
+pub fn goal_on_mesh(mesh: &super::nav::NavMesh, from: u32, goal: Vec3) -> Vec3 {
+    if !super::chase::reach_failed(mesh, Some(from), mesh.locate(goal).map(|p| p.poly)) {
+        return goal;
+    }
+    mesh.locate_nearest(goal, from, f32::MAX).map_or(goal, |p| p.position)
 }
 
 #[cfg(test)]

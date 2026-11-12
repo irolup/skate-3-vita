@@ -378,6 +378,16 @@ pub(crate) fn prop_obstacle_inputs(d: &crate::physics::prop_dynamics::PropDynami
         .collect()
 }
 
+/// The props the object flee reads: the ones moving at half its speed floor or more (a flee want keeps its target
+/// while the prop slows). skate_vita (performance): upstream lists every prop every think, with a name string and a
+/// map entry each.
+fn moving_prop_inputs(d: &crate::physics::prop_dynamics::PropDynamics, min_speed: f32) -> Vec<ObstacleInput> {
+    d.moving_boxes(min_speed * 0.5)
+        .into_iter()
+        .map(|(id, c, basis, h, v, held)| ObstacleInput { id: id as u64, center: [c.x, c.y, c.z], axes: basis.columns, half_extents: [h.x, h.y, h.z], velocity: [v.x, v.y, v.z], inactive: false, held })
+        .collect()
+}
+
 /// The simulated body: animation player, navigation, position and heading.
 #[derive(Clone, Debug)]
 pub(crate) struct PedBody {
@@ -434,6 +444,8 @@ pub(crate) struct PluginMotionRun {
     /// A tazer clip the brain asked for (`ChaseRequest::TazerClip`), and the last one the channel took with whether
     /// the ped's set had it (read by `ped_hand_props::sync_hand_props` for `PedBrain::update_tazer_clip`).
     pub tazer_clip: Option<&'static str>,
+    /// A greet / warn gesture the brain asked for this tick (b677), played on the channel.
+    pub gesture_clip: Option<&'static str>,
     pub tazer_played: Option<(&'static str, bool)>,
 }
 
@@ -452,6 +464,8 @@ pub(crate) enum PedEvent {
     /// The look could not be resolved (no entities / model): the population slot is released.
     Rejected { id: LivingWorldId, category: String },
     Despawned { id: LivingWorldId, reason: DespawnReason },
+    /// A chase group ended by aggressivecapture of the local player through the ChaserGroupEndChase op (b680).
+    ChaseCaught { target: u64 },
     State { id: LivingWorldId, state: Locomotion },
     /// The mood system picked a reaction (`skate_core::living_world::peds::mood`); `wants` were
     /// raised when `passed`.
@@ -490,6 +504,9 @@ pub(crate) enum PedEvent {
     /// A chase group changed (`kind`: join, join_refused, leave, primary, group_end); `chasee` is
     /// the chased id (players: `PLAYER_TARGET_BASE + n`).
     Chase { id: LivingWorldId, chasee: u64, kind: &'static str, reason: Option<i32> },
+    /// A ped decided to dodge a skater coming at it (SkaterAvoidance: `kind` jump / step, `dir` forward / left / right /
+    /// back); `mover` as the chase ids (players: `PLAYER_TARGET_BASE + n`).
+    Avoid { id: LivingWorldId, mover: u64, kind: &'static str, dir: &'static str, seated: bool },
     /// A ped's tazer hit `target` (the takedown's knock-down).
     Taze { id: LivingWorldId, target: u64 },
     /// A ped's takedown attempt ended (`success`: the target is knocked down).
@@ -616,11 +633,14 @@ pub(crate) struct ClipCache {
     used: std::cell::RefCell<BTreeMap<String, u64>>,
     bytes: std::cell::Cell<usize>,
     tick: std::cell::Cell<u64>,
+    /// skate_vita: the clips whose decode failed, asked for once (a known clip that does not decode was tried again
+    /// on every call, 60 ms a tick with three peds on 11 Nov 2026).
+    failed: std::cell::RefCell<std::collections::BTreeSet<String>>,
 }
 
 impl Default for ClipCache {
     fn default() -> Self {
-        Self { bank: None, known: Default::default(), decoded: Default::default(), used: Default::default(), bytes: Default::default(), tick: Default::default() }
+        Self { bank: None, known: Default::default(), decoded: Default::default(), used: Default::default(), bytes: Default::default(), tick: Default::default(), failed: Default::default() }
     }
 }
 
@@ -630,7 +650,7 @@ unsafe impl Send for ClipCache {}
 
 impl ClipCache {
     pub(crate) fn new(bank: skate_data::ped_anim::PedBank, known: std::collections::BTreeSet<String>) -> Self {
-        Self { bank: Some(bank), known, decoded: Default::default(), used: Default::default(), bytes: Default::default(), tick: Default::default() }
+        Self { bank: Some(bank), known, decoded: Default::default(), used: Default::default(), bytes: Default::default(), tick: Default::default(), failed: Default::default() }
     }
 
     /// Whether `PedBank::clip` would accept the clip's record (present, a whole frame count); the
@@ -665,10 +685,17 @@ impl ClipCache {
         if let Some((clip, _)) = map.get(name) {
             return Some(unsafe { &**clip });
         }
-        if !self.known.contains(name) {
+        if !self.known.contains(name) || self.failed.borrow().contains(name) {
             return None;
         }
-        let clip = self.bank.as_ref()?.clip(name).ok()?;
+        let clip = match self.bank.as_ref()?.clip(name) {
+            Ok(clip) => clip,
+            Err(error) => {
+                println!("PED_CLIP {name} does not decode: {error:?}");
+                self.failed.borrow_mut().insert(name.to_owned());
+                return None;
+            }
+        };
         let size = clip.frames.iter().map(|f| f.len() * std::mem::size_of::<skate_core::animation::output::Sqt>() + 32).sum::<usize>() + 256;
         let raw = Box::into_raw(Box::new(clip));
         map.insert(name.to_owned(), (raw, size));
@@ -859,6 +886,13 @@ pub(crate) struct PedMind {
     sit_avoid: Option<skate_core::living_world::peds::avoid::SeatedAvoid>,
     /// Where the jump off started (`PED_SIT_AVOID_DONE` reports how far the ped got).
     sit_avoid_from: Option<[f32; 3]>,
+    /// A standing / walking dodge to play (the Avoid graph's Jump / Step), held until the clip starts or the ped can
+    /// no longer dodge; where it started (`PED_AVOID_DONE`).
+    stand_avoid: Option<skate_core::living_world::peds::avoid::StandingAvoid>,
+    stand_avoid_from: Option<[f32; 3]>,
+    /// A Jump's `skateravoid` post into the ped's own store (`sub_82E2E890`, b685): the skater and where; the mood
+    /// step posts it on the next think.
+    avoid_post: Option<(u64, [f32; 3])>,
     /// The speech value last sent to the audio side (`PedestrianSpeech` requests a line only when
     /// the value changes; a fresh ped holds the constructor's 68).
     spoken: Option<i32>,
@@ -870,6 +904,8 @@ pub(crate) struct PedMind {
     refusals: skate_core::living_world::peds::plugins::RefusalMemory,
     /// A release the brain posted (DropHandProp) for `sync_hand_props`: the velocity, m/s.
     pub hand_prop_release: Option<[f32; 3]>,
+    /// Hand prop unlinks so far: `advance_peds` stops the channel once per new count (`82E3FAE0`, b649).
+    pub unlink_seq: u32,
     /// Log repeat limiter for PED_BRAIN / PED_MOOD lines (a refused startconversation re-raises its want every few
     /// ticks, retail by b28 / b29, and filled the log with 27k lines in 4 minutes).
     log_repeats: LogRepeats,
@@ -927,6 +963,8 @@ impl LogRepeats {
 
 /// Obstacle / want target ids of the players (above every living-world id).
 pub(crate) const PLAYER_TARGET_BASE: u64 = u64::MAX - 64;
+/// Want target ids of the props (top byte 0xFE: no living-world kind, below the players): base | DMO body id.
+pub(crate) const PROP_TARGET_BASE: u64 = 0xFE << 56;
 
 
 // ---- skate_vita: upstream's systems over plain data ----
@@ -963,6 +1001,8 @@ pub(crate) struct PedState {
     pub rejected: Vec<LivingWorldId>,
     pub contacts: Vec<PedContact>,
     pub played_cues: BTreeMap<LivingWorldId, u32>,
+    /// The unlink counts the channel was stopped for, per ped (`unlink_due`).
+    pub stopped_unlinks: BTreeMap<LivingWorldId, u32>,
     pub events: Vec<PedEvent>,
     /// The behaviour runtime's shared state (upstream resources) and `think_peds`' locals.
     pub chase_groups: PedChaseGroups,
@@ -1127,6 +1167,7 @@ pub(crate) fn advance_peds(
     let pending = std::mem::take(&mut peds.contacts);
     let ped_contacts = &mut peds.contacts;
     let played_cues = &mut peds.played_cues;
+    let stopped_unlinks = &mut peds.stopped_unlinks;
     let events = &mut peds.events;
     // Skater touchers (`IActor` owners, contact kind 5 with the skater thresholds): the players, then the NPC skaters
     // in id order (NPC skaters knock peds over in retail).
@@ -1167,6 +1208,12 @@ pub(crate) fn advance_peds(
                     info!("PED_HAND_PROP ped=#{} no clip {clip} tick={tick}", ped.id.serial);
                 }
             }
+            // The greet / warn gesture (ChannelGreet / ChannelWarnWantTarget Begin, ped vfn+0xF8, blends 0.2; b677).
+            if let Some(clip) = body.plugin_motion.gesture_clip.take() {
+                let blend = settings.ped_brain.values.gesture_blend;
+                let ok = body.player.channel_request(set, clip, blend, blend);
+                info!("PED_GESTURE ped=#{} {clip}{} tick={tick}", ped.id.serial, if ok { "" } else { " (not in the anim set)" });
+            }
             // The tazer's draw / cycle / holster clip (ped vfn248, blends 0.2, b248).
             if let Some(clip) = body.plugin_motion.tazer_clip.take() {
                 let blend = settings.ped_brain.values.tazer_clip_blend;
@@ -1187,6 +1234,19 @@ pub(crate) fn advance_peds(
                 let hold = if avoid.leaves_seat { 0.0 } else { f32::INFINITY };
                 if body.player.interrupt(set, steps, hold) && avoid.leaves_seat {
                     run.state = TauntClip::Done;
+                }
+            }
+            // The Avoid graph's Jump (at once) / Step (at the locomotion clip's branch window), blend 0.1, back to
+            // locomotion when it ends (`think_peds` raises `stand_avoid`).
+            if let Some(avoid) = mind.and_then(|m| m.stand_avoid) {
+                if !body.player.reacting() && (!avoid.waits_for_branch() || body.player.in_branch_window()) {
+                    let step = skate_core::living_world::peds::skater_contact::ReactionStep { anim: avoid.clip, mirror: avoid.mirror, blend: 0.1, cycle: false };
+                    if body.player.react(set, vec![step], 0.0) {
+                        // Avoid's StopChannel.
+                        body.player.channel_stop_own();
+                    } else {
+                        warn!("PED_AVOID ped=#{} {} not in the anim set", ped.id.serial, avoid.clip);
+                    }
                 }
             }
             match (run.state, run.packet.as_deref().and_then(skate_core::living_world::peds::plugin_motion::motion_for)) {
@@ -1216,6 +1276,8 @@ pub(crate) fn advance_peds(
             if let Some(r) = body.reaction_due.take() {
                 let steps = skate_core::living_world::peds::skater_contact::reaction_steps(r.kind, r.direction);
                 if body.player.react(set, steps, set.collision.ground_seconds) {
+                    // Entering Collision stops the upper-body channel (`StopChannel`, motiongraph_collision.xml).
+                    body.player.channel_stop_own();
                     if r.kind == skate_core::living_world::peds::skater_contact::ReactionKind::Knockdown {
                         body.player.begin_knockdown(r.direction);
                     }
@@ -1226,7 +1288,9 @@ pub(crate) fn advance_peds(
             // A skater running into the ped (retail `sub_82E38FB8` kind 5). Retail skips the contact only while the ped is
             // already in a collision reaction (controller byte +9), not during any clip: a ped sitting on a bench or
             // using a prop (its plugin clip plays as a reaction) can be knocked over.
-            let clip_reaction = body.taunt == TauntClip::Playing || body.plugin_motion.state == TauntClip::Playing;
+            // A dodge clip too: the Avoid state goes to Collision on a hit (`motiongraph_avoid.xml`, b683 2.3).
+            let clip_reaction = body.taunt == TauntClip::Playing || body.plugin_motion.state == TauntClip::Playing
+                || body.player.reaction_anim().is_some_and(|a| skate_core::living_world::peds::avoid::STANDING_CLIPS.contains(&a));
             let in_collision = mind.is_some_and(|m| m.brain.colliding) || (body.player.state == Locomotion::Reaction && !clip_reaction);
             // A knocked-down ped still takes contacts (retail drops them only during a stumble, `sub_8269DEE0` state 0, or
             // once blocked): they re-arm its ground timer or re-hit it while it gets up (b372).
@@ -1334,6 +1398,7 @@ pub(crate) fn advance_peds(
                         body.player.react(set, steps, set.collision.ground_seconds)
                     };
                     if started {
+                        body.player.channel_stop_own();
                         if kind == skate_core::living_world::peds::skater_contact::ReactionKind::Knockdown {
                             body.player.begin_knockdown(direction);
                         }
@@ -1355,6 +1420,9 @@ pub(crate) fn advance_peds(
             let sliding = mind.is_some_and(|m| {
                 m.brain.approach.zip(m.brain.approach_slide).is_some_and(|((p, _), (slide, _))| (p[0] - body.position.x).hypot(p[2] - body.position.z) <= slide)
             });
+            body.player.tier = skate_core::living_world::peds::anim::Tier::Default;
+            // RestFromChase's Tired packet; its End posts StopTired (`8269F608`, b684).
+            body.player.resting = mind.is_some_and(|m| m.brain.chase_resting);
             match data.nav.as_deref() {
                 _ if body.player.state == Locomotion::Reaction => body.player.intent = skate_core::living_world::peds::anim::Intent::Idle,
                 _ if (locked || sliding) && face.is_none() => {
@@ -1394,10 +1462,13 @@ pub(crate) fn advance_peds(
                     // The graph's Pedestrian nav modifier off (a chase): no avoiding other peds.
                     let avoid_peds = mind.is_none_or(|m| m.brain.nav_modifier(skate_core::living_world::peds::brain::nav_modifier::PEDESTRIAN));
                     let neighbours_now: &[_] = if avoid_peds { &neighbours } else { &[] };
+                    body.nav.ignore_skaters = mind.is_some_and(|m| !m.brain.nav_modifier(skate_core::living_world::peds::brain::nav_modifier::SKATER_AVOIDANCE));
                     let out = body.nav.step_avoiding(mesh, &nav_settings.wander, nav_settings.crosswalk, signals, me, body.position.to_array(), body.heading, body.player.state, neighbours_now, Some(obstacles), dt);
                     // Fleeing: run (the chase run cycle) where the nav walks.
                     let fleeing = mind.is_some_and(|m| m.flee_goal.is_some() || m.chase_goal.is_some());
-                    body.player.intent = if fleeing && out.intent == skate_core::living_world::peds::anim::Intent::Walk { skate_core::living_world::peds::anim::Intent::Run } else { out.intent };
+                    let (intent, tier) = skate_core::living_world::peds::anim::moving_intent(out.intent, fleeing, mind.and_then(|m| m.brain.speed_suggestion), &set.speed_rows, settings.ped_brain.speed_bump);
+                    body.player.intent = intent;
+                    body.player.tier = tier;
                     turn = out.turn;
                     if out.turn_degrees != 0 {
                         use skate_core::living_world::peds::anim::{names, Intent};
@@ -1414,38 +1485,47 @@ pub(crate) fn advance_peds(
                 }
                 None => body.player.intent = body.path.intent(dt, body.player.state),
             }
+            // BlockChasee's strafe flag (b686): facing the chasee, a strafe turn (45 / 90) or a step toward the block
+            // point; the clips' root motion turns and moves the ped (no steering, no face pivot).
+            body.player.strafe = mind.and_then(|m| m.brain.strafe_target.map(|t| (m, t))).filter(|_| body.player.state != Locomotion::Reaction && set.entries.contains_key(skate_core::living_world::peds::anim::names::STRAFE_INTO)).map(|(m, t)| {
+                let p = body.position;
+                let rules = &settings.ped_brain.strafe;
+                // `sub_82E2A6B0`: toward the first path node farther than `node_reach`, else the block point (b695).
+                let reach2 = rules.node_reach * rules.node_reach;
+                let step = m.brain.block_point.filter(|_| m.brain.speed_suggestion != Some(0.0)).map(|b| {
+                    let node = body.nav.corners.iter().skip(body.nav.next).find(|c| (c[0] - p.x).powi(2) + (c[1] - p.y).powi(2) + (c[2] - p.z).powi(2) > reach2).copied().unwrap_or(b);
+                    [node[0] - p.x, node[2] - p.z]
+                });
+                skate_core::living_world::peds::anim::strafe_input(body.heading, [t[0] - p.x, t[1] - p.y, t[2] - p.z], step, m.brain.speed_suggestion.unwrap_or(0.0), rules)
+            });
+            if body.player.strafe.is_some() {
+                body.player.intent = skate_core::living_world::peds::anim::Intent::Idle;
+                turn = 0.0;
+            }
             // The carry pose (`82E3F048`): while the hand prop is held and the channel is free, its record's carry
-            // animation is requested again (blend 0.2); a released or dropped prop stops it with a 0.2 s fade (unlink
-            // `82E3FAE0`). Retail requests it only while the prop is linked; ours: while held.
+            // animation is requested again (blend 0.2); the unlink (`82E3FAE0`) stops any channel clip once with its
+            // fade (b649). Retail requests it only while the prop is linked; ours: while held.
+            if mind.is_some_and(|m| unlink_due(stopped_unlinks, ped.id, m.unlink_seq)) && !body.player.channel_idle() {
+                body.player.channel_stop(settings.ped_brain.values.hand_prop.unlink_fade);
+            }
             if let Some(h) = mind.map(|m| &m.brain.hand_prop) {
                 // skate_vita: the carry clip is not taken from the hand prop record here (`carry` stays `None`).
                 let carry: Option<&str> = h.key.as_ref().and(None);
-                // The idle action's cue (`82E3F470`): a new cue plays once; the talk / read cycles are asked for every
-                // frame in retail, so ours asks again when their clip ends early.
-                use skate_core::living_world::peds::hand_prop::ActionCue;
+                // The idle action's cue (`82E3F470`, only while held): a new cue plays once; the talk / read cycles are
+                // asked for every frame in retail, so ours asks again when their clip ends early.
                 if let Some((cue, seq)) = mind.and_then(|m| m.action_cue.map(|c| (c, m.action_seq))) {
                     // skate_vita: the brain settings' default (upstream's `ped_brain`).
                     let blend = skate_core::living_world::peds::brain::BrainSettings::default().hand_prop.actions.clip_blend;
                     let new = played_cues.get(&ped.id) != Some(&seq);
-                    match cue {
-                        ActionCue::Clip(name) if new || (body.player.channel_idle() && matches!(name, "HandPropPhoneTalk" | "HandPropReadCyc")) => {
-                            body.player.channel_request(set, name, blend, blend);
-                        }
-                        ActionCue::Carry if new => {
-                            if let Some(name) = carry {
-                                body.player.channel_request(set, name, blend, blend);
-                            }
-                        }
-                        _ => {}
+                    if let Some(name) = cue_clip(cue, h.holding, new, body.player.channel_idle(), carry) {
+                        body.player.channel_request(set, name, blend, blend);
                     }
                     played_cues.insert(ped.id, seq);
                 }
-                match (h.holding, carry) {
-                    (true, Some(name)) if body.player.channel_idle() => {
+                if let (true, Some(name)) = (h.holding, carry) {
+                    if body.player.channel_idle() {
                         body.player.channel_request(set, name, 0.2, 0.2);
                     }
-                    (false, _) if body.player.channel_clip().is_some_and(|c| c.starts_with("NPC_CARRY")) => body.player.channel_stop(0.2),
-                    _ => {}
                 }
             }
             let out = body.player.step(dt, set, &*data);
@@ -1483,7 +1563,12 @@ pub(crate) fn advance_peds(
                         // SkaterAvoidance off (ChangeNavModifierSetting index 2): the skaters are not obstacles.
                         skaters: mind.is_some_and(|m| !m.brain.nav_modifier(skate_core::living_world::peds::brain::nav_modifier::SKATER_AVOIDANCE)),
                     };
-                    let (next, clear) = match obstacles.resolve_step_ignoring(from, next, mesh.agent[1], ignore) {
+                    // The contact slide's tests read the ped's velocity and steer target (b717 / b718).
+                    let contact = skate_core::living_world::peds::obstacles::Contact {
+                        velocity: Some([body.velocity.x, body.velocity.z]),
+                        target: body.nav.corners.get(body.nav.next.min(body.nav.corners.len().saturating_sub(1))).map(|c| [c[0], c[2]]),
+                    };
+                    let (next, clear) = match obstacles.resolve_step_contact(from, next, mesh.agent[1], ignore, contact) {
                         Some(n) if n == next => (n, true),
                         Some(n) => {
                             let (m, k, ok) = constrain_move(mesh, body.nav.poly, from, n);
@@ -1663,6 +1748,31 @@ pub(crate) fn ended_move_drops_route(chase_goal: &mut Option<[f32; 3]>, approach
     chase_goal.take().is_some() | std::mem::take(approach_route)
 }
 
+/// The clip a hand prop action cue asks for this frame (`82E3F470`, run only while held, b649): a new cue once; the
+/// talk / read cycles again whenever the channel idles.
+fn cue_clip<'a>(cue: skate_core::living_world::peds::hand_prop::ActionCue, holding: bool, new: bool, idle: bool, carry: Option<&'a str>) -> Option<&'a str> {
+    use skate_core::living_world::peds::hand_prop::ActionCue;
+    match cue {
+        _ if !holding => None,
+        ActionCue::Clip(name) if new || (idle && matches!(name, "HandPropPhoneTalk" | "HandPropReadCyc")) => Some(name),
+        ActionCue::Carry if new => carry,
+        _ => None,
+    }
+}
+
+/// True once per new unlink count of a ped (the unlink's channel stop, `82E3FAE0`).
+fn unlink_due(stopped: &mut BTreeMap<LivingWorldId, u32>, id: LivingWorldId, seq: u32) -> bool {
+    seq != 0 && stopped.insert(id, seq) != Some(seq)
+}
+
+/// A prop as the object flee sees it: box centre, velocity and the footprint corners of its x / z faces.
+fn moving_object(o: &ObstacleInput) -> skate_core::living_world::peds::object_flee::MovingObject {
+    let (c, a, b) = (o.center, o.axes[0], o.axes[2]);
+    let (ha, hb) = (o.half_extents[0], o.half_extents[2]);
+    let corner = |sa: f32, sb: f32| [c[0] + a[0] * ha * sa + b[0] * hb * sb, c[2] + a[2] * ha * sa + b[2] * hb * sb];
+    skate_core::living_world::peds::object_flee::MovingObject { centre: c, velocity: o.velocity, corners: [corner(-1.0, -1.0), corner(1.0, -1.0), corner(1.0, 1.0), corner(-1.0, 1.0)] }
+}
+
 /// skate_vita: upstream `think_peds`' `Local`s and its ped event cursor.
 #[derive(Default)]
 pub(crate) struct ThinkLocals {
@@ -1671,6 +1781,8 @@ pub(crate) struct ThinkLocals {
     /// Conversation listeners that get the speech value 41 when they think next (`82E3DAD8`).
     listening: Vec<u64>,
     touchers: BTreeMap<u64, u64>,
+    /// The scatter alarm: its timer, the tick it was last stepped and whether it is up (`skate_core::living_world::peds::scatter`).
+    scatter: (f32, Option<u64>, bool),
     /// [`PedState::events`] before this index were read (the chain drops them before the next tick).
     pub cursor: usize,
 }
@@ -1789,6 +1901,8 @@ pub(crate) fn think_peds(
     wiping: &[bool],
     traffic_events: &[super::vehicles::TrafficEvent],
     cars: &[(u64, [f32; 3], [f32; 3])],
+    traffic: &super::vehicles::TrafficState,
+    skater: Option<&crate::physics::SkaterRuntime>,
     physics: Option<&crate::physics::GamePhysics>,
 ) {
     let PedState { data, index, events, chase_groups, conversations, plugin_props, think, takedowns, .. } = peds;
@@ -1860,7 +1974,27 @@ pub(crate) fn think_peds(
     let program = &graph.graph.runtime.program;
     let dt = tick_seconds(state.world.clock().hz);
     let tick = state.world.tick();
+    // The scatter alarm (`sub_826C1348` once per world step, copied to every ped by `sub_826BDB50`; b654): raised while
+    // the local player's gesture runs on D-pad Down (MotionGraph +5989, `sub_8258FB30`).
+    {
+        let raised = skater.and_then(|s| s.animation.motion.gesture_publication.as_ref()).is_some_and(|g| g.down)
+            || settings.ped_brain.scatter_hold;
+        let scatter = &mut think.scatter;
+        let steps = scatter.1.map_or(1, |last| tick.saturating_sub(last));
+        if steps > 0 {
+            let length = settings.ped_brain.values.scatter_seconds;
+            let was = scatter.2;
+            scatter.2 = skate_core::living_world::peds::scatter::step(&mut scatter.0, raised && length > 0.0, settings.zombie, dt * steps as f32, length);
+            scatter.1 = Some(tick);
+            if scatter.2 != was {
+                info!("PED_SCATTER {} timer {:.1} s tick={tick}", if scatter.2 { "on" } else { "off" }, scatter.0);
+            }
+        }
+    }
+    let scattering = think.scatter.2;
     let players: Vec<[f32; 3]> = observers.iter().map(|o| o.position).collect();
+    // Each ped's linked (released) hand prop body, for the object flee.
+    let linked_props: BTreeMap<LivingWorldId, u32> = index.iter().filter_map(|(id, e)| e.linked.map(|l| (*id, l))).collect();
     // skate_vita: the ped index is in id order (upstream sorts the query).
     let mut list: Vec<(LivingWorldId, &Pedestrian, &mut PedBody, &mut PedMind)> = index
         .iter_mut()
@@ -1869,11 +2003,29 @@ pub(crate) fn think_peds(
             (*id, &*ped, body, mind)
         })
         .collect();
-    // Entity type and position of every id this tick (players are the `skater` type).
+    // The streamed-in props as want targets (the object flee), and the moving ones the flee rule tests.
+    let object_flee = settings.ped_brain.object_flee;
+    let props_now = if object_flee.enabled { dynamics_now.map(|d| moving_prop_inputs(d, object_flee.min_speed)).unwrap_or_default() } else { Vec::new() };
+    let moving_props: Vec<(u64, skate_core::living_world::peds::object_flee::MovingObject)> = if object_flee.enabled {
+        props_now.iter().map(|o| (PROP_TARGET_BASE | o.id, moving_object(o))).collect()
+    } else {
+        Vec::new()
+    };
+    let vehicle_flee = settings.ped_brain.vehicle_flee;
+    // Each car with its gate B flag (held / skitched this tick, `Car::held`; b821).
+    let held_car = |serial: u32| traffic.cars.binary_search_by_key(&serial, |c| c.key).ok().map(|i| traffic.cars[i].held).unwrap_or(false);
+    let moving_cars: Vec<(u64, ([f32; 3], [f32; 3], bool))> = if vehicle_flee.enabled {
+        traffic.index.values().map(|(c, _)| (c.meta.id.to_u64(), (c.motion.curr.translation.to_array(), c.motion.velocity.to_array(), held_car(c.meta.id.serial)))).collect()
+    } else {
+        Vec::new()
+    };
+    // Entity type and position of every id this tick (players are the `skater` type, props `prop`, cars their entity).
     let entities: BTreeMap<u64, (String, [f32; 3])> = list
         .iter()
         .map(|(_, p, b, _)| (p.id.to_u64(), (p.entity.clone(), b.position.to_array())))
         .chain(players.iter().enumerate().map(|(i, p)| (PLAYER_TARGET_BASE + i as u64, ("skater".to_string(), *p))))
+        .chain(props_now.iter().map(|o| (PROP_TARGET_BASE | o.id, ("prop".to_string(), o.center))))
+        .chain(traffic.index.values().map(|(c, _)| (c.meta.id.to_u64(), (c.meta.entity.clone(), c.motion.curr.translation.to_array()))))
         .collect();
     // A hit ped that is gone no longer waits for its Colliding state.
     touchers.retain(|id, _| entities.contains_key(id));
@@ -1882,6 +2034,8 @@ pub(crate) fn think_peds(
         .iter()
         .map(|(_, p, b, _)| (p.id.to_u64(), b.velocity.to_array()))
         .chain(observers.iter().enumerate().map(|(i, o)| (PLAYER_TARGET_BASE + i as u64, o.velocity)))
+        .chain(props_now.iter().map(|o| (PROP_TARGET_BASE | o.id, o.velocity)))
+        .chain(traffic.index.values().map(|(c, _)| (c.meta.id.to_u64(), c.motion.velocity.to_array())))
         .collect();
     let velocity_of = |id: u64| velocities.get(&id).copied();
     // World-prop plugins: the map's props, then the offer scan every 11th world tick (`826C0058` -> `826BFE18`).
@@ -2123,7 +2277,7 @@ pub(crate) fn think_peds(
     // zombie cheat (group init `82D967B0`, b105).
     let group_record = if settings.zombie { data.chase_zombie.as_deref() } else { data.chase_global.as_deref() };
     let max_chasers = |_chasee: u64| skate_core::living_world::peds::chase::ChaseRecord::max_chasers(group_record);
-    for (_entity_id, ped, body, mind) in list {
+    for (entity_id, ped, body, mind) in list {
         let mind = &mut *mind;
         let body = &mut *body;
         let me = ped.id.to_u64();
@@ -2224,6 +2378,8 @@ pub(crate) fn think_peds(
                     mind.zombie_timer = 0.0;
                 }
             }
+            // ShouldScatter (brain +3281 bit 0x80): the world alarm, the same for every live ped.
+            mind.brain.scatter = scattering;
             if let Some(&car) = honked.get(&me) {
                 mind.brain.honker = Some(car);
             }
@@ -2236,6 +2392,13 @@ pub(crate) fn think_peds(
             // ChannelGreetWantTarget's `greeted` (magnitude 1.0, `8269FAC0`).
             for &(_, instigator, position) in greeted_now.iter().filter(|g| g.0 == me) {
                 let e = MoodEvent { category: mood::category::GREETED.into(), instigator: Some(instigator), second: Some(me), position };
+                if !mind.brain.perceptions.suppressed(instigator) && tables.accepts(&set, &e, &post_ctx) && seen(&e) {
+                    mind.mood.post_ranked(e, 1.0, &priority);
+                }
+            }
+            // SkaterAvoidance's Jump post (`sub_82E2E890` -> `sub_82E3DA40`): category skateravoid, the skater as instigator.
+            if let Some((instigator, position)) = mind.avoid_post.take() {
+                let e = MoodEvent { category: mood::category::SKATER_AVOID.into(), instigator: Some(instigator), second: Some(me), position };
                 if !mind.brain.perceptions.suppressed(instigator) && tables.accepts(&set, &e, &post_ctx) && seen(&e) {
                     mind.mood.post_ranked(e, 1.0, &priority);
                 }
@@ -2336,6 +2499,34 @@ pub(crate) fn think_peds(
                 events.push(PedEvent::Mood { id: ped.id, result: reaction.result.clone(), passed: reaction.passed, wants: reaction.wants.iter().map(|w| w.want.clone()).collect() });
             }
         }
+        // A prop moving at the ped (`82E2EDC0`): flee it, outside the mood system (ask 374). Ours: never the ped's own
+        // dropped hand prop (b649; retail's class cast 0x8269B3D0 not read).
+        let own = linked_props.get(&entity_id).map(|r| PROP_TARGET_BASE | u64::from(*r));
+        if let Some((prop, _)) = moving_props.iter().find(|(id, o)| Some(*id) != own && skate_core::living_world::peds::object_flee::in_path(at, o, &object_flee)) {
+            let fresh = mind.brain.wants.get("flee").is_none_or(|w| w.target != *prop || !w.needs_addressing);
+            mind.brain.flee_object(*prop);
+            if fresh {
+                info!("PED_FLEE_OBJECT ped=#{} prop={} at [{:.2}, {:.2}, {:.2}] tick={tick}", ped.id.serial, prop & 0xFFFF_FFFF, at[0], at[1], at[2]);
+            }
+        } else if let Some((car, (cp, cv, _))) = (!moving_cars.is_empty())
+            // Gate A: the ped stands on a road triangle (ped vf200 -> road network vf0x3C, b821).
+            .then(|| state.roads.as_ref().is_some_and(|r| skate_core::living_world::traffic::spawn::road_under(r, at).is_some()))
+            .and_then(|on_road| moving_cars.iter().find(|(_, (p, v, held))| skate_core::living_world::peds::object_flee::flees_vehicle_gated(at, *p, *v, on_road, *held, &vehicle_flee)))
+        {
+            // A car near the ped moving along the line between them (`82E2C0C8`, opt-in, W8).
+            let fresh = mind.brain.wants.get("flee").is_none_or(|w| w.target != *car || !w.needs_addressing);
+            mind.brain.flee_object(*car);
+            if fresh {
+                let d = [cp[0] - at[0], cp[1] - at[1], cp[2] - at[2]];
+                let dot = d[0] * cv[0] + d[2] * cv[2];
+                info!(
+                    "PED_FLEE_VEHICLE ped=#{} car={car} at [{:.2}, {:.2}, {:.2}] car_at [{:.2}, {:.2}, {:.2}] dist={:.1} speed={:.1} dot={dot:.1} branch={} tick={tick}",
+                    ped.id.serial, at[0], at[1], at[2], cp[0], cp[1], cp[2],
+                    (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt(), (cv[0] * cv[0] + cv[2] * cv[2]).sqrt(),
+                    if dot > 0.0 { "away" } else { "toward" }
+                );
+            }
+        }
         let due = tick.saturating_sub(ped.spawn_tick);
         let controller = mind.controller.get_or_insert_with(|| skate_core::graph::controller::Controller::new(program.topology.states.len()));
         // The ped's own chase record: its type's, or `zombie` under the zombie cheat (`82E33FAC`, b105).
@@ -2429,11 +2620,12 @@ pub(crate) fn think_peds(
             // skater whose closest approach qualifies decides (docs/hails-additions/26f-living-world-peds.md#seated-peds-avoid-an-approaching-skater).
             let rules = settings.ped_brain.values.avoid;
             let every = ((rules.period / dt).round() as u64).max(1);
-            let skater_avoid = if seated && mind.sit_avoid.is_none() && (tick + u64::from(ped.id.serial)) % every == 0
-                && mind.brain.nav_modifier(skate_core::living_world::peds::brain::nav_modifier::SKATER_AVOIDANCE)
-            {
+            let on_phase = (tick + u64::from(ped.id.serial)) % every == 0
+                && mind.brain.nav_modifier(skate_core::living_world::peds::brain::nav_modifier::SKATER_AVOIDANCE);
+            // The first skater whose decision passes `accept` and the escape point's 0.1 m ground probe (82C46460).
+            let decide = |accept: &dyn Fn(&avoid::AvoidDecision) -> bool| {
                 observers.iter().enumerate().find_map(|(i, o)| {
-                    let d = avoid::decide(at, forward, o.position, o.velocity, &rules)?;
+                    let d = avoid::decide(at, forward, o.position, o.velocity, &rules).filter(|d| accept(d))?;
                     let ground = data.nav.as_ref().is_none_or(|nav| {
                         nav.locate_any(d.escape_point).is_some_and(|q| (q.position[0] - d.escape_point[0]).abs() <= SEAT_PROBE_TOLERANCE && (q.position[2] - d.escape_point[2]).abs() <= SEAT_PROBE_TOLERANCE)
                     });
@@ -2442,9 +2634,43 @@ pub(crate) fn think_peds(
                     }
                     ground.then_some((i, d))
                 })
-            } else {
-                None
             };
+            let skater_avoid = if seated && mind.sit_avoid.is_none() && on_phase { decide(&|_| true) } else { None };
+            // Standing / walking peds: the same decision into the Avoid graph's Jump / Step (b683):
+            // docs/hails-additions/26f-living-world-peds.md#standing-peds-dodge-an-approaching-skater
+            let can_dodge = !seated && rules.standing && avoid::may_dodge(body.player.state) && !body.player.reacting();
+            let pending = mind.stand_avoid;
+            if pending.is_some_and(|p| anim == Some(p.clip)) {
+                // `advance_peds` started the clip.
+                mind.stand_avoid = None;
+            } else if can_dodge && on_phase {
+                if let Some((skater, d)) = decide(&|d| avoid::replaces(pending, d.kind)) {
+                    let play = avoid::standing(d.kind, d.dir);
+                    if play.speech.is_some() {
+                        mind.brain.speech = play.speech;
+                    }
+                    mind.stand_avoid = Some(play);
+                    mind.stand_avoid_from = Some(at);
+                    events.push(PedEvent::Avoid { id: ped.id, mover: PLAYER_TARGET_BASE + skater as u64, kind: d.kind.name(), dir: d.dir.name(), seated: false });
+                    if d.kind == avoid::AvoidKind::Jump {
+                        mind.avoid_post = Some((PLAYER_TARGET_BASE + skater as u64, at));
+                    }
+                    info!(
+                        "PED_AVOID ped=#{} skater={skater} {} {} standing state={} clip={}{} t={:.2} miss={:.2} speed={:.2} angle={:.2} tick={tick}",
+                        ped.id.serial, d.kind.name(), d.dir.name(), body.player.state.name(), play.clip, if play.mirror { " mirrored" } else { "" }, d.t, d.miss, d.speed, d.angle
+                    );
+                }
+            } else if !can_dodge && mind.stand_avoid.take().is_some() {
+                debug!("PED_AVOID ped=#{} dropped (state {}) tick={tick}", ped.id.serial, body.player.state.name());
+            }
+            if mind.stand_avoid.is_none() && !anim.is_some_and(|a| avoid::STANDING_CLIPS.contains(&a)) {
+                if let Some(from) = mind.stand_avoid_from.take() {
+                    let moved = ((at[0] - from[0]).powi(2) + (at[2] - from[2]).powi(2)).sqrt();
+                    info!("PED_AVOID_DONE ped=#{} moved={moved:.2} tick={tick}", ped.id.serial);
+                    // AvoidComplete: PedestrianWandering 1.
+                    mind.brain.speech = Some(avoid::AVOID_COMPLETE_SPEECH);
+                }
+            }
             if seat_pushed.contains(&me) && seated && mind.sit_avoid.is_none() {
                 let jump = avoid::seated(avoid::AvoidKind::Jump, avoid::AvoidDir::Forward);
                 mind.brain.speech = jump.speech;
@@ -2458,6 +2684,10 @@ pub(crate) fn think_peds(
                 }
                 mind.sit_avoid = Some(play);
                 mind.sit_avoid_from = Some(at);
+                events.push(PedEvent::Avoid { id: ped.id, mover: PLAYER_TARGET_BASE + skater as u64, kind: d.kind.name(), dir: d.dir.name(), seated: true });
+                if d.kind == avoid::AvoidKind::Jump {
+                    mind.avoid_post = Some((PLAYER_TARGET_BASE + skater as u64, at));
+                }
                 info!(
                     "PED_AVOID ped=#{} skater={skater} {} {} seated clip={}{} leaves_seat={} t={:.2} miss={:.2} speed={:.2} angle={:.2} tick={tick}",
                     ped.id.serial, d.kind.name(), d.dir.name(), play.clip, if play.mirror { " mirrored" } else { "" }, play.leaves_seat, d.t, d.miss, d.speed, d.angle
@@ -2910,13 +3140,21 @@ pub(crate) fn think_peds(
                         mind.hand_prop_release = Some(velocity);
                         continue;
                     }
+                    ChaseRequest::GestureClip { clip } => {
+                        body.plugin_motion.gesture_clip = Some(clip);
+                        continue;
+                    }
                     ChaseRequest::MoodReset { target } => {
                         mind.mood.forget(target);
                         continue;
                     }
-                    ChaseRequest::GroupEnd { chasee, reason } => {
-                        if let Some(g) = chase_groups.0.get_mut(&chasee) {
-                            g.end_reason = Some(reason);
+                    ChaseRequest::GroupEnd { chasee, reason, notify } => {
+                        let in_group = chase_groups.0.get_mut(&chasee).map(|g| g.end_reason = Some(reason)).is_some();
+                        // `826A5318`: a chaser in a group ending it by aggressivecapture of the local player shows a
+                        // CAUGHT line (chase manager +64 with (1, 0), b680).
+                        if notify && in_group && reason == skate_core::living_world::peds::chase::reason::AGGRESSIVE_CAPTURE
+                            && chasee == PLAYER_TARGET_BASE {
+                            events.push(PedEvent::ChaseCaught { target: chasee });
                         }
                         (chasee, "group_end", Some(reason))
                     }
@@ -2997,10 +3235,8 @@ pub(crate) fn think_peds(
                 // else as it is. A swimmer is handed over as it is (no snap onto the bank), so the reachability check
                 // below fails. The body's route only follows a destination on the mesh (a path request to an off-mesh
                 // point keeps the old path, `82E957F8`).
-                let here = mesh.locate(at);
                 if let Some(q) = target(chasee) {
-                    let chasee_poly = mesh.locate(q).map(|p| p.poly);
-                    let reachable = !chase::reach_failed(mesh, here.map(|p| p.poly), chasee_poly);
+                    let reachable = !chase::reach_failed_at(mesh, at, q, settings.ped_brain.values.reach_snap_window);
                     let velocity = observers.get(chasee.wrapping_sub(PLAYER_TARGET_BASE) as usize).map_or([0.0; 3], |o| o.velocity);
                     let speed = record.and_then(|r| r.run_speed()).unwrap_or(0.0);
                     // No record: the max lead time reads 0.0, so no intercept (the chasee itself is the destination).
@@ -3023,7 +3259,7 @@ pub(crate) fn think_peds(
                 if let Some(q) = target(chasee).filter(|_| mind.reach_clock >= settings.ped_brain.values.reach_check_seconds) {
                     mind.reach_clock = 0.0;
                     let destination = mind.chase_goal.unwrap_or(q);
-                    let failed = chase::reach_failed(mesh, here.map(|p| p.poly), mesh.locate(destination).map(|p| p.poly));
+                    let failed = chase::reach_failed_at(mesh, at, destination, settings.ped_brain.values.reach_snap_window);
                     let near = (q[0] - at[0]).hypot(q[2] - at[2]) <= settings.ped_brain.values.unreachable_radius;
                     let was = mind.brain.target_unreachable;
                     chase::apply_reach_report(&mut mind.brain.target_unreachable, failed, near);
@@ -3043,33 +3279,31 @@ pub(crate) fn think_peds(
         }
         // Flee movement: 15 m legs away from the threat, a new one within 2 m of the goal; the
         // leg goes to the nav as a one-point route (cleared when the flee ends).
-        let flee = settings.ped_brain.flee;
-        match (mind.brain.motion_intent, mind.brain.flee_from, data.nav.as_deref()) {
+        // A channel stop the brain asked for (Scatter's Begin, b824).
+        if let Some(fade) = mind.brain.channel_stop.take() {
+            body.player.channel_stop(fade);
+        }
+        // Scatter (b645): the threat is the local player, whatever the flee want says, and legs end within 3 m.
+        let scatter = mind.brain.scatter_threat;
+        let mut flee = settings.ped_brain.flee;
+        if scatter {
+            flee.arrival_radius = settings.ped_brain.values.scatter_arrival_radius;
+        }
+        let threat_id = if scatter { (!players.is_empty()).then_some(PLAYER_TARGET_BASE) } else { mind.brain.flee_from };
+        match (mind.brain.motion_intent, threat_id, data.nav.as_deref()) {
             (Some(skate_core::living_world::peds::brain::motion::FLEE), Some(threat), Some(mesh)) => {
-                if mind.flee_goal.is_none_or(|g| skate_core::living_world::peds::flee::arrived(at, g, &flee)) {
+                // A new leg on arrival (82E2BC70) or when the bot is done short of the goal (82E2CB08, b697).
+                let bot_done = flee.releg_on_nav_done && body.nav.route_done;
+                if mind.flee_goal.is_none_or(|g| bot_done || skate_core::living_world::peds::flee::arrived(at, g, &flee)) {
                     if let Some(threat_at) = target(threat) {
-                        let velocity = observers.get(threat.wrapping_sub(PLAYER_TARGET_BASE) as usize).map_or([0.0; 3], |o| o.velocity);
+                        let velocity = velocity_of(threat).unwrap_or([0.0; 3]);
                         let mut goal = skate_core::living_world::peds::flee::goal(at, threat_at, velocity, &flee);
-                        // The navmesh cast (`sub_82C465A8`): a blocked leg ends at the last clear
-                        // point along it (`sub_82C46208`'s rewrite, inferred).
                         if let Some(here) = mesh.locate(at) {
-                            if !mesh.clear_line(here, goal) {
-                                let (mut lo, mut hi) = (0.0f32, 1.0f32);
-                                for _ in 0..8 {
-                                    let mid = (lo + hi) * 0.5;
-                                    let p = [at[0] + (goal[0] - at[0]) * mid, at[1], at[2] + (goal[2] - at[2]) * mid];
-                                    if mesh.clear_line(here, p) {
-                                        lo = mid;
-                                    } else {
-                                        hi = mid;
-                                    }
-                                }
-                                goal = [at[0] + (goal[0] - at[0]) * lo, at[1], at[2] + (goal[2] - at[2]) * lo];
-                            }
+                            goal = skate_core::living_world::peds::flee::goal_on_mesh(mesh, here.poly, goal);
                         }
                         body.nav.set_route(Some(skate_core::living_world::peds::PedRoute { points: vec![goal], looped: false }));
                         mind.flee_goal = Some(goal);
-                        info!("PED_FLEE ped=#{} from={} goal=[{:.1}, {:.1}, {:.1}] tick={tick}", ped.id.serial, threat, goal[0], goal[1], goal[2]);
+                        info!("PED_FLEE ped=#{} from={} scatter={scatter} goal=[{:.1}, {:.1}, {:.1}] tick={tick}", ped.id.serial, threat, goal[0], goal[1], goal[2]);
                     }
                 }
             }

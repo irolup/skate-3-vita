@@ -240,6 +240,11 @@ impl PlayerAudio {
         }
     }
 
+    /// The listener of the last pass (the world owners' position blocks read it).
+    pub(crate) fn last_listener(&self) -> Option<Listener> {
+        self.last_listener
+    }
+
     /// The materials' footstep layers (`Library::footstep_materials`).
     pub(crate) fn set_footstep_materials(&mut self, materials: Vec<skate_audio::player::footsteps::FootstepMaterial>) {
         self.footstep_tuning.materials = materials;

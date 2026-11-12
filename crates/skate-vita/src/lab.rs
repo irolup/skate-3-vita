@@ -211,6 +211,8 @@ pub(crate) struct Shared {
     /// park).
     pub park_save: Option<String>,
     pub park_saved: Option<(String, Option<Vec<u8>>)>,
+    /// A park is being written: the player's pad reads neutral, so nothing can be done while the save wheel spins.
+    pub input_frozen: bool,
     /// Request (My Parks): lay this saved park (`.park` bytes) over the park, once its world has loaded.
     pub park_load: Option<Vec<u8>>,
     /// Request (New Park): lay this Park Setup template (its world row) over the park, once its world has loaded.
@@ -524,6 +526,11 @@ fn run_session(shared: &Mutex<Shared>, input: &Input, session: &mut Session, mut
                     neutral = true;
                 } else {
                     paused_since.get_or_insert_with(Instant::now);
+                    // Save Park from the pause menu: answered at once (the paused world is not ticking), so the save
+                    // wheel starts with the save, not when the menu closes.
+                    if let Some(name) = s.park_save.take() {
+                        s.park_saved = Some((name, session.park_file()));
+                    }
                     // Start in the editor leaves it for the pause menu (retail `825CB440`, "to pause"), its edits kept.
                     if session.editor_open() {
                         session.close_editor();
@@ -651,7 +658,10 @@ fn run_session(shared: &Mutex<Shared>, input: &Input, session: &mut Session, mut
         }
         for _ in 0..due {
             #[cfg_attr(feature = "soak", allow(unused_variables))]
-            let mut settings = shared.lock().unwrap().settings;
+            let (mut settings, frozen) = {
+                let g = shared.lock().unwrap();
+                (g.settings, g.input_frozen)
+            };
             // The Object Dropper's menus (the catalogue, the Quick Menu) take Left / Right from the d-pad and use no
             // bumpers: there the d-pad stays a d-pad whatever the "D-pad left / right as LB / RB" setting says.
             use skate_sim::object_dropper::Mode;
@@ -659,7 +669,7 @@ fn run_session(shared: &Mutex<Shared>, input: &Input, session: &mut Session, mut
                 settings.dpad_bumpers = false;
             }
             let sample = input.poll();
-            let mut state = if neutral {
+            let mut state = if neutral || frozen {
                 XboxState { buttons: 0, triggers: [0, 0], left: [0, 0], right: [0, 0] }
             } else {
                 #[cfg(feature = "soak")]

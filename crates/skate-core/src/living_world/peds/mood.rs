@@ -1,34 +1,5 @@
-//! A pedestrian's mood: what happened around it (the skater nearby, a collision, a trick) and the
-//! want producer that turns it into wants for the ped AI graph (doc 26 "Ped behaviour runtime").
-//! All rules come from the stock mood tables (`livingworld_moodeventcategories`,
-//! `livingworld_entities_moodreactions`, `livingworld_entities_moodresults`, exported by setup);
-//! this module holds no values of its own.
-//!
-//! Retail (TU3, evidence only; re-implemented; `.local/research/peds/b4-ped-want-producer.md`,
-//! `b5-ped-mood-events.md`, `b6-ped-mood-fields.md`; main checked the key addresses):
-//! - posting `sub_82E41060`: an existing record with the same (instigator, second entity,
-//!   category) is bumped (`sub_82E41750`: magnitude += the category's per-event magnitude, count
-//!   += 1, age = 0, position = the event's), else a new one is pushed (`sub_82E414D8`: at most 10;
-//!   when full only an event without an instigator or second entity may evict one: `sub_82E441C8`
-//!   takes the record whose category Priority is numerically highest, the oldest on a tie, the first
-//!   in slot order on an exact tie; b189, main re-read the compares). The
-//!   per-event magnitude is the category field `B1DD` (the presence period, 0.5 s stock; discrete
-//!   categories have none: the attribute default `0x830D0850`, 0.0);
-//! - per tick (`sub_82E41600`): cooldowns run down and go at 0, ages run up, suppress timers run
-//!   down to 0; magnitude and count never decay; a record older than its category's lifetime
-//!   (`A379`, 30 s stock) goes (`sub_82E440E0`);
-//! - presence (`sub_82E3CA20`): every presence period each player within 35 m (`0x8206D148`)
-//!   posts `presence` (instigator = player, second = the ped);
-//! - the producer `sub_82E41B98` / evaluator `sub_82E41EB0`: for each record not suppressed,
-//!   the ped's reaction results by priority (lower wins), each checked in retail's order (see
-//!   [`MoodTables::evaluate`]); the winner is rolled (`sub_8269A588`: `rand() % 100 + 1`, pass
-//!   when p x 100 >= n; p 0 always passes), every roll starts the result's cooldown; on a pass
-//!   the result's wants are raised on its target (instigator, second entity or the ped itself)
-//!   and the record is suppressed for the result's suppress time.
-//! Not decoded (answer false, documented): the target checks `vfunc +28` / `+32` (`D9F3` /
-//! `D44E`), the hand-prop bit (`brain+3278` 0x02, `072D`), the ped-state prerequisites (kinds 1,
-//! 2, 4, 7, 8), the sight test (`sub_82E27240`; every post is seen). The count range (`7FF7`)
-//! reads the instigator's perception entry `+68`, raised wants about it (inferred).
+//! A pedestrian's mood records and the want producer, all rules from the stock mood tables.
+//! Retail mechanism and gaps: docs/hails-additions/26g-living-world-ped-interactions.md#ped-mood
 
 use super::super::rng::Rng;
 use super::super::Vec3;
@@ -39,6 +10,9 @@ pub mod category {
     pub const PRESENCE: &str = "presence";
     /// Posted by a greeting ped into the greeted ped's store (ChannelGreetWantTarget, `8269FAC0`).
     pub const GREETED: &str = "greeted";
+    /// Posted by a ped into its own store when it jumps out of a skater's way (`sub_82E2E890`, category 3, research
+    /// b685): instigator the skater, second the ped; raises `skateravoidwarn` / `skateravoidchase` in the stock sets.
+    pub const SKATER_AVOID: &str = "skateravoid";
     pub const COLLISION: &str = "collision";
     pub const NEARBY_COLLISION: &str = "nearbycollision";
     /// Posted for every skater while the zombie cheat is on (`sub_82E24B60`, category 19); raises
@@ -328,14 +302,7 @@ impl MoodTables {
         self.prerequisites_pass(reactions, &record, ctx)
     }
 
-    /// Prerequisites of a record's category (`sub_82BFED98`, AND of the items; each item `sub_82BFEA60` about the
-    /// ped itself) [code]: kind 2 OwnPluginObject, 3 the squared distance from the ped to the record's position
-    /// (`+48`), 4 the ped is chasing, 6 the second entity is the ped itself (`sub_82E41060`'s input), 8 the `flee` want
-    /// (slot 10) is pending, 9 zombie mode.
-    /// Comparators: 0 the value, 1 its negation, 2 farther than the item value, 3 nearer; any other is false. Only
-    /// kind 3 has a distance (0.0 otherwise) and only kind 3 squares the item value.
-    /// NOT RETAIL YET: kinds 1 (`0x8269A888` vfunc +16), 5 (`0x8269A950` vfunc +8 with the position) and 7 (the
-    /// chasee's `0x8258E778` vfunc +12) are false (research b152).
+    /// Prerequisites of a record's category (82BFED98 / 82BFEA60; kinds 1, 5, 7 NOT RETAIL YET): docs/hails-additions/26g-living-world-ped-interactions.md#mood-prerequisites
     pub fn prerequisites_pass(&self, reactions: &MoodReactions, record: &MoodRecord, ctx: &MoodContext) -> bool {
         reactions.prerequisites.iter().filter(|p| p.category == record.category).all(|p| {
             let (value, item, distance) = match p.kind {

@@ -149,3 +149,25 @@ fn steer_point_puts_each_width_on_its_own_side() {
     assert!((left[0] - 0.5).abs() < 1e-5 && (left[2] - 6.0).abs() < 1e-5, "{left:?}");
     assert!((right[0] + 1.0).abs() < 1e-5, "{right:?}");
 }
+fn pp(node: u32, t: f32) -> PathPoint {
+    PathPoint { point: [0.0, 0.0, node as f32 + t], direction: [0.0, 0.0, 1.0], width_left: 1.0, width_right: 2.0, node, t }
+}
+
+/// b612: before the obstacle the far point shifts by the side's width; past it the obstacle's point (or near) anchors.
+#[test]
+fn avoid_aim_follows_both_retail_branches() {
+    let target = pp(10, 0.5);
+    let r = avoid_aim(&pp(8, 0.0), &pp(2, 0.0), &target, 0.5);
+    assert_eq!((r.node, r.t, r.width_left, r.width_right), (8, 0.0, 0.0, 0.0));
+    assert!((steer_point(&pp(8, 0.0), 0.5)[0] - r.point[0]).abs() < 1e-6 && (r.point[0].abs() - 1.0).abs() < 1e-6);
+    let l = avoid_aim(&pp(8, 0.0), &pp(2, 0.0), &target, -0.5);
+    assert!((l.point[0].abs() - 0.5).abs() < 1e-6 && l.point[0].signum() != r.point[0].signum());
+    let past = avoid_aim(&pp(12, 0.0), &pp(9, 0.0), &target, 0.5);
+    assert_eq!((past.node, past.t), (10, 0.5));
+    let both = avoid_aim(&pp(12, 0.0), &pp(11, 0.0), &target, 0.5);
+    assert_eq!((both.node, both.t), (11, 0.0));
+    let equal = avoid_aim(&pp(10, 0.5), &pp(10, 0.5), &target, 0.5);
+    assert_eq!((equal.node, equal.t), (10, 0.5), "t equal is not before");
+    let zero = PathPoint { width_left: 0.0, width_right: 0.0, ..pp(3, 0.0) };
+    assert!((steer_point(&zero, 0.25)[0].abs() - 0.25).abs() < 1e-6, "zero width shifts lateral metres");
+}

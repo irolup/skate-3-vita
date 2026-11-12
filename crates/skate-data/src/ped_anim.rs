@@ -1,19 +1,5 @@
-//! Pedestrian body data (doc 26, peds milestone M2): the ped animation bank and the look /
-//! animation tables, read into the pure `skate_core::living_world::peds` types.
-//!
-//! - Bank: `data/anim/PedestrianSkeletonPres.abin` from the user's stock data (462 VBR clips, one
-//!   50-bone rig with trajectory, 10 parts) [data]. Its clips carry only the first 6 parts (bones
-//!   0..=26), so the skater's full-hierarchy loader (`animation_frames`) does not apply; this
-//!   module decodes the parts a clip has with the same core VBR decoder and leaves the other
-//!   bones at identity. The reference pose is the bank's `PEDESTRIAN_RIG_TPOSE` pose record.
-//!   Clip attributes (`LEFTTOEDOWN`, `RIGHTTOEDOWN`, `LEFTHEELDOWN`, `RIGHTHEELDOWN`,
-//!   `BODYFALLTYPE`, ...) come from `animation_metadata` (first payload word = the value).
-//! - Tables (`private/living_world/tables.json`): `livingworld_entitycategories.entities`,
-//!   `livingworld_entities` (`model`, the `livingworld_entity_animation` ref), `livingworld_models`
-//!   (`recipe`, `voice`, `tints_a` / `tints_b` = `secondary_colours` / `chassis_colours`, distance pairs) and the animation sets, whose
-//!   logical names are vault hashes (`attrib_hash::hash("FwdWalkCyc")` = `Hash_4AA12E0083F10739`)
-//!   and whose `tAnimAttributes` entries name their clip through `anim_name` (setup resolves the
-//!   string-pool offset, `living_world_anim.py`).
+//! Pedestrian body data: the ped animation bank and the look / animation tables, read into core types.
+//! Bank and table details: docs/hails-additions/26f-living-world-peds.md#ped-anim-data
 
 use crate::abin::{Bank, RecordData};
 use crate::animation_metadata::AnimationMetadata;
@@ -294,6 +280,16 @@ impl PedTables {
                 // Ours (retail's `c+4 > 5` is a code constant): a mod may set it per set.
                 block_after: f.get("block_after").and_then(Value::as_u64).map_or(d.block_after, |v| v.min(255) as u8),
             };
+            // The locomotion speed rows setup named (`living_world_anim.py`, b682), ascending.
+            set.speed_rows = f.get("speed_rows").and_then(Value::as_array).into_iter().flatten().filter_map(|r| {
+                Some(skate_core::living_world::peds::anim::SpeedRow {
+                    threshold: r.get("threshold")?.as_f64()? as f32,
+                    state: r.get("state")?.as_str()?.to_string(),
+                    tier: skate_core::living_world::peds::anim::Tier::from_intent(r.get("tier").and_then(Value::as_str)),
+                    turn_from: r.get("turn_from").and_then(Value::as_array).into_iter().flatten().filter_map(|s| s.as_str().map(String::from)).collect(),
+                })
+            }).collect();
+            set.speed_rows.sort_by(|a, b| a.threshold.total_cmp(&b.threshold));
             t.anim_sets.insert(k.clone(), set);
         }
         if t.catalog.categories.is_empty() || t.catalog.models.is_empty() {

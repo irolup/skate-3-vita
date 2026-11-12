@@ -58,6 +58,9 @@ impl GrindInputState {
                 },
                 &mut self.secondary_history,
             );
+            if fields.valid_1488 && !output.valid && crate::physics::log_actor() == "npc" {
+                tracing::info!("NPC_GRIND_DROP tweak #{} family={} state={} category={} surface_kind={} surface_flags={:#x}", crate::physics::log_npc(), fields.family_1248, p.state_2508, p.category_2512, surface.kind as u32, surface.flags);
+            }
             fields.valid_1488 = output.valid;
             fields.family_1248 = output.family;
             fields.flags_1516 = output.flags;
@@ -139,6 +142,9 @@ impl GrindInputState {
             flags: fields.flags_1516,
             previous_entry_velocity: float(fields.entry_velocity_1184),
         });
+        if fields.valid_1488 && !engagement.valid && crate::physics::log_actor() == "npc" {
+            tracing::info!("NPC_GRIND_DROP engagement #{} family={} state={} category={} speed={:.2} impact={:.2} reasons={:?}", crate::physics::log_npc(), fields.family_1248, p.state_2508, p.category_2512, p.scalar_2652, engagement.impact_speed, engagement.wipeout_reasons);
+        }
         fields.valid_1488 = engagement.valid;
         fields.flags_1516 = engagement.flags;
         fields.entry_velocity_1184 = raw(engagement.entry_velocity);

@@ -29,7 +29,8 @@ pub struct SkaterCharacter {
     pub key: String,
     /// Profile pro index (`Hash_A390BE5FC0DDA71C`), if the profile has one.
     pub pro_index: Option<u32>,
-    /// Capability bytes +145 / +144 / +146 against line flag bits 0 / 1 / 2 (not named yet).
+    /// The runtime profile's bytes +0x31 / +0x30 / +0x32 against line flag bits 0 / 1 / 2 (`sub_8245FFD8`, b675;
+    /// names not decoded).
     pub capabilities: [bool; 3],
     pub community: bool,
 }
@@ -38,11 +39,12 @@ pub struct SkaterCharacter {
 pub trait SkaterWorld {
     fn lines(&self) -> &[SkaterLine];
     fn characters(&self) -> &[SkaterCharacter];
-    /// Whether a character may ride a line (`sub_8245B068` / `sub_8245C018` validity): the line's
-    /// allowed-skater bit for the character's pro index, or a matching capability bit.
+    /// Whether a character may ride a line (`sub_82456970`, used by the spawn `sub_8245C018` / `sub_8245B068`, the
+    /// branches and the line-end search; b159 / b675): the line's allowed-skater bit for the character's pro index
+    /// AND a capability bit matching a line flag bit. NOT RETAIL YET: the controller exclusion (ctrl+0xA0) is not read.
     fn fits(&self, line: &SkaterLine, character: &SkaterCharacter) -> bool {
         character.pro_index.is_some_and(|p| p < 64 && line.allowed_skaters & (1u64 << p) != 0)
-            || (0..3).any(|b| character.capabilities[b] && line.flags & (1 << b) != 0)
+            && (0..3).any(|b| character.capabilities[b] && line.flags & (1 << b) != 0)
     }
 }
 

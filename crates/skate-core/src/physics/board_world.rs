@@ -323,6 +323,17 @@ impl BoardWorld {
         Ok(world)
     }
 
+    /// Replace the level's query edges (the off-board searches' rail records), validated like authored ones.
+    pub fn set_static_edges(&mut self, edges: Vec<query_metadata::EdgeSegment>) -> Result<(), &'static str> {
+        let metadata = self.query_metadata.as_mut().ok_or("Canonical world has no authored query metadata")?;
+        let old = std::mem::replace(&mut metadata.static_edges, edges);
+        if let Err(e) = metadata.validate(&self.triangles) {
+            metadata.static_edges = old;
+            return Err(e);
+        }
+        Ok(())
+    }
+
     /// skate_vita: the world's largest buffers, emptied, for the next one ([`WorldBuffers`]).
     pub fn into_buffers(self) -> WorldBuffers {
         let mut b = WorldBuffers {

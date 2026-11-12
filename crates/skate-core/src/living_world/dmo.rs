@@ -20,7 +20,7 @@
 
 use super::census::CensusRange;
 use super::{Observer, Vec3};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The five `livingworld.dynamicobjects` score weights [data, b97 §1.4].
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -107,12 +107,22 @@ fn flat_dist(a: Vec3, b: Vec3) -> f32 {
 
 /// The score vector `s[1..=4]` of a placement or live object [code `sub_82C4A130`]; compare with [`score_value`].
 pub fn score(p: &DmoPlacement, view: &DmoView, w: &DmoWeights) -> [f32; 4] {
+    score_as(p, view, w, false)
+}
+
+/// The score of a LIVE object [code `82C55160`, b657]: its `s1` is always 2^31 (the placement priority only ranks spawn
+/// candidates).
+pub fn live_score(p: &DmoPlacement, view: &DmoView, w: &DmoWeights) -> [f32; 4] {
+    score_as(p, view, w, true)
+}
+
+fn score_as(p: &DmoPlacement, view: &DmoView, w: &DmoWeights, live: bool) -> [f32; 4] {
     let to = [p.position[0] - view.camera[0], p.position[1] - view.camera[1], p.position[2] - view.camera[2]];
     let in_front = to[0] * view.forward[0] + to[1] * view.forward[1] + to[2] * view.forward[2] > 0.0;
     let k_view = if in_front { w.in_front } else { 1.0 };
     let k_flag = if p.keep { w.keep_flag } else { 1.0 };
     let s1 = match (p.keep, p.priority) {
-        (false, Some(prio)) => w.priority * prio as f32 * k_flag,
+        (false, Some(prio)) if !live => w.priority * prio as f32 * k_flag,
         _ => 2f32.powi(31),
     };
     let n = 1.0;
@@ -139,6 +149,9 @@ pub struct DmoStream {
     group: Vec<usize>,
     /// skate_vita (performance): each group's placements in ascending order, by group index.
     members: Vec<Vec<usize>>,
+    /// Where live objects moved off their placement are now (the host sets it each pass): the cull and the live
+    /// score read the object's current position, a spawn the placement's (`826BAD98` vfunc +16, b651).
+    pub live_at: BTreeMap<u32, Vec3>,
 }
 
 /// skate_vita: a key whose unsigned order is `f32::total_cmp`'s (std's transform).
@@ -174,7 +187,7 @@ impl DmoStream {
         for (i, &g) in group.iter().enumerate() {
             members[g].push(i);
         }
-        Self { placements, live: BTreeSet::new(), group, members }
+        Self { placements, live: BTreeSet::new(), group, members, live_at: BTreeMap::new() }
     }
 
     fn index(&self, id: u32) -> Option<usize> {
@@ -197,8 +210,10 @@ impl DmoStream {
         if circles.is_empty() {
             return out;
         }
+        let live_at = &self.live_at;
+        let now = |p: &DmoPlacement| live_at.get(&p.id).map_or_else(|| p.clone(), |at| DmoPlacement { position: *at, ..p.clone() });
         // Cull: beyond every observer's circle, with the whole group.
-        let beyond = |p: &DmoPlacement| circles.iter().all(|((c, centre), _)| flat_dist(p.position, *centre) > c.cull);
+        let beyond = |p: &DmoPlacement| circles.iter().all(|((c, centre), _)| flat_dist(now(p).position, *centre) > c.cull);
         let mut cull_groups = BTreeSet::new();
         for (i, p) in self.placements.iter().enumerate() {
             if self.live.contains(&p.id) && p.streamable && !exempt(p.id) && beyond(p) {
@@ -217,17 +232,29 @@ impl DmoStream {
         }
         // The best score over the observers' views.
         let best = |p: &DmoPlacement| circles.iter().map(|(_, v)| score_value(score(p, v, &settings.weights))).fold(f32::MIN, f32::max);
+        let best_live = |p: &DmoPlacement| circles.iter().map(|(_, v)| score_value(live_score(p, v, &settings.weights))).fold(f32::MIN, f32::max);
         // skate_vita (performance): a placement's score at most once per pass, when first needed (it reads only
         // the views), and the live, non-exempt objects ordered by (live score in `total_cmp` order, id): the eviction
         // front is the first, the same minimum as scanning them; upstream rescanned every placement per spawn attempt.
-        // `score(i, true)` is upstream's live score (a kept object scores like a keep placement, flag 0x10: s1 = 2^31,
-        // the keep weight), `score(i, false)` its `best` (a spawn candidate's).
-        let mut memo: Vec<[Option<f32>; 2]> = vec![[None; 2]; self.placements.len()];
+        // `score(i, true)` is upstream's live score (at the object's current position, s1 always 2^31, and a kept
+        // object scores like a keep placement, flag 0x10: the keep weight), `score(i, false)` its `best` (a spawn
+        // candidate's, at the placement).
+        let mut memo: Vec<[Option<f32>; 3]> = vec![[None; 3]; self.placements.len()];
         let placements = &self.placements;
         let mut score = |i: usize, live: bool| {
             let p = &placements[i];
-            let as_kept = live && kept(p.id) && !p.keep;
-            *memo[i][as_kept as usize].get_or_insert_with(|| if as_kept { best(&DmoPlacement { keep: true, ..p.clone() }) } else { best(p) })
+            if !live {
+                return *memo[i][0].get_or_insert_with(|| best(p));
+            }
+            let as_kept = kept(p.id) && !p.keep;
+            *memo[i][1 + as_kept as usize].get_or_insert_with(|| {
+                let p = now(p);
+                if as_kept {
+                    best_live(&DmoPlacement { keep: true, ..p })
+                } else {
+                    best_live(&p)
+                }
+            })
         };
         let mut queue: BTreeSet<(u32, u32, usize)> = BTreeSet::new();
         for (i, p) in placements.iter().enumerate() {

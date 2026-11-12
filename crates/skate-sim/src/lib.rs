@@ -11,10 +11,30 @@
 #[macro_use]
 extern crate tracing;
 
+/// A data-gated test whose private inputs are missing prints one `TEST_SKIPPED` line (also appended to the file in
+/// `SKATE_TEST_SKIPS` when set) and returns (upstream `main.rs`, PR #52 `02ce8847`).
+#[cfg(test)]
+macro_rules! test_skip {
+    ($($why:tt)*) => {{
+        let line = format!("TEST_SKIPPED {}: {}", module_path!(), format_args!($($why)*));
+        eprintln!("{line}");
+        if let Some(path) = std::env::var_os("SKATE_TEST_SKIPS") {
+            use std::io::Write as _;
+            // One write per line, so parallel tests do not interleave inside a line.
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                let _ = f.write_all(format!("{line}\n").as_bytes());
+            }
+        }
+        return;
+    }};
+}
+
 mod animation;
 mod audio_events;
 /// The skater's audio publication after each tick (retail audio).
 pub use audio_events::Riding as AudioRiding;
+/// The props' audio entries the host reads (`PropDynamics::take_audio_samples`).
+pub use physics::prop_dynamics::{PropAudioSample, PropAudioType};
 mod animation_pose;
 mod camera;
 mod career_stats;

@@ -1,14 +1,13 @@
-//! Retail sea reset (doc 09, "Falling into the Industrial sea"): Industrial's sea has an
-//! invisible floor at y -4.0 (surface 768, physics type 6 `physics_unrideable`). Touching it
-//! raises the teleport request (82DB8120), so the checkpoint reset carries reason `boundary`.
-//! Real map and stock graphs: drop the skater over open sea, read the respawn event.
+//! Retail sea reset (doc 09): Industrial's invisible floor at y -4.0 raises the teleport request (82DB8120),
+//! so the reset reason is `boundary`. Real map and stock graphs.
 use super::*;
 
 #[test]
-#[ignore = "requires private stock graphs and Industrial (SKATE3_ASSET_ROOT, SKATE3_MAP=<maps/Industrial.skate>)"]
+#[ignore = "requires private stock graphs and Industrial (SKATE3_ASSET_ROOT, SKATE3_MAP=<any map in the install's maps folder>)"]
 fn skater_dropped_onto_the_industrial_sea_floor_respawns_with_reason_boundary() {
     let root = std::path::PathBuf::from(std::env::var_os("SKATE3_ASSET_ROOT").unwrap());
-    let map_path = std::path::PathBuf::from(std::env::var_os("SKATE3_MAP").unwrap());
+    let map_path = std::path::PathBuf::from(std::env::var_os("SKATE3_MAP").unwrap())
+        .with_file_name("Industrial.skate");
     let map = skate_data::skate_map::SkateMap::load(&map_path).unwrap();
     let assets = skate_data::GameAssets::load(&root).unwrap();
     let graphs = crate::graph_runtime::StockGraphs::load(&root, &assets).unwrap();

@@ -1,11 +1,5 @@
-//! Data-gated checks of the living-world population data on the user's own export. Skips (passes
-//! with a note) when no data is configured. `SKATE3_ASSET_ROOT`: converted assets (one root, or
-//! several joined like PATH); reads `private/living_world/{tables.json, census.json,
-//! <District>.census.bin, skater_profiles.json, skater_paths/*.bin}`.
-//!
-//! The expected values are the shipped Skate 3 data the research measured (labels in
-//! `.claude/notes/npc-livingworld-re.md` §1 and doc 26); they are asserted, not embedded in the
-//! engine.
+//! Data-gated checks of the living-world population data on the local export (skip without data).
+//! Inputs and expected values: docs/hails-additions/26b-living-world-population.md#population-data-tests
 
 use skate_core::living_world::{Kind, LivingWorld, Observer, PopulationConfig, TickInputs};
 use skate_data::aipath;
@@ -223,7 +217,7 @@ fn replay_cursor_rides_every_exported_line() {
             while !c.finished && frames < 60 * 60 * 2 {
                 let s = c.sample(&lines, 0.0).unwrap();
                 let speed = (s.velocity[0].powi(2) + s.velocity[1].powi(2) + s.velocity[2].powi(2)).sqrt();
-                let ctx = BranchContext { position: s.position, forward: s.velocity, speed, players: &players, others: &[], in_use: &[], preferred_skill: -1, online: false, chain: ChainConfig::retail(), tricks: Default::default() };
+                let ctx = BranchContext { position: s.position, forward: s.velocity, speed, players: &players, others: &[], in_use: &[], preferred_skill: -1, online: false, chain: ChainConfig::retail(), tricks: Default::default(), body: None, valid_lines: None };
                 c.step(&lines, &mut Decider::Decide(ctx), &mut ev);
                 frames += 1;
                 let p = c.sample(&lines, 0.0).unwrap().position;
@@ -255,12 +249,7 @@ fn replay_cursor_rides_every_exported_line() {
     assert!(total.2 * 2 < total.0, "most rides keep going for 2 minutes: {} of {} ended", total.2, total.0);
 }
 
-/// Fix 14 (NPC skater jitter): exported lines ridden with the retail branch and chain choice and
-/// drawn at 144 Hz like `npc_skaters::present_pose` (the cursor one tick back, interpolated by the
-/// fixed-step fraction with the recorded decisions). A render step never moves the root more than
-/// the line's own fastest motion plus one smoothstep step of a 4 m chain gap, while the same ride
-/// cut over (blend 0) jumps; the clip time never steps back. Seeded (the line order) and
-/// deterministic.
+/// Fix 14 on exported lines: 144 Hz drawing never jumps more than line motion plus one blend step: docs/hails-additions/26b-living-world-population.md#test-exported-line-jitter
 #[test]
 fn npc_skater_render_is_smooth_on_the_exported_lines() {
     use skate_core::living_world::replay::{BranchContext, BranchRecord, ChainConfig, CursorEvent, Decider, LineCursor, ReplayLine, ReplaySample, SWITCH_BLEND_SECONDS};
@@ -291,7 +280,7 @@ fn npc_skater_render_is_smooth_on_the_exported_lines() {
                 prev = c.clone();
                 let s = c.sample(lines, 0.0).unwrap();
                 let speed = (s.velocity[0].powi(2) + s.velocity[1].powi(2) + s.velocity[2].powi(2)).sqrt();
-                let ctx = BranchContext { position: s.position, forward: s.velocity, speed, players: &players, others: &[], in_use: &[], preferred_skill: -1, online: false, chain: ChainConfig::retail(), tricks: Default::default() };
+                let ctx = BranchContext { position: s.position, forward: s.velocity, speed, players: &players, others: &[], in_use: &[], preferred_skill: -1, online: false, chain: ChainConfig::retail(), tricks: Default::default(), body: None, valid_lines: None };
                 let mut ev = Vec::new();
                 c.step(lines, &mut Decider::Decide(ctx), &mut ev);
                 if ev.iter().any(|e| matches!(e, CursorEvent::Branch(_))) {
@@ -355,17 +344,7 @@ fn npc_skater_render_is_smooth_on_the_exported_lines() {
     assert!(worst.3 > 100 && worst.0 < worst.2, "the blend removes the switch jumps");
 }
 
-/// Facing rules on the exported lines (fix 16, fix 23, fix 23 corrected). Every eighth line of the
-/// three districts is ridden for 40 s (branches and chains decided by the retail chooser) under
-/// three rules: the retail rule (`riding_entry`, mod option: recorded skater frame, turned while
-/// the flip latched on entering riding is set, held across switches), the fix 23 rule
-/// (`per_node`, the default, NOT RETAIL YET) and the fix 16 option (`keep_facing` on top of `per_node`, not retail).
-/// Counted per rule: settled frames drawn more than 135 deg against travel where the line's path
-/// frame does not oppose travel (`facing_check`, the `NPC_SKATER_BACKWARDS` diagnostic). The
-/// counts are reported, not tuned: the retail rule draws a recorder's switch stance as recorded,
-/// and the puppet has no stance mirror (NOT RETAIL YET), so its count measures that gap. Asserted:
-/// determinism, the fix 23 rule's own property (it folds every node onto the path frame), and that
-/// the fix 16 option rides more forward-recorded frames backwards than the fix 23 rule.
+/// Facing rules on the exported lines (fix 16, 23, 23 corrected): counts reported, determinism asserted: docs/hails-additions/26b-living-world-population.md#test-exported-facing-rules
 #[test]
 fn npc_skater_facing_rules_on_the_exported_lines() {
     use skate_core::living_world::replay::{facing_check, rotate, BranchContext, ChainConfig, CursorEvent, Decider, FacingRule, LineCursor, ReplayLine, ReplayPhase};
@@ -401,7 +380,7 @@ fn npc_skater_facing_rules_on_the_exported_lines() {
             }
             let s = c.sample(lines, 0.0).unwrap();
             let speed = (s.velocity[0].powi(2) + s.velocity[1].powi(2) + s.velocity[2].powi(2)).sqrt();
-            let ctx = BranchContext { position: s.position, forward: s.velocity, speed, players: &players, others: &[], in_use: &[], preferred_skill: -1, online: false, chain, tricks: Default::default() };
+            let ctx = BranchContext { position: s.position, forward: s.velocity, speed, players: &players, others: &[], in_use: &[], preferred_skill: -1, online: false, chain, tricks: Default::default(), body: None, valid_lines: None };
             let was = c.flip;
             let mut ev = Vec::new();
             c.step(lines, &mut Decider::Decide(ctx), &mut ev);
@@ -500,10 +479,7 @@ fn npc_skater_facing_rules_on_the_exported_lines() {
     assert!(total[7] < total[9], "the fix 16 option rides more forward-recorded frames backwards ({} vs {})", total[7], total[9]);
 }
 
-/// Fix 21 (NPC skater pops and tricks): on the exported lines the trick slots hold `EScorableID`s
-/// (-1 or 0..332, [code] `sub_8246A2E0`), most of them jump tricks (ollie 128, kickflip 96), and
-/// about half of all phase changes come before a 0.2 s crossfade could finish: the puppet must
-/// nest a running blend instead of restarting it.
+/// Fix 21: trick slots hold EScorableIDs (8246A2E0), half the phase changes beat a 0.2 s blend.
 #[test]
 fn npc_skater_trick_slots_and_phase_changes_on_the_exported_lines() {
     use skate_core::living_world::replay::{node_events, ReplayLine, ReplayPhase};

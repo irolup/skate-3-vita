@@ -145,9 +145,10 @@ fn stock_motion_factory_support_inventory() {
         counts[index] += 1;
     }
     assert_eq!(counts.iter().sum::<usize>(), binding.operations.len());
-    let output = std::path::PathBuf::from(
-        std::env::var_os("SKATE3_MOTION_INVENTORY").expect("Set SKATE3_MOTION_INVENTORY"),
-    );
+    // The checks above are the test; writing the inventory is optional (SKATE3_MOTION_INVENTORY = output file).
+    let Some(output) = std::env::var_os("SKATE3_MOTION_INVENTORY").map(std::path::PathBuf::from) else {
+        return;
+    };
     std::fs::write(&output, rows).unwrap();
     println!(
         "MotionGraph factory inventory: {} behaviors, {} conditions, {} hooks; {}",
@@ -156,4 +157,24 @@ fn stock_motion_factory_support_inventory() {
         counts[2],
         output.display()
     );
+}
+
+/// An unsupported operation fails the skater's animation tick when its state is reached (the player's game ends, an
+/// NPC drops to replay): docs/hails-additions/26c-living-world-npc-skaters.md#failed-tick-leaves-queries
+#[test]
+#[ignore = "requires the user's private stock MotionGraph"]
+fn stock_motion_graph_has_no_unsupported_operations() {
+    use skate_data::state_graph::{StateGraph, binding::Binding};
+    let root = std::path::PathBuf::from(std::env::var_os("SKATE3_ASSET_ROOT").expect("Set SKATE3_ASSET_ROOT"));
+    let source = StateGraph::load(&root.join("private/stock/data/state/MotionGraph_OnBoard.stategraph")).unwrap();
+    let binding = Binding::from_graph(&source).unwrap();
+    let instantiated = binding.instantiate_operations(&source, &mut MotionFactory).unwrap();
+    let unsupported: Vec<_> = binding
+        .operations
+        .iter()
+        .zip(&instantiated.operations)
+        .filter(|(_, op)| matches!(op, MotionOperation::Unsupported { .. }))
+        .map(|(o, _)| format!("{:?} {}", o.kind, o.name))
+        .collect();
+    assert!(unsupported.is_empty(), "{unsupported:?}");
 }

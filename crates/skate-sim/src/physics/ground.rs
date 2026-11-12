@@ -194,6 +194,9 @@ fn build_world(
             }
         }
     }
+    with_authored_metadata(triangles, edges)
+}
+pub(crate) fn with_authored_metadata(triangles: Vec<WorldTriangle>, edges: Vec<EdgeSegment>) -> BoardWorld {
     //This test level explicitly authors material0/category0/upper flags0.
     //This is host metadata, not a claim that the stock material is concrete,
     //and not derived from the neutral contact coefficients or rendering tag.

@@ -18,7 +18,7 @@ fn fixture() -> MenuData {
     screens[3] = vec!["ID_GAMESETTINGS_SFXVOLUME".into(), "ID_GAMESETTINGS_SFXPACK".into()];
     MenuData {
         categories: ["Options", "SinglePlayer", "Create"].map(category).to_vec(),
-        items: ["ChallengeMap", "GameSettings", "SkateWith", "Project10", "SavePark", "ReplayEditor"].map(item).to_vec(),
+        items: ["ChallengeMap", "GameSettings", "SkateWith", "Project10", "SavePark", "ReplayEditor", "EnterSkatePark", "PartyPlay"].map(item).to_vec(),
         settings: vec![
             setting("ID_GAMESETTINGS_DIFFICULTY_SETTINGS", Widget::Option),
             setting("ID_GAMESETTINGS_AUDIO_SETTINGS", Widget::Option),
@@ -135,13 +135,22 @@ fn every_entry_is_greyed_until_a_handler_registers() {
 fn park_rules_and_dirty_park_confirmation() {
     let mut registry = MenuRegistry::new(fixture());
     let count = Arc::new(AtomicUsize::new(0));
-    for item in ["ChallengeMap", "SkateWith", "SavePark"] {
+    for item in ["ChallengeMap", "SkateWith", "SavePark", "EnterSkatePark", "PartyPlay"] {
         registry.register_handler(EntryRef::item(item), engine_handler("f", count.clone()));
     }
     let career = MenuContext::new("Career");
     let park = MenuContext::new("CareerPark");
     assert!(registry.enabled(&EntryRef::item("SkateWith"), &career));
     assert!(!registry.enabled(&EntryRef::item("SkateWith"), &park), "SkateWith is off in a park");
+    // b673: also off in a world flagged IsSkatePark; EnterSkatePark in career waits for progression; PartyPlay needs
+    // the San Van pack.
+    let free = MenuContext::new("FreePlay");
+    assert!(!registry.enabled(&EntryRef::item("SkateWith"), &free.clone().with(facts::WORLD_IS_SKATE_PARK, 1.0)));
+    assert!(registry.enabled(&EntryRef::item("SkateWith"), &free));
+    assert!(!registry.enabled(&EntryRef::item("EnterSkatePark"), &career.clone().with(facts::SKATE_PARK_LOCKED, 1.0)));
+    assert!(registry.enabled(&EntryRef::item("EnterSkatePark"), &free.clone().with(facts::SKATE_PARK_LOCKED, 1.0)));
+    assert!(!registry.enabled(&EntryRef::item("PartyPlay"), &free));
+    assert!(registry.enabled(&EntryRef::item("PartyPlay"), &free.with(facts::PARTY_PACK_OWNED, 1.0)));
     assert!(!registry.enabled(&EntryRef::item("SavePark"), &park));
     assert!(registry.enabled(&EntryRef::item("SavePark"), &park.clone().with(facts::PARK_SAVEABLE, 1.0)));
 

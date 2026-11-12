@@ -45,6 +45,7 @@ fn indexed_edges_sort_ids_and_preserve_shared_capacity() {
         conditional_pool: &[],
         island_flags: 0,
         static_edges: &static_edges,
+        static_metadata: &[],
         primary_edges: PrimaryEdges::Normal {
             dynamic: &[],
             vehicles: &[],
@@ -149,6 +150,7 @@ fn actual_triangle_queries_preserve_pool_ties_group_filter_and_conditional_gate(
         conditional_pool: &conditional,
         island_flags: 0,
         static_edges: &[],
+        static_metadata: &[],
         primary_edges: PrimaryEdges::Normal {
             dynamic: &[],
             vehicles: &[],
@@ -284,4 +286,54 @@ fn indexed_world_bridge_retains_group_pool_and_conditional_selection() {
                 .all(|hit| hit.unwrap().packed_surface == expected)
         );
     }
+}
+#[test]
+fn static_edges_read_in_place_match_the_converted_copy() {
+    use skate_core::physics::board_world::query_metadata as qm;
+    let mut seed = 0x9E37_79B9_u32;
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        (seed as f32 / u32::MAX as f32) * 40.0 - 20.0
+    };
+    let raw: Vec<qm::EdgeSegment> = (0..600)
+        .map(|_| {
+            let (start, end) = (Vector3::new(next(), next(), next()), Vector3::new(next(), next(), next()));
+            let (min, max) = (Vector3::new(start.x.min(end.x), start.y.min(end.y), start.z.min(end.z)), Vector3::new(start.x.max(end.x), start.y.max(end.y), start.z.max(end.z)));
+            qm::EdgeSegment { start, end, local_bounds: qm::Bounds { min, max } }
+        })
+        .collect();
+    // The copy `with_world_scene` made before reading the edges in place.
+    let converted: Vec<Segment> = raw
+        .iter()
+        .map(|s| Segment { edge: Edge { start: s.start, end: s.end }, local_bounds: Bounds { min: s.local_bounds.min, max: s.local_bounds.max } })
+        .collect();
+    let scene = |copy: bool| Scene {
+        ground_pool: &[],
+        island_pool: &[],
+        conditional_pool: &[],
+        island_flags: 0,
+        static_edges: if copy { &converted } else { &[] },
+        static_metadata: if copy { &[] } else { &raw },
+        primary_edges: PrimaryEdges::Normal { dynamic: &[], vehicles: &[] },
+        indexed_edges: &[],
+    };
+    let bits = |e: &[Edge]| e.iter().map(|e| [e.start.x, e.start.y, e.start.z, e.end.x, e.end.y, e.end.z].map(f32::to_bits)).collect::<Vec<_>>();
+    let mut hits = 0;
+    for _ in 0..400 {
+        let (c, r) = (Vector3::new(next(), next(), next()), next().abs() * 0.4);
+        let search = EdgeSearch {
+            min: Vector3::new(c.x - r, c.y - r, c.z - r),
+            max: Vector3::new(c.x + r, c.y + r, c.z + r),
+            frame: Frame::IDENTITY,
+            context: QueryContext { selection_flags_2948: 0, matching_id_2952: -1 },
+            narrow_forward: false,
+        };
+        let old = scene(true).edge_candidates(&search).unwrap();
+        let new = scene(false).edge_candidates(&search).unwrap();
+        assert_eq!(bits(&old), bits(&new));
+        hits += old.len();
+    }
+    assert!(hits > 400, "the queries must find edges ({hits})");
 }

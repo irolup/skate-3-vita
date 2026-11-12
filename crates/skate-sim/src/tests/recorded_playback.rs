@@ -7,7 +7,7 @@ use super::*;
 fn recorded_controller_sequence_runs_production_gameplay() {
     let root = std::env::var_os("SKATE3_ASSET_ROOT").expect("set SKATE3_ASSET_ROOT");
     let root = std::path::Path::new(&root);
-    let path = std::env::var_os("SKATE3_INPUT_RECORDING").expect("set SKATE3_INPUT_RECORDING");
+    let Some(path) = std::env::var_os("SKATE3_INPUT_RECORDING") else { test_skip!("set SKATE3_INPUT_RECORDING") };
     let recording =
         skate_data::input_recording::Recording::load(std::path::Path::new(&path)).unwrap();
     let assets = skate_data::GameAssets::load(root).unwrap();

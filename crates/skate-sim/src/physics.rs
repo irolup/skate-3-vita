@@ -97,6 +97,7 @@ pub(crate) mod grab_view {
 pub(crate) mod prop_carry;
 pub(crate) mod prop_dynamics;
 pub(crate) mod prop_layout;
+pub(crate) mod prop_water;
 mod settings;
 mod skeleton_grind_air;
 mod teleport_state;
@@ -148,10 +149,16 @@ pub(crate) struct GamePhysics {
     /// id. Rewritten each tick before the solve by `living_world::npc_skaters::push_proxies`
     /// (NPC skater body + board, doc 26 fix 19); empty when nothing fills it.
     pub(crate) actor_prop_volumes: Vec<(u64, BoardWorldVolume)>,
+    /// The traffic cars as on-foot ground this tick (`living_world::vehicles::publish_on_foot_solids`); only the
+    /// on-foot queries (`biped_world`) read them.
+    pub(crate) on_foot_vehicles: Option<std::sync::Arc<crate::modding::bridge::MovingQueries>>,
     /// Near peds' body A for the dynamic prop step: (body A id, volume, push mass kg), sorted by id. Rewritten each
     /// tick by `living_world::ped_body::push_ped_proxies` (b342); its own list, so the NPC proxy system clearing
     /// [`Self::actor_prop_volumes`] cannot drop it.
     pub(crate) ped_prop_volumes: Vec<(u64, BoardWorldVolume, f32)>,
+    /// The peds' body A displacements the last prop steps solved (`living_world::ped_body::push_ped_proxies` applies
+    /// them before the next step): (body A id, displacement, contact normal along it).
+    pub(crate) ped_prop_shoves: Vec<(u64, Vector3, Vector3, Vector3)>,
     pub(crate) network_active: bool,
     pub(crate) network_contacts: usize,
     clock: clock::SimulationClock,
@@ -469,7 +476,7 @@ impl GamePhysics {
 
     /// What the on-foot queries see: the map and the prop world (`offboard::BipedWorld`).
     pub(crate) fn biped_world(&self) -> offboard::BipedWorld<'_> {
-        offboard::BipedWorld { map: &self.world, props: self.prop_layer.as_ref().map(crate::skate_world::PropCollisionLayer::world) }
+        offboard::BipedWorld { map: &self.world, props: self.prop_layer.as_ref().map(crate::skate_world::PropCollisionLayer::world), vehicles: self.on_foot_vehicles.as_deref() }
     }
 
     pub(crate) fn prop_world(&self) -> Option<&BoardWorld> {
@@ -504,6 +511,12 @@ impl GamePhysics {
         }
     }
 
+    /// Better Water's props in water ([`prop_dynamics::PropDynamics::set_water`]); how many props woke.
+    pub(crate) fn set_prop_water(&mut self, water: Option<prop_water::PropWater>) -> Option<usize> {
+        let dynamics = self.prop_dynamics.as_mut().map(shared_mut)?;
+        Some(dynamics.set_water(water, &self.world))
+    }
+
     /// Push, integrate and re-bake dynamic props against the static world.
     /// `volumes` are the skater's board and skeleton world volumes; the NPC skaters' volumes
     /// ([`Self::actor_prop_volumes`]) push props by the same rule.
@@ -526,6 +539,20 @@ impl GamePhysics {
             let mut others = self.actor_prop_volumes.clone();
             others.extend(self.ped_prop_volumes.iter().map(|(id, v, _)| (*id, *v)));
             dynamics.step_with_actors(&self.world, layer, volumes, &others);
+        }
+        let mut shoves = Vec::new();
+        dynamics.take_actor_shoves(&mut shoves);
+        for (id, shove, normal, velocity) in shoves {
+            if !self.ped_prop_volumes.iter().any(|v| v.0 == id) {
+                continue;
+            }
+            match self.ped_prop_shoves.iter_mut().find(|s| s.0 == id) {
+                Some(s) => {
+                    s.1 = Vector3::new(s.1.x + shove.x, s.1.y + shove.y, s.1.z + shove.z);
+                    s.3 = velocity;
+                }
+                None => self.ped_prop_shoves.push((id, shove, normal, velocity)),
+            }
         }
         // Each prop's retail collision type on its query meshes (heavy 12 / light 14 / held 13), which the on-foot
         // walker's queries filter.
@@ -834,18 +861,19 @@ impl GamePhysics {
         };
         let layout = pieces.as_ref().map(crate::skate_world::LayoutPieces::Loaded).or(baked.as_ref().map(crate::skate_world::LayoutPieces::Baked));
         let mut window = None;
-        let world = match map {
+        let mut world = match map {
             Some(map) => match (crate::collision_window::configured(), map.extensions.iter().find(|e| &e.tag == b"RWCM")) {
                 (Some((half, trigger)), Some(archive)) => {
                     let at = [map.spawn[0], map.spawn[1], map.spawn[2]];
-                    let (w, world) = crate::collision_window::Window::from_archive(archive.payload.clone(), settings.floor_material, half, trigger, at)?;
+                    // The rail edges come from the grind provider below.
+                    let (w, world) = crate::collision_window::Window::from_archive(archive.payload.clone(), settings.floor_material, half, trigger, at, Vec::new())?;
                     window = Some(w);
                     world
                 }
                 // A district pack: its collision is streamed from the pack by offset.
                 (Some((half, trigger)), None) => {
                     let at = [map.spawn[0], map.spawn[1], map.spawn[2]];
-                    match crate::collision_window::Window::from_installed(settings.floor_material, half, trigger, at) {
+                    match crate::collision_window::Window::from_installed(settings.floor_material, half, trigger, at, Vec::new()) {
                         Some(built) => {
                             let (w, world) = built?;
                             window = Some(w);
@@ -892,16 +920,25 @@ impl GamePhysics {
             }
         }
         prop_carry.set_base_tuning(settings.move_object);
+        // The map's own rails (not a layout's pieces: the whole world's edges are the map's, `map_rail_edges`).
+        let mut map_edges = Vec::new();
         let grind_world = std::sync::Arc::new(if map.is_none() && terrain == ground::Terrain::Course {
             crate::grind_world::StaticProvider::authored(&crate::grind_world::test_rails())?
         } else {
             let provider = crate::grind_world::StaticProvider::new(map)?;
+            if window.is_some() {
+                map_edges = crate::skate_world::rail_edges(provider.chords());
+            }
             match (&pieces, &baked) {
                 (Some(pieces), _) => provider.with_pieces(&pieces.rails)?,
                 (None, Some(baked)) => provider.with_pieces(&baked.rails)?,
                 (None, None) => provider,
             }
         });
+        // A streamed world's rail edges (the off-board searches' rail records) from the rails the provider built.
+        if let Some(w) = window.as_mut() {
+            w.attach_edges(std::mem::take(&mut map_edges), &mut world)?;
+        }
         if let Some(map) = map {
             eprintln!(
                 "SKATE_GRIND_READY splines={} primitives={}",
@@ -927,7 +964,9 @@ impl GamePhysics {
             network_proxies: network::Proxies::default(),
             npc_sim_proxy_mark: None,
             actor_prop_volumes: Vec::new(),
+            on_foot_vehicles: None,
             ped_prop_volumes: Vec::new(),
+            ped_prop_shoves: Vec::new(),
             network_active: false,
             network_contacts: 0,
             clock: clock::SimulationClock::default(),
@@ -976,7 +1015,9 @@ impl GamePhysics {
             network_proxies: self.network_proxies.clone(),
             npc_sim_proxy_mark: None,
             actor_prop_volumes: self.actor_prop_volumes.clone(),
+            on_foot_vehicles: self.on_foot_vehicles.clone(),
             ped_prop_volumes: self.ped_prop_volumes.clone(),
+            ped_prop_shoves: Vec::new(),
             network_active: self.network_active,
             network_contacts: 0,
             clock: parts.clock,
@@ -1128,6 +1169,12 @@ impl GamePhysics {
         context.board.part_transforms()[skate_core::physics::board::BodyId::Deck.index()]
     }
 
+    /// The deck rigid body's position (its centre of mass, retail `Reckoning+144`) in a context.
+    pub(crate) fn context_deck_position(context: &SkaterPhysicsContext) -> [f32; 3] {
+        let p = context.board.bodies()[skate_core::physics::board::BodyId::Deck.index()].rates.position;
+        [p.x, p.y, p.z]
+    }
+
     /// The deck's linear velocity in a context (diagnostics).
     pub(crate) fn context_deck_velocity(context: &SkaterPhysicsContext) -> [f32; 3] {
         let v = context.board.bodies()[skate_core::physics::board::BodyId::Deck.index()].rates.linear_velocity;
@@ -1145,6 +1192,12 @@ impl GamePhysics {
         for body in context.board.bodies_mut() {
             body.rates.linear_velocity = Vector3::new(velocity[0], velocity[1], velocity[2]);
         }
+    }
+
+    /// A context whose tick failed part-way: forget the query batches it started, so the next owner of the pooled body
+    /// starts its own (docs/hails-additions/26c-living-world-npc-skaters.md#failed-tick-leaves-queries).
+    pub(crate) fn abandon_context_queries(context: &mut SkaterPhysicsContext) {
+        context.riding.abandon_queries();
     }
 
     /// An AI spawn push: [`Self::set_context_velocity`], and the acceleration sampler's previous velocities take the
@@ -1435,3 +1488,26 @@ mod gameplay_gesture_tests;
 #[cfg(test)]
 #[path = "tests/difficulty.rs"]
 mod difficulty_tests;
+
+// Which body a shared log line belongs to: upstream NPC skaters step through the same physics as the player, so their
+// log lines read like the player's (`GamePhysics::advance_npc_skater` sets the flag per thread). skate_vita: the
+// simulated NPC tier is not ported, so every line is the player's; the functions exist for the copied diagnostics.
+thread_local! {
+    static STEPPING_NPC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static NPC_LOG_SERIAL: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// The NPC serial shared physics log lines name on this thread.
+#[allow(dead_code)]
+pub(crate) fn set_log_npc(serial: u32) {
+    NPC_LOG_SERIAL.with(|c| c.set(serial));
+}
+
+pub(crate) fn log_npc() -> u32 {
+    NPC_LOG_SERIAL.with(std::cell::Cell::get)
+}
+
+/// `npc` while an NPC skater steps on this thread, else `player`: the `actor` field of shared physics log lines.
+pub(crate) fn log_actor() -> &'static str {
+    if STEPPING_NPC.with(|c| c.get()) { "npc" } else { "player" }
+}

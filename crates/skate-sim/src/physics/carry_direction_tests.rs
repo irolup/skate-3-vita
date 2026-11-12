@@ -1,10 +1,5 @@
-//! Move Object direction (fix20, docs 26): grab a real map prop with RB and
-//! push the left stick in eight directions through the stock graphs, setup
-//! data and the whole frame (input, animation phase, OffBoardPushing ground
-//! step, prop follow). The pair must travel the way the stick points in the
-//! skater's frame: up pushes forward, down pulls back, left/right side-step.
-//! Before fix20 every direction moved the pair forward at the speed of the
-//! requested velocity (the walking approach 82D7F458 follows the facing line).
+//! Move Object direction (fix20): grab a map prop with RB, push the left stick 8 ways through the whole frame;
+//! the pair must travel the way the stick points in the skater's frame.
 use super::*;
 use skate_core::player::state::PhysicalStateId;
 
@@ -36,7 +31,7 @@ fn move_object_with_the_board_hidden() {
 
 fn carry(hide_board: bool) {
     // As in the game (`LivingWorldPlugin`): props are in the grab scene and Move Object binds their authored records.
-    crate::physics::prop_dynamics::set_prop_grab_enabled(true);
+    let _grab = crate::physics::prop_dynamics::prop_grab_for_test(true);
     let root_dir = std::path::PathBuf::from(std::env::var_os("SKATE3_ASSET_ROOT").unwrap());
     let map_path = std::path::PathBuf::from(std::env::var_os("SKATE3_MAP").unwrap());
     let map = skate_data::skate_map::SkateMap::load(&map_path).unwrap();
@@ -91,11 +86,7 @@ fn carry(hide_board: bool) {
         }
         assert_eq!(skater.skateboard_controller.fields.state_448, 3, "board not hidden");
     }
-    // Put the nearest map prop in front of the skater, end-on (its longest
-    // box axis pointing at the skater, near face 1.5 m away, centre beyond
-    // the 3.5 m hold limit for a bench), then hold RB.
-    // A centre pulled in to the old 0.9 m hold put the skater inside a long
-    // prop such as a bench.
+    // Nearest map prop end-on in front of the skater (near face 1.5 m, centre beyond the 3.5 m hold), then hold RB.
     let (at, forward) = root(&skater);
     let dynamics = physics.prop_dynamics_mut().expect("map props");
     let probe = skate_core::math::Vector3::new(at[0], at[1], at[2]);

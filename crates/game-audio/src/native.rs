@@ -16,6 +16,7 @@ use skate_audio::runtime::Runtime;
 use tracing::{error, info, warn};
 
 use crate::library::Library;
+use crate::prop_sounds::PropSounds;
 
 /// The host's step: one 60 Hz physics step. The host ticks once per physics step ([`HostClock`]);
 /// the MixMap evaluates on every second one (the console's 30 Hz, `skate_audio::mixmap::cadence`).
@@ -120,6 +121,8 @@ pub struct Native {
     /// their nodes and reset their objects when it changes (an owner that survives the change would
     /// otherwise keep redelivering to a node whose instances the unload destroyed).
     pub(crate) map_epoch: u64,
+    /// The dynamic props' sounds (MixMap slot 8); taken out while they run.
+    pub(crate) props: Option<crate::prop_sounds::PropSounds>,
     /// The world / NPC owners' instance counts the MixMap was built with.
     pub(crate) world: WorldInstances,
     /// This frame's pass between [`mixmap_frame`] (inputs, the local player's process) and
@@ -245,6 +248,7 @@ impl Native {
             emitter_states: [false; EMITTER_STATES],
             bed,
             map_epoch: 0,
+            props: Some(PropSounds::default()),
             world,
             pending: None,
             resident: Vec::new(),
@@ -494,7 +498,7 @@ pub struct Listener {
 }
 
 /// What one rendered frame gives the host (skate_vita: the reference's Bevy resources).
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 pub struct FrameInput<'a> {
     /// The skater's publication (`skate_events::Cues::riding`) and the physics steps since the
     /// last frame (`Cues::take_steps`): `skate_sim::live::Session::take_audio`.
@@ -515,6 +519,8 @@ pub struct FrameInput<'a> {
     /// Front-end records to play (`skate_audio::frontend::key` of their names: the session
     /// marker's `frontend_marker` sounds, `ui_audio::FrontendSound`).
     pub frontend: &'a [u64],
+    /// The awake props' audio entries since the last frame (`Session::take_prop_audio`); the host takes them.
+    pub props: &'a mut Vec<skate_sim::PropAudioSample>,
     /// The teleport effect amount (`ui_audio::TeleportEffect`): the session marker's Go To Marker
     /// hold, 0..=1; None when not sent.
     pub teleport: Option<f32>,
@@ -564,7 +570,14 @@ impl Native {
         self.ambience_update(library, &f);
         self.emitters_frame(library, &f);
         self.mixmap_frame(&f);
+        let mut props = self.props.take().unwrap_or_default();
+        props.frame_pre(self, library, f.props, &f.riding.audio);
+        self.props = Some(props);
         self.mixmap_tick();
+        if let Some(mut props) = self.props.take() {
+            crate::prop_sounds::frame_post(&mut props, self);
+            self.props = Some(props);
+        }
         self.ambience_output(library);
         self.frontend_frame(f.frontend);
         self.grain_bed_update(library, f.riding);

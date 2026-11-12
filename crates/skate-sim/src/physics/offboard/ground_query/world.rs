@@ -1,5 +1,5 @@
 //! Ephemeral adapter over the canonical BoardWorld metadata. Geometry is borrowed.
-use super::{Bounds, Frame, IndexedEdgeBody, Mesh, PrimaryEdges, Scene, Segment};
+use super::{Bounds, Frame, IndexedEdgeBody, Mesh, PrimaryEdges, Scene};
 use skate_core::player::offboard::ground_query::{
     EdgeSearch, GroundQueryPacket, GroundQueryScene, LineHit,
 };
@@ -114,26 +114,13 @@ pub fn with_world_scene<'w, T>(
 ) -> Result<T, &'static str> {
     let world = world.into();
     let metadata = world.map.query_metadata()?;
-    let edges: Vec<_> = metadata
-        .static_edges
-        .iter()
-        .map(|s| Segment {
-            edge: Edge {
-                start: s.start,
-                end: s.end,
-            },
-            local_bounds: Bounds {
-                min: s.local_bounds.min,
-                max: s.local_bounds.max,
-            },
-        })
-        .collect();
     let edges = Scene {
         ground_pool: &[],
         island_pool: &[],
         conditional_pool: &[],
         island_flags: metadata.island_flags,
-        static_edges: &edges,
+        static_edges: &[],
+        static_metadata: &metadata.static_edges,
         primary_edges,
         indexed_edges,
     };

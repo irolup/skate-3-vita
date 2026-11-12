@@ -41,6 +41,9 @@ impl BoardProbes {
         self.deck = BoardProbeState::default();
         self.wall = BoardProbeState::default();
     }
+    pub(crate) fn abandon(&mut self) {
+        self.pending = None;
+    }
     pub fn wall_contact_frame(
         &self,
         time2752: f32,

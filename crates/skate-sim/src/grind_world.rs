@@ -91,6 +91,14 @@ pub(crate) mod props;
 pub(crate) use provider::{RailHit, RailRules, RailSource, RailView, StaticProvider};
 pub(crate) use spline::PrimitiveMetadata;
 
+/// Every map rail segment's contact chord (start, end), world space: the same records the grind sees (retail cubic
+/// or authored polyline), for the off-board searches' rail query.
+pub(crate) fn map_rail_chords(map: &skate_data::skate_map::SkateMap) -> Result<Vec<([f32; 3], [f32; 3])>, String> {
+    let bytes = spline::build(Some(map))?;
+    let (primitives, _) = spline::decoded_from_blob(&bytes)?;
+    Ok(primitives.iter().map(|p| ([p.start[0], p.start[1], p.start[2]], [p.end[0], p.end[1], p.end[2]])).collect())
+}
+
 #[cfg(test)]
 mod tests;
 

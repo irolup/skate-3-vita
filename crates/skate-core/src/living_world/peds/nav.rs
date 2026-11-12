@@ -65,11 +65,13 @@ pub struct NavRules {
     pub locate_height: f32,
     /// Polygons A* may expand per query (ours, a cost cap).
     pub max_expansions: usize,
+    /// A raw path start farther than this in plane from its snap point gets its own element (`82928530`: 0.1 x the NavPower scale 1.3).
+    pub raw_start_offset: f32,
 }
 
 impl Default for NavRules {
     fn default() -> Self {
-        Self { blocked_areas: vec![AREA_OTHER], area_cost: Vec::new(), locate_radius: 0.5, locate_height: 4.0, max_expansions: 6000 }
+        Self { blocked_areas: vec![AREA_OTHER], area_cost: Vec::new(), locate_radius: 0.5, locate_height: 4.0, max_expansions: 6000, raw_start_offset: 0.13 }
     }
 }
 
@@ -452,6 +454,12 @@ impl NavMesh {
         best.map(|(_, at)| at)
     }
 
+    /// The reach check's snap (`82C46348`, b653): the 3D-nearest walkable point with no distance cap and no height
+    /// test, rejected when it lies more than `window` from `p` along X or along Z.
+    pub fn reach_snap(&self, p: Vec3, window: f32) -> Option<NavPoint> {
+        self.locate_start_nearest(p, f32::MAX).filter(|n| (n.position[0] - p[0]).abs() <= window && (n.position[2] - p[2]).abs() <= window)
+    }
+
     /// The nearest walkable polygon point to `p` (3D), any component, within `max_dist`: retail's path start search
     /// (`82933848` -> `829338B0`: range FLT_MAX, best distance from ~9.2e18, the closest point of each candidate by
     /// `8292F9F0`; b324), for a start [`Self::locate`] refuses (more than 0.5 m off the mesh). Inside a polygon's outline
@@ -662,11 +670,40 @@ impl NavMesh {
     /// Path corners from `from` to `to` (both located), or `None` when unreachable or the search
     /// cap is hit. The first corner is the first turn (not the start), the last is `to`.
     pub fn find_path(&self, from: NavPoint, to: NavPoint) -> Option<Vec<Vec3>> {
+        let portals = self.path_portals(from, to)?;
+        Some(funnel(from.position, to.position, &portals))
+    }
+
+    /// NavPower's path elements as (start, end), one per polygon crossed, from the raw start to `to`:
+    /// docs/hails-additions/26e-living-world-skater-ai.md#controller-b-path-service
+    pub fn find_path_elements(&self, raw: Vec3, from: NavPoint, to: NavPoint) -> Option<Vec<(Vec3, Vec3)>> {
+        let portals = self.path_portals(from, to)?;
+        let mut points = vec![raw];
+        if dist_xz(raw, from.position) > self.rules.raw_start_offset {
+            points.push(from.position);
+        }
+        let (mut prev, mut first) = (from.position, 0);
+        for (corner, last) in funnel_spans(from.position, to.position, &portals) {
+            for &portal in &portals[first.min(portals.len())..last.min(portals.len())] {
+                let p = crossing(prev, corner, portal);
+                if points.last().is_none_or(|l| dist_xz(*l, p) >= 1e-5) {
+                    points.push(p);
+                }
+            }
+            points.push(corner);
+            prev = corner;
+            first = last + 1;
+        }
+        Some(points.windows(2).map(|w| (w[0], w[1])).collect())
+    }
+
+    /// The (left, right) portals along the A* polygon chain; empty within one polygon.
+    fn path_portals(&self, from: NavPoint, to: NavPoint) -> Option<Vec<(Vec3, Vec3)>> {
         if !self.reachable(from.poly, to.poly) {
             return None;
         }
         if from.poly == to.poly {
-            return Some(vec![to.position]);
+            return Some(Vec::new());
         }
         // skate_vita (performance): the search's per-polygon arrays are kept between searches and stamped with the
         // search's number, so a search no longer allocates and fills three arrays the size of the mesh (DownTown:
@@ -736,14 +773,14 @@ impl NavMesh {
                 chain.push((prev, e as usize, at));
                 at = prev;
             }
-            Some(self.path_from_chain(from, to, chain))
+            Some(self.portals_from_chain(chain))
         })
     }
 
-    /// The corners along a chain of (polygon, edge, next polygon) found by [`Self::find_path`].
-    fn path_from_chain(&self, from: NavPoint, to: NavPoint, mut chain: Vec<(u32, usize, u32)>) -> Vec<Vec3> {
+    /// The (left, right) portals along a chain of (polygon, edge, next polygon) found by [`Self::path_portals`].
+    fn portals_from_chain(&self, mut chain: Vec<(u32, usize, u32)>) -> Vec<(Vec3, Vec3)> {
         chain.reverse();
-        let portals: Vec<(Vec3, Vec3)> = chain
+        chain
             .iter()
             .map(|&(p, e, q)| {
                 let (a, b) = self.portal(p, e, q);
@@ -753,9 +790,16 @@ impl NavMesh {
                 let dir = sub2(self.polys[q as usize].centre, c);
                 if cross2(sub2(a, c), dir) <= cross2(sub2(b, c), dir) { (a, b) } else { (b, a) }
             })
-            .collect();
-        funnel(from.position, to.position, &portals)
+            .collect()
     }
+}
+
+/// Where the line `a` to `b` crosses a portal in xz, clamped to the portal (`8293C158`).
+fn crossing(a: Vec3, b: Vec3, portal: (Vec3, Vec3)) -> Vec3 {
+    let (edge, dir) = (sub2(portal.1, portal.0), sub2(b, a));
+    let denom = cross2(edge, dir);
+    let t = if denom.abs() < 1e-6 { 0.5 } else { (cross2(sub2(a, portal.0), dir) / denom).clamp(0.0, 1.0) };
+    [portal.0[0] + (portal.1[0] - portal.0[0]) * t, portal.0[1] + (portal.1[1] - portal.0[1]) * t, portal.0[2] + (portal.1[2] - portal.0[2]) * t]
 }
 
 /// [`NavMesh::find_path`]'s arrays, kept per thread between searches (stamped with the search number).
@@ -775,6 +819,11 @@ thread_local! {
 
 /// The simple stupid funnel over (left, right) portals in xz; returns the corners after `start`.
 pub fn funnel(start: Vec3, goal: Vec3, portals: &[(Vec3, Vec3)]) -> Vec<Vec3> {
+    funnel_spans(start, goal, portals).into_iter().map(|(p, _)| p).collect()
+}
+
+/// [`funnel`] with the index of the portal each corner sits on (`portals.len()` for the goal).
+fn funnel_spans(start: Vec3, goal: Vec3, portals: &[(Vec3, Vec3)]) -> Vec<(Vec3, usize)> {
     let mut pts: Vec<(Vec3, Vec3)> = portals.to_vec();
     pts.push((goal, goal));
     let mut out = Vec::new();
@@ -798,7 +847,7 @@ pub fn funnel(start: Vec3, goal: Vec3, portals: &[(Vec3, Vec3)]) -> Vec<Vec3> {
                 right = pr;
                 ri = i;
             } else {
-                out.push(left);
+                out.push((left, li));
                 apex = left;
                 ri = li;
                 i = li + 1;
@@ -813,7 +862,7 @@ pub fn funnel(start: Vec3, goal: Vec3, portals: &[(Vec3, Vec3)]) -> Vec<Vec3> {
                 left = pl;
                 li = i;
             } else {
-                out.push(right);
+                out.push((right, ri));
                 apex = right;
                 li = ri;
                 i = ri + 1;
@@ -824,12 +873,13 @@ pub fn funnel(start: Vec3, goal: Vec3, portals: &[(Vec3, Vec3)]) -> Vec<Vec3> {
         }
         i += 1;
     }
-    if out.last().is_none_or(|l| !eq(*l, goal)) {
-        out.push(goal);
+    match out.last_mut() {
+        Some(last) if eq(last.0, goal) => last.1 = portals.len(),
+        _ => out.push((goal, portals.len())),
     }
-    out.retain(|p| !eq(*p, start));
+    out.retain(|p| !eq(p.0, start));
     if out.is_empty() {
-        out.push(goal);
+        out.push((goal, portals.len()));
     }
     out
 }

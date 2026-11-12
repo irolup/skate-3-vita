@@ -178,18 +178,18 @@ fn words(s: Sqt) -> SampleWords {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn fixture() -> (AnimationFrames, String) {
+    /// `None` when the captured crouch / treflip clip (`private/custom/crouch-treflip.json`, written by no setup) is missing.
+    fn fixture() -> Option<(AnimationFrames, String)> {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets");
+        let text = std::fs::read_to_string(root.join("private/custom/crouch-treflip.json")).ok()?;
         let banks = AnimationBanks::load(&root).unwrap();
         let frames = AnimationFrames::from_banks(&banks).unwrap();
-        let text =
-            std::fs::read_to_string(root.join("private/custom/crouch-treflip.json")).unwrap();
-        (frames, text)
+        Some((frames, text))
     }
     #[test]
     #[ignore = "requires private stock banks and the captured crouch/treflip asset"]
     fn authored_body_preserves_board_trajectory_and_slot_timing() {
-        let (frames, text) = fixture();
+        let Some((frames, text)) = fixture() else { test_skip!("no private/custom/crouch-treflip.json") };
         let replacements = Replacements::parse(&text, &frames).unwrap();
         assert_eq!(replacements.0.len(), 7);
         let board = frames
@@ -219,7 +219,7 @@ mod tests {
     #[test]
     #[ignore = "requires private stock banks and the captured crouch/treflip asset"]
     fn authored_idle_body_loop_closes() {
-        let (frames, text) = fixture();
+        let Some((frames, text)) = fixture() else { test_skip!("no private/custom/crouch-treflip.json") };
         let replacements = Replacements::parse(&text, &frames).unwrap();
         for name in ["R_ANTIC_OLLIE_N_0_CYC", "R_ANTIC_360SHUVIT_N_0_CYC"] {
             let c = replacements.clip(name).unwrap();
@@ -230,7 +230,7 @@ mod tests {
     #[test]
     #[ignore = "requires private stock banks and the captured crouch/treflip asset"]
     fn authored_clip_rejects_bad_timing_and_skeleton() {
-        let (frames, text) = fixture();
+        let Some((frames, text)) = fixture() else { test_skip!("no private/custom/crouch-treflip.json") };
         let mut v: serde_json::Value = serde_json::from_str(&text).unwrap();
         v["bone_names"][1] = "WRONG".into();
         assert!(Replacements::parse(&v.to_string(), &frames).is_err());

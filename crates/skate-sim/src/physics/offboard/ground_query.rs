@@ -62,6 +62,8 @@ pub struct Scene<'a> {
     pub conditional_pool: &'a [Mesh<'a>],
     pub island_flags: u32,
     pub static_edges: &'a [Segment],
+    /// The map's static edges read in place (`with_world_scene`), after `static_edges`.
+    pub static_metadata: &'a [skate_core::physics::board_world::query_metadata::EdgeSegment],
     pub primary_edges: PrimaryEdges<'a>,
     pub indexed_edges: &'a [IndexedEdgeBody<'a>],
 }

@@ -73,6 +73,12 @@ pub(crate) fn post(skater: &mut SkaterRuntime, collision: CollisionInput<'_>) {
     });
     let p = &skater.player_input.processed;
     let owner = &mut skater.biped_ground;
+    // BIPED_GROUND_R31: which stumbling check gave reason 31 (research b802).
+    let r31 = (p.flags_2484 & 0x400 != 0).then(|| {
+        let g = &owner.ground;
+        (g.flags_144_to_150[6], g.flags_144_to_150[2], g.angle_172, owner.contact.kind_164, g.frame_80[1][1])
+    });
+    let r31_before = skater.wipeout.state.reasons[31];
     core::post_physics(
         &mut owner.ground,
         &mut skater.wipeout.state,
@@ -86,6 +92,12 @@ pub(crate) fn post(skater: &mut SkaterRuntime, collision: CollisionInput<'_>) {
             ground_kind_356: owner.contact.kind_164,
         },
     );
+    if let Some((turn, wants_air, angle, kind, up_y)) = r31.filter(|_| !r31_before && skater.wipeout.state.reasons[31]) {
+        tracing::info!(
+            "BIPED_GROUND_R31 turn_and_air={} wants_air={wants_air} start_angle={angle:.3} ground_kind={kind} up_y={up_y:.3}",
+            turn && wants_air
+        );
+    }
     if let Some((serial, part, by, closing, disp, squash, before)) = ped {
         let s = &owner.collision_settings;
         let now = &skater.wipeout.state.reasons;

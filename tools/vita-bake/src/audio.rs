@@ -59,8 +59,24 @@ fn world_banks(manifest: &Value) -> std::collections::BTreeSet<String> {
     }
     // The zone crossfades' banks (`Main_Ambience_Crossfade_*`): looping transition sounds, 0.2-0.5 MiB each.
     banks.extend(["Main_Ambience_Crossfade_DT", "Main_Ambience_Crossfade_Ind", "Main_Ambience_Crossfade_Uni"].map(str::to_owned));
+    // The dynamic props' banks (PR #52 `3d14a7bb`, retail prop sounds): the shared start and loop banks, then the main
+    // loop and one-shot banks of the prop types (the `Moveable_*` and `*_Randoms` stems, 27 MiB of PCM16 and about 7 MiB
+    // of ADPCM in all). On the card with the emitters' banks; each loads when a prop of its kind first sounds.
+    banks.extend(PROP_BANKS.map(str::to_owned));
     banks
 }
+
+/// The prop sound banks (`skate_audio::world::props::LOOP_BANKS`, `moveable::START_BANK`, and every `MovingType` main
+/// and one-shot bank of the DMO types in the stock vault).
+const PROP_BANKS: [&str; 30] = [
+    "DMO_Starts", "Dynamics_Objects_Roll", "Dynamics_Objects_Slide_A", "Dynamics_Objects_Slide_B",
+    "Moveable_Concrete_Bench", "Moveable_Concrete_Bench_2", "Moveable_Concrete_Globe", "Moveable_Drum_Pylon", "Moveable_Metal_1",
+    "Moveable_Metal_2", "Moveable_Metal_Box_Large", "Moveable_Metal_Box_Large_2", "Moveable_Metal_Rail_3", "Moveable_Metal_Rail_4",
+    "Moveable_Metal_Ramp", "Moveable_Objects_Wood", "Moveable_Oil_Drum", "Moveable_Plastic_Box_Large", "Moveable_Plastic_Table",
+    "Moveable_Shopping_Cart", "Moveable_Wood_Bench_A", "Moveable_Wood_Box_B", "SK82_ConcBench_Randoms", "SK82_Dumpster_Randoms",
+    "SK82_Metal2_Randoms", "SK82_Metal_Box_Randoms", "SK82_Recycle_Bin_Randoms", "SK82_Shopcart_Randoms", "SK82_Wood2_Randoms",
+    "Sk82_Wood_Box_Small_Randoms",
+];
 
 /// Planar PCM16 channels and the rate of a PCM16 WAV.
 fn wav(bytes: &[u8]) -> Result<(u32, Vec<Vec<i16>>), String> {

@@ -45,6 +45,10 @@ pub(super) struct NativeFrames {
 }
 /// Clips requested within this many `trim` epochs keep their keys.
 const KEEP_EPOCHS: u32 = 2;
+/// skate_vita: clips not requested for this many `trim` epochs (about a second each in the live sim) drop their streams
+/// and slots too, whatever the budget: the few KB each touched clip kept, times the many clips the NPC skaters' trees
+/// touch, filled the Vita's heap over a session.
+const COLD_EPOCHS: u32 = 8;
 impl NativeFrames {
     pub(super) fn new(banks: &AnimationBanks) -> Result<Self, String> {
         let mut clips: BTreeMap<String, Entry<ClipFrames>> = BTreeMap::new();
@@ -92,9 +96,13 @@ impl NativeFrames {
         let mut idle = Vec::new();
         for (name, entry) in &self.clips {
             if let Some(Ok(clip)) = entry.decoded.get() {
+                let used = entry.used.load(Relaxed);
+                if epoch.wrapping_sub(used) >= COLD_EPOCHS && clip.frames.is_warm() {
+                    clip.frames.release_all();
+                    continue;
+                }
                 let bytes = clip.frames.decoded_bytes();
                 total += bytes;
-                let used = entry.used.load(Relaxed);
                 if bytes > 0 && epoch.wrapping_sub(used) >= KEEP_EPOCHS {
                     idle.push((epoch.wrapping_sub(used), name.clone()));
                 }
@@ -284,16 +292,27 @@ pub(super) struct StockKeys {
     name: String,
     bank: Arc<Bank>,
     bones: usize,
-    parts: Vec<StockPart>,
+    /// skate_vita: each part's stream location and first channel, to rebuild its stream after [`StockKeys::release_all`].
+    recipe: Box<[PartRecipe]>,
     count: usize,
     cache: Mutex<Cache>,
+}
+#[derive(Clone, Copy)]
+struct PartRecipe {
+    offset: usize,
+    header: usize,
+    data: usize,
+    start: usize,
 }
 struct StockPart {
     stream: VbrStream,
     start: usize,
 }
-/// The decoded keys and each part's unpacked blocks, and the bytes they hold.
+/// The parts' streams, the decoded keys and each part's unpacked blocks, and the bytes they hold. skate_vita: all
+/// three are dropped by [`StockKeys::release_all`] and rebuilt from the bank on the next key (a touched clip kept about
+/// 3 to 6 KB of them for the session, and the NPC skaters' trees touch many clips).
 struct Cache {
+    parts: Option<Vec<StockPart>>,
     keys: Box<[Option<Arc<[SampleWords]>>]>,
     blocks: Box<[Box<[Option<Vec<[f32; 8]>>]>]>,
     bytes: usize,
@@ -308,6 +327,9 @@ impl StockKeys {
     pub(super) fn decoded_bytes(&self) -> usize {
         self.cache().bytes
     }
+    pub(super) fn is_warm(&self) -> bool {
+        self.cache().parts.is_some()
+    }
     /// Drops every decoded key and unpacked block; returns the bytes released.
     /// Keys handed out stay valid until their last handle goes.
     pub(super) fn release(&self) -> usize {
@@ -318,11 +340,36 @@ impl StockKeys {
         }
         std::mem::take(&mut cache.bytes)
     }
+    /// Drops the streams, keys and blocks and their slots; the next key rebuilds them from the bank, word for word the
+    /// same. Keys handed out stay valid until their last handle goes.
+    pub(super) fn release_all(&self) -> usize {
+        let mut cache = self.cache();
+        cache.parts = None;
+        cache.keys = Box::default();
+        cache.blocks = Box::default();
+        std::mem::take(&mut cache.bytes)
+    }
+    /// The streams and the slots, rebuilt after [`Self::release_all`].
+    fn warm(&self, cache: &mut Cache) -> Result<(), String> {
+        if cache.parts.is_some() {
+            return Ok(());
+        }
+        let parts: Vec<StockPart> = self
+            .recipe
+            .iter()
+            .map(|r| VbrStream::new(self.bank.bytes(), r.offset, r.header, r.data).map(|stream| StockPart { stream, start: r.start }))
+            .collect::<Result<_, _>>()?;
+        cache.blocks = parts.iter().map(|part| (0..part.stream.block_count()).map(|_| None).collect()).collect();
+        cache.keys = (0..self.count).map(|_| None).collect();
+        cache.parts = Some(parts);
+        Ok(())
+    }
     pub(super) fn get(&self, index: usize) -> Result<Arc<[SampleWords]>, String> {
         if index >= self.count {
             return Err(format!("{}: animation key {index} out of range", self.name));
         }
         let mut cache = self.cache();
+        self.warm(&mut cache).map_err(|e| format!("{}: {e}", self.name))?;
         if let Some(key) = &cache.keys[index] {
             return Ok(key.clone());
         }
@@ -338,10 +385,12 @@ impl StockKeys {
         let bytes = self.bank.bytes();
         let mut frame = vec![[0; 10]; self.bones];
         let block = index / 8;
-        for (part, blocks) in self.parts.iter().zip(cache.blocks.iter_mut()) {
+        let Cache { parts, blocks: all_blocks, bytes: held, .. } = cache;
+        let parts = parts.as_ref().ok_or("animation parts released")?;
+        for (part, blocks) in parts.iter().zip(all_blocks.iter_mut()) {
             if blocks[block].is_none() {
                 let words = part.stream.unpack_block(bytes, block)?;
-                cache.bytes += words.len() * size_of::<[f32; 8]>();
+                *held += words.len() * size_of::<[f32; 8]>();
                 blocks[block] = Some(words);
             }
             let coefficients = blocks[block].as_ref().unwrap();
@@ -367,6 +416,7 @@ fn stock_keys(
     }
     let mut assigned = vec![false; bones];
     let mut streams = Vec::with_capacity(parts.len());
+    let mut recipe = Vec::with_capacity(parts.len());
     for (entry, layout) in parts.iter().zip(&hierarchy.parts) {
         let part = entry
             .part
@@ -391,6 +441,7 @@ fn stock_keys(
             return Err("Overlapping animation parts".into());
         }
         assigned[start..end].fill(true);
+        recipe.push(PartRecipe { offset: part.offset, header: part.compression_header_relative as usize, data: part.compressed_data_relative as usize, start });
         streams.push(StockPart { stream, start });
     }
     if assigned.iter().any(|v| !*v) {
@@ -404,9 +455,10 @@ fn stock_keys(
         name: name.to_owned(),
         bank: bank.clone(),
         bones,
-        parts: streams,
+        recipe: recipe.into(),
         count,
         cache: Mutex::new(Cache {
+            parts: Some(streams),
             keys: (0..count).map(|_| None).collect(),
             blocks,
             bytes: 0,
@@ -455,6 +507,15 @@ mod tests {
         assert_eq!(native.trim(0), full);
         // Idle for two epochs: released.
         assert_eq!(native.trim(0), 0);
+        for (name, words) in names.iter().zip(&before) {
+            assert_eq!(&native.clip(name).unwrap().frames.to_vec().unwrap(), words, "{name}");
+        }
+        assert_eq!(native.trim(usize::MAX), full);
+        // skate_vita: idle for COLD_EPOCHS, the streams go too, and rebuild word for word.
+        for _ in 0..COLD_EPOCHS + 1 {
+            native.trim(usize::MAX);
+        }
+        assert!(names.iter().all(|n| !native.clip(n).unwrap().frames.is_warm()));
         for (name, words) in names.iter().zip(&before) {
             assert_eq!(&native.clip(name).unwrap().frames.to_vec().unwrap(), words, "{name}");
         }

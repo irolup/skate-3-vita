@@ -19,6 +19,8 @@ pub struct GroundSteerTuning {
     /// Look-ahead of the near / far aim points along the line, recorded ticks (`pc+144` A + 2, `pc+352` A + 45).
     pub near_ticks: f32,
     pub far_ticks: f32,
+    /// While avoid-steering, the far aim's fallback anchor: A + this many ticks (`0x820BD16C`, 15.0; b612).
+    pub avoid_anchor_ticks: f32,
     /// Below this squared length the aim direction is degenerate and the alignment error is used (`0x82195100`;
     /// the image value is not readable in our dump, taken as small).
     pub aim_eps: f32,
@@ -26,7 +28,7 @@ pub struct GroundSteerTuning {
 
 impl Default for GroundSteerTuning {
     fn default() -> Self {
-        Self { full_deg: 18.0, lane_centre: 0.6, rejoin_start: 0.4, rejoin_full: 3.0, blend_dist: 1.0, near_ticks: 2.0, far_ticks: 45.0, aim_eps: 1e-6 }
+        Self { full_deg: 18.0, lane_centre: 0.6, rejoin_start: 0.4, rejoin_full: 3.0, blend_dist: 1.0, near_ticks: 2.0, far_ticks: 45.0, avoid_anchor_ticks: 15.0, aim_eps: 1e-6 }
     }
 }
 

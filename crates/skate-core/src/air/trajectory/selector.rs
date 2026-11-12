@@ -73,6 +73,10 @@ impl TrajectorySelector {
     pub fn grind_normal(&self) -> Option<Vector> {
         self.grind_normal
     }
+    /// The last launch cast the recorded AI arc (`82D67B50` accepted it).
+    pub fn recorded(&self) -> bool {
+        self.batch.as_ref().is_some_and(|b| b.recorded)
+    }
     pub fn launch_info(&self) -> Option<&LaunchInfo> {
         self.launch_info.as_ref()
     }

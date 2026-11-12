@@ -164,7 +164,7 @@ fn run(l: &ReplayLine, mode: TrickMode, seed: u64, p: &TrickProfile) -> (Vec<Tri
     let mut records = Vec::new();
     let mut seen = Vec::new();
     let tricks = TrickContext { mode, ..ctx(p, seed) };
-    let b = BranchContext { position: [0.0; 3], forward: [0.0, 0.0, 1.0], speed: 5.0, players: &[], others: &[], in_use: &[], preferred_skill: -1, online: false, chain: ChainConfig { radius: 0.0, ..ChainConfig::retail() }, tricks };
+    let b = BranchContext { position: [0.0; 3], forward: [0.0, 0.0, 1.0], speed: 5.0, players: &[], others: &[], in_use: &[], preferred_skill: -1, online: false, chain: ChainConfig { radius: 0.0, ..ChainConfig::retail() }, tricks, body: None, valid_lines: None };
     for _ in 0..200 {
         let mut ev = Vec::new();
         c.step(&ls, &mut Decider::Decide(b), &mut ev);
@@ -229,7 +229,7 @@ fn a_dropped_slot_opens_no_trick_span() {
     let l = air_line(BSGRAB, 60);
     let ls: BTreeMap<[u8; 16], ReplayLine> = [(l.id, l.clone())].into();
     let tricks = TrickContext { slot_tricks: false, ..ctx(&p, 1) };
-    let b = BranchContext { position: [0.0; 3], forward: [0.0, 0.0, 1.0], speed: 5.0, players: &[], others: &[], in_use: &[], preferred_skill: -1, online: false, chain: ChainConfig { radius: 0.0, ..ChainConfig::retail() }, tricks };
+    let b = BranchContext { position: [0.0; 3], forward: [0.0, 0.0, 1.0], speed: 5.0, players: &[], others: &[], in_use: &[], preferred_skill: -1, online: false, chain: ChainConfig { radius: 0.0, ..ChainConfig::retail() }, tricks, body: None, valid_lines: None };
     let mut c = LineCursor::new(l.id, 0);
     let mut records = Vec::new();
     let mut phases = Vec::new();

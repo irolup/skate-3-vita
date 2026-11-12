@@ -1,23 +1,5 @@
-//! Controller B (retail "NavMeshController"), the NPC skater's walk back to its line for the obstacle avoider's
-//! mode 7 ("back to the line past the prop"; retail TU3, evidence only; re-implemented; `.local/research/npc/b70-npc-submode-reposition.md` and
-//! `b78-mode7-controller-b.md`, `b79-controller-b-outputs-path.md`; main checked the constants, the throttle `82467B00`,
-//! the reset `82466F40` and the writer slots `82470D08` / `82470D78`):
-//! - the brain swaps from the line controller (A) to B (`sub_824661A8`); B's activate (`82467508`) resets it
-//!   (`82466F40`: everything 0, waypoint seen -1, the "can move" latch = the skater's state now) and plans a path
-//!   to the chosen line node (`82467088`): with waypoints the last one must lie within 2.0 h / 1.0 v of the node,
-//!   without waypoints the node within 1.5 h / 3.0 v of the skater; a failed plan keeps A;
-//! - B's tick (`824675C8`) writes the on-foot intents, never position or velocity: abort / hand back, the
-//!   `WipeOutRequest` (key `0x830BECC4`) on a stop request or when stuck, then the path update (`82467718`: latch,
-//!   re-plan, arrival, waypoint advance, stuck monitor `82466A00`), the off-board toggle presses (`824712E0`,
-//!   "ToggleOffboardState": `NewToggleOffBoardState` / `ToggleOffBoardState` until the skater is off the board),
-//!   the steer (`82467C90`, "OffBoardMotion" slot 2 `82470D78`: `OB_Steer` and `OB_MagHeld` = s) and the throttle
-//!   (`82467B00`, slot 1 `82470D08`: `OB_Mag` and `OB_MagHeld` = min(f, 1), only when f > 0); so the skater steps
-//!   off and walks back on the navmesh (NavPower in retail, the peds' navmesh here);
-//! - B hands back to A (`sub_824661A8(brain, null)`: A re-attaches by its saved line id) on arrival (all legs done,
-//!   2.4 h / 1.0 v of the node, heading within pi/8 of the node direction), when no plan is left, or on abort.
-//!
-//! Distances are horizontal (x, z) and vertical (y). Angles are signed about +Y. Multiplayer: [`ControllerB`] is
-//! plain per-NPC data, ticked by the host at the retail tick; [`PathService`] must be deterministic.
+//! Controller B (retail NavMeshController): the NPC skater's walk back to its line for avoider mode 7.
+//! Retail mechanism (824661A8, 82467508, 824675C8): docs/hails-additions/26e-living-world-skater-ai.md#controller-b
 
 use std::f32::consts::PI;
 
@@ -147,21 +129,12 @@ impl PathService for DirectPath {
     }
 }
 
-/// The peds' navmesh as B's path service (retail: NavPower, the same runtime the peds use; b79). Every path corner,
-/// the goal included, becomes one element with entry = exit = the corner [inference: retail's 56-byte elements carry
-/// two points per portal; ours are the funnel's corners], so a reachable goal always has a last waypoint for the
-/// 2.0 h / 1.0 v acceptance. The mesh is static, so a held path stays valid (retail re-checks its element references
-/// each tick, `829277C0`). The goal is the nearest point the start can reach (retail `82928618`, b277). The start is
-/// the peds' point query, else the nearest walkable polygon at any distance (retail `82933848` -> `829338B0`: range
-/// `0x8206D108` FLT_MAX, best distance from `0x822F9310`; b324): a skater stalled on a grind block or inside an
-/// obstacle's navmesh cut is 0.65 to 2.6 m off the mesh (laptop 2026-10-19, nodes 69 / 36 / 29 / 23), which the
-/// peds' 0.5 m snap refused, so every walk-back there failed with "no plan".
+/// The peds' navmesh as B's path service (retail NavPower; b79, b277, b324): docs/hails-additions/26e-living-world-skater-ai.md#controller-b-path-service
 impl PathService for super::peds::NavMesh {
     fn solve(&self, from: [f32; 3], to: [f32; 3], goal_radius: f32, start_radius: f32) -> Option<Vec<PathElement>> {
         let a = self.locate(from).or_else(|| self.locate_start_nearest(from, start_radius))?;
         let b = self.locate_nearest(to, a.poly, goal_radius)?;
-        let corners = self.find_path(a, b)?;
-        Some(corners.into_iter().map(|c| PathElement { entry: c, exit: c }).collect())
+        Some(self.find_path_elements(from, a, b)?.into_iter().map(|(entry, exit)| PathElement { entry, exit }).collect())
     }
 }
 
@@ -389,7 +362,7 @@ impl ControllerB {
         self.waypoint = 0;
         let Some(path) = paths.solve(position, self.target, s.goal_locate_radius, s.start_locate_radius) else { return false };
         let ok = match path.last() {
-            Some(last) => within(sub(self.target, last.entry), s.plan_path_h, s.plan_path_v),
+            Some(last) => within(sub(self.target, last.exit), s.plan_path_h, s.plan_path_v),
             None => within(sub(self.target, position), s.plan_direct_h, s.plan_direct_v),
         };
         if !ok {

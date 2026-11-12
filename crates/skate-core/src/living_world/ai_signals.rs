@@ -1,35 +1,5 @@
-//! The ActionGraph signals an AI skater's PathController posts so a simulated NPC skater rides
-//! into its recorded tricks like a player would (doc 26 "Simulated NPC skaters do their tricks").
-//! Retail writes named signals into the same intent map the player's pad listener fills; no pad
-//! bits or stick gestures (`.local/research/npc/m7-ai-trick-signals.md`, main checked
-//! `sub_824691A0` and the signal addresses).
-//!
-//! Retail (TU3, evidence only; re-implemented):
-//! - anticipation `sub_824691A0` (each tick from the node advance `sub_8246D560`): within 3.0 m of
-//!   the line (`pc+828`, `0x82063B08`) it looks up to 60 recorded frames past the cursor for a
-//!   start-trick node (`sub_82456550`); an ollie or flip there (category 1 / 2) sets `AnticMag`
-//!   1.0 and `AnticAngle` 0, or pi for a nollie (the recorded trick, `sub_82469048`);
-//!   `sub_824696B8` posts them (and `Crouch` on a crouched node outside a trick, `Manual` before a
-//!   manual) when the skater faces along the line (under pi/4, `0x821A9C28`) [code, the posting
-//!   gates partly inferred];
-//! - dispatch `sub_8246A2E0`: on the tick the committed cursor reaches the start-trick node it
-//!   posts `Trick`, the trick's scorable name, `GestureSpeed`, `TrickHeight` and
-//!   `DontMirrorTrick`, all 1.0 (the graph enters the trick on `HasAGIntent <name>`, names
-//!   compare case-insensitively); only the newest event node of the tick, none when the cursor
-//!   crossed more than 3 nodes (1 right after spawn). That perform path is the ollie / flip one only
-//!   (categories 1 / 2, `sub_8246A080`); the other categories keep the trick in the slot and the
-//!   per-tick writer posts its timed intents, like a player's held inputs (below, research b113).
-//! - trick slot: `pc+832` category (from the recorded trick, table 0x820862A8), `pc+844` trick, `pc+904`
-//!   ticks since the start node (0 there, +1 after every writer call); an end node or a failed dispatch
-//!   clears the category (0x8246A6D4). Jump table 0x8246A45C: 1 / 2 perform; 3 / 4 / 12 take the trick only
-//!   when the profile's slot-tricks byte (+51) is set (`sub_82469EF0`; else the slot keeps the old trick);
-//!   5 / 7 / 10 / 13 take it; 6 / 9 only validate; 8 is the manual value; 11 (revert) posts `Trick` and
-//!   `SlideFs180` (fsrevert, id 4) / `SlideBs180` (bsrevert, id 5) (`sub_8246A1E8`).
-//! - per-tick writer `sub_824696B8` (jump table 0x824698F8): categories 1-5, 7, 10, 12, 13 post the slot
-//!   trick's `SkaterIntentTuple` list (`sub_82470ED0`: entry live from `start` to `end`, `end` < 0 = open);
-//!   6 (handplant) posts `GrabWorld` 1.0; 8 `Manual`; 9 the powerslide keys; 11 nothing.
-//! - takeoff board yaw (`sub_8246B1F8`) and its post in the air arm (`sub_8246B358` -> `sub_82471008`): see
-//!   [`BoardYaw`].
+//! ActionGraph signals an AI skater's PathController posts so a simulated NPC rides into its recorded tricks.
+//! Retail mechanism (824691A0, 8246A2E0, 824696B8): docs/hails-additions/26e-living-world-skater-ai.md#ai-trick-signals
 
 use super::replay::{node_events, node_flags, ReplayLine};
 use super::Vec3;
@@ -74,8 +44,8 @@ pub struct SignalInput {
     pub off_line: f32,
     /// Angle between the skater's facing and the line, radians.
     pub heading_error: f32,
-    /// A trick span is open (no new anticipation, no crouch).
-    pub in_trick: bool,
+    /// In the air or under 5 ticks after landing (`pc+0x3A0`, `pc+900`): only then a manual ahead is posted.
+    pub manual_window: bool,
 }
 
 /// The first start-trick node within `frames` recorded frames after (`node`, `into`)
@@ -97,26 +67,7 @@ pub fn upcoming_start(line: &ReplayLine, node: u32, into: u32, frames: u32) -> O
 /// The signals of this tick. `chosen` gives the trick started at a start-trick node (the npc_tricks
 /// choice the replay cursor made; the recorded trick when it has none).
 pub fn signals(line: &ReplayLine, s: &SignalSettings, input: &SignalInput, chosen: &dyn Fn(u32) -> i16, slot: &mut TrickSlot, slot_tricks: bool) -> Vec<Signal> {
-    let mut out = Vec::new();
-    // Anticipation.
-    if input.off_line <= s.anticipation_distance && !input.in_trick && input.heading_error.abs() < s.anticipation_heading {
-        if let Some(n) = upcoming_start(line, input.node, input.frame_in_segment, s.anticipation_frames) {
-            let recorded = line.node_trick(&line.nodes[n as usize]);
-            match catalog::category(recorded) {
-                Some(1 | 2) => {
-                    out.push(("AnticMag".into(), 1.0));
-                    let angle = if super::npc_tricks::is_nollie(recorded) { core::f32::consts::PI } else { 0.0 };
-                    out.push(("AnticAngle".into(), angle));
-                }
-                // `sub_824696B8` with `pc+788` = 8: the manual's side, `sub_82469338(pc+792)` (+ nose, - tail).
-                Some(8) => out.push(("Manual".into(), manual_value(recorded, s.manual_value))),
-                _ => {}
-            }
-        }
-    }
-    if !input.in_trick && line.nodes.get(input.node as usize).is_some_and(|n| n.flags & node_flags::CROUCHED != 0) {
-        out.push(("Crouch".into(), 1.0));
-    }
+    let mut dispatched = Vec::new();
     // Dispatch: the newest start-trick node crossed this tick.
     let limit = if input.last_node.is_none() { 1 } else { s.max_crossed_nodes };
     let from = input.last_node.map_or(input.node, |l| l + 1);
@@ -126,11 +77,36 @@ pub fn signals(line: &ReplayLine, s: &SignalSettings, input: &SignalInput, chose
             if line.nodes[n as usize].event == node_events::END_TRICK {
                 slot.category = 0;
             } else {
-                dispatch(line.node_trick(&line.nodes[n as usize]), chosen(n), slot, slot_tricks, s.manual_value, &mut out);
+                dispatch(line.node_trick(&line.nodes[n as usize]), chosen(n), slot, slot_tricks, s.manual_value, &mut dispatched);
             }
         }
     }
+    // The writer `sub_824696B8` runs after the dispatch, so it reads the slot as dispatched.
+    let mut out = Vec::new();
+    let upcoming = (input.off_line <= s.anticipation_distance)
+        .then(|| upcoming_start(line, input.node, input.frame_in_segment, s.anticipation_frames))
+        .flatten()
+        .map(|n| line.node_trick(&line.nodes[n as usize]));
+    let category = upcoming.and_then(catalog::category);
+    let anticipating = matches!(category, Some(1 | 2)) && input.heading_error.abs() < s.anticipation_heading && slot.category != 8;
+    if let (true, Some(recorded)) = (anticipating, upcoming) {
+        out.push(("AnticMag".into(), 1.0));
+        let angle = if super::npc_tricks::is_nollie(recorded) { core::f32::consts::PI } else { 0.0 };
+        out.push(("AnticAngle".into(), angle));
+    }
+    if !anticipating && slot.category == 0 && line.nodes.get(input.node as usize).is_some_and(|n| n.flags & node_flags::CROUCHED != 0) {
+        out.push(("Crouch".into(), 1.0));
+    }
+    if let (Some(8), true, true, Some(recorded)) = (category, input.manual_window, slot.category != 8, upcoming) {
+        out.push(("Manual".into(), manual_value(recorded, s.manual_value)));
+    }
+    out.extend(dispatched);
     out
+}
+
+/// The push writer set `pc+0x39E` this tick: the writer posts no anticipation and no crouch.
+pub fn drop_for_push(out: &mut Vec<Signal>) {
+    out.retain(|x| !matches!(x.0.as_str(), "AnticMag" | "AnticAngle" | "Crouch"));
 }
 
 /// One timed intent of a trick (`Sk8::Score::SkaterIntentTuple`, 16 B: i32 intent index into
@@ -177,9 +153,8 @@ fn dispatch(recorded: i16, trick: i16, slot: &mut TrickSlot, slot_tricks: bool, 
         ok
     };
     let ok = match slot.category {
-        // The perform step (`sub_8246A080` -> `sub_82469448`, which also stores the trick). Powerslides (9) keep it
-        // too until their writer arm is ported (it reads `pc+920`, not decoded).
-        1 | 2 | 9 => {
+        // The perform step (`sub_8246A080` -> `sub_82469448`, which also stores the trick).
+        1 | 2 => {
             if let Some((name, ..)) = usize::try_from(trick).ok().and_then(|i| catalog::IDENTIFIERS.get(i)) {
                 out.push(("Trick".into(), 1.0));
                 out.push(((*name).to_string(), 1.0));
@@ -187,11 +162,13 @@ fn dispatch(recorded: i16, trick: i16, slot: &mut TrickSlot, slot_tricks: bool, 
                 out.push(("TrickHeight".into(), 1.0));
                 out.push(("DontMirrorTrick".into(), 1.0));
             }
-            if slot.category != 9 && valid(trick) {
+            if valid(trick) {
                 slot.trick = trick;
             }
             valid(trick)
         }
+        // A powerslide posts nothing at dispatch: the writer arm does it every tick (b676).
+        9 => valid(trick),
         3 | 4 | 12 => !slot_tricks || take(slot),
         5 | 7 | 10 | 13 => take(slot),
         6 => valid(trick),
@@ -222,9 +199,37 @@ fn dispatch(recorded: i16, trick: i16, slot: &mut TrickSlot, slot_tricks: bool, 
     }
 }
 
+/// The powerslide arm's values (`sub_824696B8` case 9, 0x8246999C; b676): retail's, a mod may change them.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PowerslideValues {
+    /// The start key's value (`0x8231A844`).
+    pub start: f32,
+    /// `LeftSlide` / `RightSlide`, posted every tick (`0x822F8FE4` / `0x8209184C`).
+    pub left: f32,
+    pub right: f32,
+    /// Steer error below this starts right, else left (`0x82165A10`).
+    pub split: f32,
+}
+
+impl Default for PowerslideValues {
+    fn default() -> Self {
+        Self { start: 1.0, left: -0.42, right: 0.42, split: 0.0 }
+    }
+}
+
+/// What the powerslide arm reads this tick: on the path (`pc+920`, before this tick's drop) and the ground steer's
+/// heading error (`pc+824`).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Slide {
+    pub on_path: bool,
+    pub heading_error: f32,
+    pub values: PowerslideValues,
+}
+
 /// The per-tick writer's slot arm (`sub_824696B8` from 0x824698D0), then `pc+904 += 1`. `schedule` = the slot
-/// trick's intent list; `handplant_grab` = the category-6 GrabWorld value (1.0, `0x8231A844`).
-pub fn slot_signals(slot: &mut TrickSlot, schedule: &[IntentTuple], handplant_grab: f32) -> Vec<Signal> {
+/// trick's intent list; `handplant_grab` = the category-6 GrabWorld value (1.0, `0x8231A844`); `slide` = the
+/// powerslide arm's inputs.
+pub fn slot_signals(slot: &mut TrickSlot, schedule: &[IntentTuple], handplant_grab: f32, slide: Slide) -> Vec<Signal> {
     let mut out = Vec::new();
     match slot.category {
         1..=5 | 7 | 10 | 12 | 13 if valid(slot.trick) => {
@@ -240,6 +245,14 @@ pub fn slot_signals(slot: &mut TrickSlot, schedule: &[IntentTuple], handplant_gr
         6 => out.push(("GrabWorld".into(), handplant_grab)),
         // `loc_82469954`: a manual holds `Manual` = `pc+836` every tick until its end node.
         8 => out.push(("Manual".into(), slot.manual)),
+        // 0x8246999C: on the path, a start key by the steer error's side, then both slide values every tick.
+        9 if slide.on_path => {
+            let v = slide.values;
+            let start = if slide.heading_error < v.split { "RightSlideStart" } else { "LeftSlideStart" };
+            out.push((start.into(), v.start));
+            out.push(("LeftSlide".into(), v.left));
+            out.push(("RightSlide".into(), v.right));
+        }
         _ => {}
     }
     slot.ticks = slot.ticks.saturating_add(1);
@@ -263,7 +276,7 @@ pub fn retail_heading(v: Vec3) -> f32 {
 pub struct BoardYawTuning {
     /// No tweak while the folded yaw is at or under this (rad, `0x822F9284`, 0.31416 = 18 deg).
     pub dead_zone: f32,
-    /// `BoardAdjustMag` = |yaw| x this (`0x822F8C7C`, 6.0606).
+    /// `BoardAdjustMag` = |yaw| x this (`0x822F8B7C`, 2/pi: a 90 deg yaw is a full adjust).
     pub mag_scale: f32,
     /// `BoardAdjustAngle` with a manual ahead: nose-side and tail-side values (`0x822F94A8` / `0x822F94AC`).
     pub manual_ahead_angles: (f32, f32),
@@ -271,7 +284,7 @@ pub struct BoardYawTuning {
 
 impl Default for BoardYawTuning {
     fn default() -> Self {
-        Self { dead_zone: 0.31416, mag_scale: 6.0606, manual_ahead_angles: (-2.677, 0.257) }
+        Self { dead_zone: 0.31416, mag_scale: core::f32::consts::FRAC_2_PI, manual_ahead_angles: (-2.677, 0.257) }
     }
 }
 
@@ -285,11 +298,30 @@ pub struct BoardYaw {
     pub mag: f32,
 }
 
+/// `sub_824566C8`: the first ground node after the next air section from `from`, where the recording lands; a landing
+/// inside a footplant (category 13) does not count.
+pub fn landing_node(line: &ReplayLine, from: u32) -> Option<u32> {
+    let (mut category, mut in_air) = (0, false);
+    for (i, node) in line.nodes.iter().enumerate().skip(from as usize) {
+        match node.event {
+            node_events::START_TRICK => category = catalog::category(line.node_trick(node)).unwrap_or(0),
+            node_events::END_TRICK => category = 0,
+            _ => {}
+        }
+        if node.flags & node_flags::AIRBORNE != 0 {
+            in_air = true;
+        } else if in_air {
+            if category != 13 {
+                return u32::try_from(i).ok();
+            }
+            in_air = false;
+        }
+    }
+    None
+}
+
 impl BoardYaw {
-    /// `sub_8246B1F8` on the takeoff edge, from the cursor node's recorded board and skater frames:
-    /// d = heading(board forward) - heading(skater forward) ([`retail_heading`]), wrapped to [-pi, pi], folded to
-    /// [-pi/2, pi/2] (nose and tail lie on the same board line); outside the dead zone the angle is +-pi/2 by the sign
-    /// of d and the magnitude |d| x scale (not clamped here).
+    /// 8246B1F8 on the takeoff edge: board yaw from the node's recorded board and skater frames: docs/hails-additions/26e-living-world-skater-ai.md#takeoff-board-yaw
     pub fn takeoff(board: [f32; 4], skater: [f32; 4], t: &BoardYawTuning) -> Self {
         use core::f32::consts::{FRAC_PI_2, PI, TAU};
         let z = [0.0, 0.0, 1.0];
@@ -332,9 +364,10 @@ pub fn manual_value(trick: i16, tunable: f32) -> f32 {
 }
 
 /// The trick anticipated ahead (`pc+792`, with `pc+796` set, `sub_824691A0`): the recorded trick of the first start
-/// node in the look-ahead, under the anticipation gates of [`signals`].
+/// node in the look-ahead. Retail gates this on the off-line distance only; heading and an open trick gate posting
+/// `AnticMag`, not `pc+796`.
 pub fn anticipated(line: &ReplayLine, s: &SignalSettings, input: &SignalInput) -> Option<i16> {
-    if input.off_line > s.anticipation_distance || input.in_trick || input.heading_error.abs() >= s.anticipation_heading {
+    if input.off_line > s.anticipation_distance {
         return None;
     }
     let n = upcoming_start(line, input.node, input.frame_in_segment, s.anticipation_frames)?;
@@ -408,7 +441,7 @@ mod tests {
     }
 
     fn at(node: u32, last: Option<u32>) -> SignalInput {
-        SignalInput { node, frame_in_segment: 0, last_node: last, off_line: 0.2, heading_error: 0.1, in_trick: false }
+        SignalInput { node, frame_in_segment: 0, last_node: last, off_line: 0.2, heading_error: 0.1, manual_window: false }
     }
 
     fn names(v: &[Signal]) -> Vec<&str> {
@@ -436,12 +469,12 @@ mod tests {
         // The 5-0's schedule: PhysGrindUpDown -1 from the slot tick on, open-ended.
         let schedule = [IntentTuple { intent: 71, value: -1.0, start: 0, end: -1 }];
         for _ in 0..3 {
-            assert_eq!(slot_signals(&mut slot, &schedule, 1.0), vec![("PhysGrindUpDown".to_string(), -1.0)]);
+            assert_eq!(slot_signals(&mut slot, &schedule, 1.0, Slide::default()), vec![("PhysGrindUpDown".to_string(), -1.0)]);
         }
         assert_eq!(slot.ticks, 3);
         signals(&l, &s, &at(14, Some(13)), &|_| BS_5_O, &mut slot, true);
         assert_eq!(slot.category, 0);
-        assert!(slot_signals(&mut slot, &schedule, 1.0).is_empty());
+        assert!(slot_signals(&mut slot, &schedule, 1.0, Slide::default()).is_empty());
     }
 
     #[test]
@@ -452,7 +485,7 @@ mod tests {
             IntentTuple { intent: 0, value: 1.0, start: 0, end: -1 },
         ];
         let mut slot = TrickSlot { category: 10, trick: 20, ticks: 0, manual: 0.0 };
-        let seen: Vec<Vec<Signal>> = (0..4).map(|_| slot_signals(&mut slot, &schedule, 1.0)).collect();
+        let seen: Vec<Vec<Signal>> = (0..4).map(|_| slot_signals(&mut slot, &schedule, 1.0, Slide::default())).collect();
         assert_eq!(seen[0], vec![("LeftPush".to_string(), 1.0)]);
         assert_eq!(seen[1], vec![("LeftPush".to_string(), 1.0)]);
         assert_eq!(seen[2], vec![("TweakY".to_string(), -1.0)]);
@@ -460,11 +493,11 @@ mod tests {
         // Handplant: GrabWorld every tick, no schedule. Manual: its side every tick (`pc+836`). Powerslide and revert:
         // nothing from the slot.
         let mut hp = TrickSlot { category: 6, trick: FS_HANDPLANT, ticks: 0, manual: 0.0 };
-        assert_eq!(slot_signals(&mut hp, &schedule, 1.0), vec![("GrabWorld".to_string(), 1.0)]);
+        assert_eq!(slot_signals(&mut hp, &schedule, 1.0, Slide::default()), vec![("GrabWorld".to_string(), 1.0)]);
         let mut tail = TrickSlot { category: 8, trick: 3, ticks: 0, manual: -0.5 };
-        assert_eq!(slot_signals(&mut tail, &schedule, 1.0), vec![("Manual".to_string(), -0.5)]);
+        assert_eq!(slot_signals(&mut tail, &schedule, 1.0, Slide::default()), vec![("Manual".to_string(), -0.5)]);
         for c in [9, 11] {
-            assert!(slot_signals(&mut TrickSlot { category: c, trick: 20, ticks: 0, manual: 0.0 }, &schedule, 1.0).is_empty());
+            assert!(slot_signals(&mut TrickSlot { category: c, trick: 20, ticks: 0, manual: 0.0 }, &schedule, 1.0, Slide::default()).is_empty());
         }
     }
 
@@ -508,12 +541,12 @@ mod tests {
         use core::f32::consts::FRAC_PI_2;
         let t = BoardYawTuning::default();
         // Board turned +80 deg about +Y from the skater (a noseblunt-like pose): d = heading(board) - heading(skater)
-        // = -80 deg, so the angle is -pi/2 and the magnitude 80 deg x 6.0606. (Exactly 90 deg is the fold edge: the
+        // = -80 deg, so the angle is -pi/2 and the magnitude 80/90 (80 deg x 2/pi). (Exactly 90 deg is the fold edge: the
         // byte rounding of the recorded frames decides the side there, as in retail.)
         let b = BoardYaw::takeoff(decode(yaw(80.0)), decode(yaw(0.0)), &t);
         assert!(b.set && b.latched);
         assert!((b.angle + FRAC_PI_2).abs() < 1e-6, "{b:?}");
-        assert!((b.mag - 80f32.to_radians() * 6.0606).abs() < 0.05, "{b:?}");
+        assert!((b.mag - 80.0 / 90.0_f32).abs() < 0.01, "{b:?}");
         // The other side and the reversed board (tail first) give the mirrored / same results.
         assert!((BoardYaw::takeoff(decode(yaw(-80.0)), decode(yaw(0.0)), &t).angle - FRAC_PI_2).abs() < 1e-6);
         let tail = BoardYaw::takeoff(decode(yaw(-160.0)), decode(yaw(0.0)), &t);
@@ -531,6 +564,27 @@ mod tests {
 
     fn decode(raw: [u8; 4]) -> [f32; 4] {
         crate::living_world::replay::decode_orientation(raw)
+    }
+
+    #[test]
+    fn the_board_yaw_node_is_the_first_ground_node_after_the_air() {
+        let air = node_flags::AIRBORNE;
+        let mut l = line(30, 85, &[(5, air), (6, air), (10, air)]);
+        assert_eq!(landing_node(&l, 0), Some(7));
+        assert_eq!(landing_node(&l, 6), Some(7));
+        assert_eq!(landing_node(&l, 7), Some(11));
+        assert_eq!(landing_node(&l, 11), None);
+        // A landing inside a footplant does not count.
+        let footplant = (0..332).find(|&t| catalog::category(t) == Some(13)).unwrap();
+        l.jumps[0].trick = footplant;
+        l.nodes[30].event = 0;
+        l.nodes[4].event = node_events::START_TRICK;
+        l.nodes[4].jump = Some(0);
+        assert_eq!(landing_node(&l, 0), None);
+        l.nodes[8].event = node_events::END_TRICK;
+        assert_eq!(landing_node(&l, 0), Some(11));
+        l.nodes[7].event = node_events::END_TRICK;
+        assert_eq!(landing_node(&l, 0), Some(7));
     }
 
     #[test]
@@ -560,6 +614,32 @@ mod tests {
         assert_eq!(names(&go), ["Trick", "360flip", "GestureSpeed", "TrickHeight", "DontMirrorTrick"]);
     }
 
+    /// `sub_824696B8`: an open trick other than a manual does not stop `AnticMag`, a manual does; anticipating or
+    /// pushing stops the crouch.
+    #[test]
+    fn the_writer_gates_anticipation_on_a_manual_and_on_the_push() {
+        let l = line(20, 85, &[(5, node_flags::CROUCHED)]);
+        let s = SignalSettings::default();
+        let mut grinding = TrickSlot { category: 5, ..TrickSlot::default() };
+        assert_eq!(names(&signals(&l, &s, &at(5, Some(4)), &|_| 85, &mut grinding, true)), ["AnticMag", "AnticAngle"]);
+        let mut manual = TrickSlot { category: 8, ..TrickSlot::default() };
+        assert!(signals(&l, &s, &at(5, Some(4)), &|_| 85, &mut manual, true).is_empty());
+        let facing_away = sig(&l, &s, &SignalInput { heading_error: 1.0, ..at(5, Some(4)) }, &|_| 85);
+        assert_eq!(names(&facing_away), ["Crouch"]);
+        let mut pushed = sig(&l, &s, &at(5, Some(4)), &|_| 85);
+        drop_for_push(&mut pushed);
+        assert!(pushed.is_empty());
+    }
+
+    /// `sub_824691A0`: only the off-line distance gates the anticipated trick; heading and an open trick do not.
+    #[test]
+    fn the_anticipated_trick_ignores_heading_and_an_open_trick() {
+        let l = line(20, 85, &[]);
+        let s = SignalSettings::default();
+        assert_eq!(anticipated(&l, &s, &SignalInput { heading_error: 3.0, ..at(5, Some(4)) }), Some(85));
+        assert_eq!(anticipated(&l, &s, &SignalInput { off_line: 3.5, ..at(5, Some(4)) }), None);
+    }
+
     #[test]
     fn the_chosen_trick_is_started_and_a_nollie_is_anticipated_backwards() {
         let nollie = catalog::IDENTIFIERS.iter().position(|t| t.0.starts_with('n') && t.2 == 1).unwrap() as i16;
@@ -579,18 +659,19 @@ mod tests {
         let mut l = line(10, 3, &[]);
         l.nodes[14].event = node_events::END_TRICK;
         let s = SignalSettings::default();
-        let ahead = sig(&l, &s, &at(5, Some(4)), &|_| 3);
+        assert!(sig(&l, &s, &at(5, Some(4)), &|_| 3).is_empty(), "on the ground, long after landing");
+        let ahead = sig(&l, &s, &SignalInput { manual_window: true, heading_error: 3.0, ..at(5, Some(4)) }, &|_| 3);
         assert_eq!(ahead, vec![("Manual".to_string(), -0.5)]);
         let mut slot = TrickSlot::default();
         let start = signals(&l, &s, &at(10, Some(9)), &|_| 3, &mut slot, true);
         assert!(names(&start).iter().all(|n| *n != "Trick"), "a manual posts no Trick: {start:?}");
         assert_eq!((slot.category, slot.manual), (8, -0.5));
         for _ in 0..3 {
-            assert_eq!(slot_signals(&mut slot, &[], 1.0), vec![("Manual".to_string(), -0.5)]);
+            assert_eq!(slot_signals(&mut slot, &[], 1.0, Slide::default()), vec![("Manual".to_string(), -0.5)]);
         }
-        signals(&l, &s, &SignalInput { in_trick: true, ..at(14, Some(13)) }, &|_| 3, &mut slot, true);
+        signals(&l, &s, &at(14, Some(13)), &|_| 3, &mut slot, true);
         assert_eq!(slot.category, 0);
-        assert!(slot_signals(&mut slot, &[], 1.0).is_empty(), "nothing after the end node");
+        assert!(slot_signals(&mut slot, &[], 1.0, Slide::default()).is_empty(), "nothing after the end node");
         assert_eq!(manual_value(2, s.manual_value), 0.5, "a nosemanual's side is +");
     }
 
@@ -600,7 +681,24 @@ mod tests {
         let s = SignalSettings::default();
         assert!(names(&sig(&l, &s, &at(10, Some(5)), &|_| 85)).iter().all(|n| *n != "Trick"));
         assert!(names(&sig(&l, &s, &at(10, Some(7)), &|_| 85)).contains(&"Trick"));
-        assert!(names(&sig(&l, &s, &at(3, Some(2)), &|_| 85)).contains(&"Crouch"));
-        assert!(!names(&sig(&l, &s, &SignalInput { in_trick: true, ..at(3, Some(2)) }, &|_| 85)).contains(&"Crouch"));
+        assert!(names(&sig(&l, &s, &SignalInput { heading_error: 1.0, ..at(3, Some(2)) }, &|_| 85)).contains(&"Crouch"));
+        let mut grinding = TrickSlot { category: 5, ..TrickSlot::default() };
+        assert!(!names(&signals(&l, &s, &SignalInput { heading_error: 1.0, ..at(3, Some(2)) }, &|_| 85, &mut grinding, true)).contains(&"Crouch"));
+    }
+}
+
+#[cfg(test)]
+mod powerslide_tests {
+    use super::*;
+
+    /// b676: category 9 posts nothing at dispatch; on the path the writer posts the start key by the steer error's
+    /// side (0 goes left) and both slide values every tick; off the path nothing.
+    #[test]
+    fn a_powerslide_writes_its_start_side_and_both_slides_on_the_path() {
+        let mut slot = TrickSlot { category: 9, trick: 20, ticks: 0, manual: 0.0 };
+        let on = |e| Slide { on_path: true, heading_error: e, ..Default::default() };
+        assert_eq!(slot_signals(&mut slot, &[], 1.0, on(-0.1)), vec![("RightSlideStart".to_string(), 1.0), ("LeftSlide".to_string(), -0.42), ("RightSlide".to_string(), 0.42)]);
+        assert_eq!(slot_signals(&mut slot, &[], 1.0, on(0.0))[0], ("LeftSlideStart".to_string(), 1.0));
+        assert!(slot_signals(&mut slot, &[], 1.0, Slide::default()).is_empty(), "off the path");
     }
 }

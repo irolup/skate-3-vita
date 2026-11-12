@@ -35,16 +35,21 @@ pub(super) fn vehicle(state: &mut Requests, s: &Settings, f: &Frame) {
         state.request(7, 0.0);
     }
 }
+/// The closing velocity in animation space: (xz length, |y|), as 82D90AB8 compares them.
+pub fn closing_terms(f: &Frame) -> (f32, f32) {
+    let v = f.closing_velocity;
+    let m = f.world_to_animation;
+    let local: [f32; 4] =
+        std::array::from_fn(|i| m[2][i].madd(v[2], m[1][i].madd(v[1], m[0][i] * v[0])));
+    (length([local[0], 0.0, local[2], local[3]]), local[1].abs())
+}
 ///82D90AB8 rotates closing velocity656 by the actual WorldToAnim basis.
 pub(super) fn closing(state: &mut Requests, f: &Frame, xz: f32, y: f32) {
     if !f.board_contact {
         return;
     }
-    let v = f.closing_velocity;
-    let m = f.world_to_animation;
-    let local: [f32; 4] =
-        std::array::from_fn(|i| m[2][i].madd(v[2], m[1][i].madd(v[1], m[0][i] * v[0])));
-    if length([local[0], 0.0, local[2], local[3]]) > xz || local[1].abs() > y {
+    let (local_xz, local_y) = closing_terms(f);
+    if local_xz > xz || local_y > y {
         state.request(2, 0.0);
         if force(f, 1.0, 20.0) {
             state.request(0, 0.0);

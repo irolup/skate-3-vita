@@ -55,6 +55,10 @@ pub struct WanderParams {
     pub yield_distance: f32,
     /// NOT RETAIL: seconds a yielding ped waits before re-pathing to the same target: docs/hails-additions/26f-living-world-peds.md#ped-yield-patience
     pub yield_patience: f32,
+    /// How far an unreachable target moves to the nearest reachable navmesh point, the NavPower path request's
+    /// destination rewrite (`82E957F8` -> `82933E18`, range from bot settings `+0x40`; FLT_MAX in the flee request,
+    /// the wander value not read, b645): docs/hails-additions/26f-living-world-peds.md#unreachable-targets-move-onto-the-mesh
+    pub rewrite_range: f32,
 }
 
 impl Default for WanderParams {
@@ -77,6 +81,7 @@ impl Default for WanderParams {
             give_up_seconds: 2.0,
             yield_distance: 2.0,
             yield_patience: 2.0,
+            rewrite_range: f32::MAX,
         }
     }
 }
@@ -170,6 +175,9 @@ pub struct PedNav {
     pub targets_chosen: u32,
     pub route: Option<PedRoute>,
     route_index: usize,
+    /// The last step found a planned route's path ended or failed (retail `82E96728` "bot done"): the goal provider
+    /// is asked for a new goal (`82E2CB08` -> provider vfn 0x10, b697).
+    pub route_done: bool,
     /// [`NavObstacles::version`] the corners were last checked against (fix 11).
     pub obstacle_version: u64,
     /// The polygon the body stands on (kept by [`constrain_move`]; fix 17). `None` = locate.
@@ -187,6 +195,11 @@ pub struct PedNav {
     pub repath_due: bool,
     /// How often the ped re-pathed to its target (logs, tests).
     pub repaths: u32,
+    /// SkaterAvoidance off: skaters are not side-stepped (set by the host each step).
+    pub ignore_skaters: bool,
+    /// The last step's position (the ped's velocity) and the side-step's lateral velocity (x, z).
+    pub last_position: Option<Vec3>,
+    pub side_velocity: [f32; 2],
 }
 
 fn rotate_y(v: [f32; 2], angle: f32) -> [f32; 2] {
@@ -266,12 +279,23 @@ pub fn choose_target_clear(mesh: &NavMesh, params: &WanderParams, from: NavPoint
     (t, mesh.locate(t))
 }
 
+/// The NavPower path request (`82E957F8`): a destination that is off the mesh or not reachable from `here` moves to
+/// the nearest point of a reachable polygon (`82933E18` + `8292F9F0`), within `range`; None when there is none.
+fn request_path(mesh: &NavMesh, here: NavPoint, located: Option<NavPoint>, target: Vec3, range: f32) -> Option<(Vec3, Vec<Vec3>)> {
+    if let Some(c) = located.and_then(|to| mesh.find_path(here, to)) {
+        return Some((target, c));
+    }
+    let to = mesh.locate_nearest(target, here.poly, range)?;
+    mesh.find_path(here, to).map(|c| (to.position, c))
+}
+
 impl PedNav {
     pub fn set_route(&mut self, route: Option<PedRoute>) {
         self.route = route;
         self.route_index = 0;
         self.target = None;
         self.corners.clear();
+        self.route_done = false;
         self.hold_on_fail = false;
         self.holding = false;
     }
@@ -322,17 +346,22 @@ impl PedNav {
         self.next = 0;
         self.stall = None;
         self.holding = false;
-        self.corners = match located.and_then(|to| mesh.find_path(here, to)) {
-            Some(c) => c,
+        // An approach goal keeps its own rule (no path: stand and ask again, b515 / b516), so no rewrite for it.
+        let range = if self.hold_on_fail { 0.0 } else { params.rewrite_range };
+        self.corners = match request_path(mesh, here, located, target, range) {
+            Some((to, c)) => {
+                self.target = Some(to);
+                c
+            }
             None if self.hold_on_fail && self.route.is_some() => {
                 self.holding = true;
                 vec![here.position]
             }
             None => {
-                // No path (retail: a NavPower failure event 1-3 sets `+32`): go straight and
-                // take the short fan next time.
+                // No reachable point (retail: a NavPower failure event 1-3 sets `+32`, the bot is done): the ped stays
+                // put, arrives at once and picks a new target with the short fan next tick.
                 self.skip_long = true;
-                vec![target]
+                vec![here.position]
             }
         };
         if let Some(o) = obstacles {
@@ -347,13 +376,15 @@ impl PedNav {
     /// Re-path from `here` to the SAME target (retail re-requests the bot's destination, `82E957F8`; b315, b332): the
     /// target and a route's index stay. No path: the corners are dropped and the long fan skipped, so the arrival
     /// branch picks a new target (retail: a failed request ends the path, then the bot is done, b190).
-    pub fn repath(&mut self, mesh: &NavMesh, here: NavPoint, obstacles: Option<&NavObstacles>) {
+    pub fn repath(&mut self, mesh: &NavMesh, params: &WanderParams, here: NavPoint, obstacles: Option<&NavObstacles>) {
         let Some(target) = self.target else { return };
         self.repaths += 1;
         self.next = 0;
         self.stall = None;
-        match mesh.locate(target).and_then(|to| mesh.find_path(here, to)) {
-            Some(c) => {
+        let range = if self.hold_on_fail { 0.0 } else { params.rewrite_range };
+        match request_path(mesh, here, mesh.locate(target), target, range) {
+            Some((to, c)) => {
+                self.target = Some(to);
                 self.corners = c;
                 if let Some(o) = obstacles {
                     self.corners = o.detour(mesh, here.position, &self.corners, mesh.agent[1]);
@@ -405,6 +436,8 @@ impl PedNav {
         obstacles: Option<&NavObstacles>,
         dt: f32,
     ) -> NavOutput {
+        let velocity = self.last_position.filter(|_| dt > 0.0).map_or([0.0; 2], |l| [(position[0] - l[0]) / dt, (position[2] - l[2]) / dt]);
+        self.last_position = Some(position);
         let here = self.poly.and_then(|k| mesh.point_on(k, position)).or_else(|| mesh.locate(position));
         let Some(here) = here else {
             self.waiting = NavWait::OffMesh;
@@ -438,10 +471,11 @@ impl PedNav {
             self.still_fired = false;
         }
         if std::mem::take(&mut self.repath_due) && !give_up {
-            self.repath(mesh, here, obstacles);
+            self.repath(mesh, params, here, obstacles);
         }
         // Arrival / no plan: choose the next target (the bot's state 1).
         let arrived = self.corners.is_empty() || (self.next + 1 >= self.corners.len() && self.corners.last().is_some_and(|c| dist_xz(*c, position) < params.corner_radius));
+        self.route_done = arrived && self.route.is_some() && self.target.is_some();
         if give_up {
             self.reverse = true;
             self.skip_long = true;
@@ -541,9 +575,31 @@ impl PedNav {
             let steer = [to[0] + push[0] * 2.0, to[1] + push[1] * 2.0];
             error = wrap(heading_of(steer) - heading);
         }
+        // Side-step round skaters and moving props: docs/hails-additions/26f-living-world-peds.md#predictive-side-step
+        let ignore = super::obstacles::Ignore { id: None, skaters: self.ignore_skaters };
+        // Braking at the path end skips the side-step and stops the ped (`82E9FC20`, research b716).
+        let braking = obstacles.is_some_and(|o| o.brakes(position, velocity, [corner[0], corner[2]], ignore));
+        if braking {
+            yield_to = true;
+        }
+        let a = if braking { [0.0; 2] } else { obstacles.map_or([0.0; 2], |o| o.side_step(position, velocity, radius, ignore)) };
+        let sv = &mut self.side_velocity;
+        if a != [0.0, 0.0] {
+            *sv = [sv[0] + a[0] * dt, sv[1] + a[1] * dt];
+        }
+        // Retail's path turn term pulls it back every tick, also while the side-step pushes (research b716).
+        if let Some(o) = obstacles {
+            *sv = o.path_turn(*sv, forward(heading + error), velocity[0].hypot(velocity[1]), dt);
+        }
+        let side_stepping = *sv != [0.0, 0.0];
+        if side_stepping {
+            let speed = velocity[0].hypot(velocity[1]);
+            let base = forward(heading + error);
+            error = wrap(heading_of([base[0] * speed + sv[0], base[1] * speed + sv[1]]) - heading);
+        }
         // Ours: while the avoidance stand-in steers, no turn is posted and the stand-in's stop / pivot rule runs (it
         // walks the ped off its path on purpose; retail's avoidance is NavPower's, not decoded).
-        let avoiding = blocker.is_some() || push != [0.0, 0.0];
+        let avoiding = blocker.is_some() || push != [0.0, 0.0] || side_stepping;
 
         // Crosswalk rule (mods): wait before the first road polygon while the walk light is not
         // green.
@@ -583,13 +639,15 @@ impl PedNav {
             // Turning: the clip's root yaw turns the ped until the turn completes; then a walk turn walks on.
             (Locomotion::TurnLeft | Locomotion::TurnRight, _) => out(Intent::Idle, 0.0),
             (Locomotion::WalkTurnLeft | Locomotion::WalkTurnRight, _) => out(Intent::Walk, 0.0),
+            // A run turn runs on (the caller turns the walk into the run while fleeing / chasing).
+            (Locomotion::RunTurnLeft | Locomotion::RunTurnRight | Locomotion::ShuffleTurnLeft | Locomotion::ShuffleTurnRight, _) => out(Intent::Walk, 0.0),
             // Standing, stopping or walking past the first edge: the bucket's turn (stand or walk clip).
-            (Locomotion::Idle | Locomotion::Stop | Locomotion::Walk, Some(degrees)) if !avoiding => post(degrees),
+            (Locomotion::Idle | Locomotion::Stop | Locomotion::Walk | Locomotion::Run | Locomotion::Shuffle, Some(degrees)) if !avoiding => post(degrees),
             // Avoiding while standing (ours): pivot, walk once roughly facing the way.
             (Locomotion::Idle | Locomotion::Stop, _) if avoiding => out(if error.abs() <= params.walk_heading { Intent::Walk } else { Intent::Idle }, turn),
             // Below the first edge: walk and steer.
-            (Locomotion::Idle | Locomotion::Stop | Locomotion::Walk | Locomotion::Start, _) if !avoiding => out(Intent::Walk, turn),
-            // Running (no run turns yet) or avoiding while walking (ours): a way far off to the side stops the ped to pivot.
+            (Locomotion::Idle | Locomotion::Stop | Locomotion::Walk | Locomotion::Start | Locomotion::Shuffle | Locomotion::ShuffleStart, _) if !avoiding => out(Intent::Walk, turn),
+            // The run start, or avoiding while walking (ours): a way far off to the side stops the ped to pivot.
             _ => out(if error.abs() > params.stop_heading { Intent::Idle } else { Intent::Walk }, turn),
         }
     }

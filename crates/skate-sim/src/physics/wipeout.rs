@@ -54,7 +54,21 @@ impl Wipeout {
     pub fn check_air(&mut self, input: &Observations<'_>, use_com: bool) -> Result<(), String> {
         let mode = self.mode(input.processed)?;
         let frame = input.frame()?;
+        let before = self.state.reasons[2];
         wipeout::check_air(&mut self.state, &self.settings, &mode, &frame, use_com);
+        // AIR_R2: which closing limit gave wipeout reason 2 (research b803).
+        if !before && self.state.reasons[2] {
+            let (branch, xz, y) = wipeout::air_closing_limits(&self.settings, &mode, &frame);
+            let (vxz, vy) = wipeout::closing_terms(&frame);
+            tracing::info!(
+                "AIR_R2 branch={branch} xz={vxz:.3}/{xz:.3} y={vy:.3}/{y:.3} jump_fix_frames={} side_on={} body_flip={} light_dmo={} closing={:.2?}",
+                frame.jump_fix_frames,
+                frame.flags_2472 & (1 << 15) != 0,
+                frame.flags_2476 & (1 << 26) != 0,
+                frame.board_material_flags & (1 << 29) != 0,
+                frame.closing_velocity
+            );
+        }
         Ok(())
     }
     pub(crate) fn mode(&self, p: &ProcessedPhysicsInput) -> Result<Mode, String> {

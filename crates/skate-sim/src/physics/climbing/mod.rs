@@ -328,8 +328,10 @@ impl Runtime {
         skater.animation_input.extra.look_x = f32::from_bits(w[9]);
         skater.animation_input.extra.look_y = f32::from_bits(w[10]);
         let feedback = skater.physical_feedback;
-        super::camera_output::advance(physics, skater, &feedback, camera)?;
+        let tick = physics.ticks;
         physics.ticks += 1;
+        super::frame::publish_output(physics, skater, tick)?;
+        super::camera_output::advance(physics, skater, &feedback, camera)?;
         physics.clock.finish_tick();
         if complete {
             // Re-seed the real ground controller at the landing. Old ground

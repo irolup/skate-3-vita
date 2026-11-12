@@ -6,6 +6,7 @@
 //! retail's traces), which the output stage folds. Voices with an effect routing record also feed
 //! one of the two FlangeSub returns (order 150, [`flange`]), which send on into the env input and
 //! SFX Master.
+pub mod dynamic;
 pub mod env;
 pub mod eqchain;
 pub mod flange;
@@ -26,6 +27,9 @@ pub enum Output {
     /// A FootStep SubMix graph ([`submix`]; mono: route it with [`Route::mono`]). It sends on into
     /// the env bus and SFX Master. Falls back to SFX Master when the graph was never built.
     Submix(u8),
+    /// The dynamic-object manager's graph A (0, routing code 2048) or B (1, code 512) ([`dynamic`], mono). Falls back
+    /// to SFX Master before the graphs are built.
+    Dynamic(u8),
 }
 
 /// How a direct (Splice / stream) voice is routed: its output bus, whether resolving it may
@@ -61,6 +65,8 @@ pub struct Buses {
     pub submix: submix::FootSubmixes,
     /// The speech stream slots' echo submixes (`world::speech_player`).
     pub speech_echo: speech_echo::SpeechEchoes,
+    /// The dynamic-object manager's two graphs (the pushed props' loops).
+    pub dynamic: dynamic::DynamicBuses,
 }
 
 impl Default for Buses {
@@ -77,6 +83,7 @@ impl Default for Buses {
             flange: flange::FlangeReturns::default(),
             submix: submix::FootSubmixes::default(),
             speech_echo: speech_echo::SpeechEchoes::default(),
+            dynamic: dynamic::DynamicBuses::default(),
         }
     }
 }
@@ -111,6 +118,9 @@ impl Buses {
             Output::Submix(i) if self.submix.graphs.get(usize::from(i)).is_some_and(Option::is_some) => {
                 self.submix.input(i).expect("built graph")
             }
+            Output::Dynamic(i) if self.dynamic.built() && i < 2 => {
+                self.dynamic.input(dynamic::CODES[usize::from(i)]).expect("built graphs")
+            }
             _ => master,
         }
     }
@@ -120,6 +130,7 @@ impl Buses {
     pub fn render(&mut self, master: &mut [[f32; BLOCK]; 6]) {
         let p = crate::prof::Scope::new(7);
         self.submix.render(&mut self.env_in, master);
+        self.dynamic.render(master);
         self.speech_echo.render(&mut self.env_in);
         drop(p);
         let p = crate::prof::Scope::new(8);

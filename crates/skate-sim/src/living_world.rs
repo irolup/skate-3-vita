@@ -201,6 +201,11 @@ pub(crate) mod dmo_stream {
         // skate_vita (performance): upstream builds the moved set over every body each pass; the census asks only about
         // the live and spawning ones (`PropDynamics::is_moved`, the same test).
         let dynamics = physics.prop_dynamics();
+        // Moved objects cull and score by where they are now (b651); the spawn keeps the authored placement.
+        // skate_vita (performance): only the live moved ones (the census reads no other).
+        stream.live_at = dynamics
+            .map(|d| stream.live.iter().filter(|&&id| d.is_moved(id)).filter_map(|&id| d.origin_of(id).map(|o| (id, [o.x, o.y, o.z]))).collect())
+            .unwrap_or_default();
         let decisions = stream.step_kept(&views, &core, fill, &|id| held == Some(id) || layout.contains(&id), &|id| dynamics.is_some_and(|d| d.is_moved(id)));
         if decisions.is_empty() && !fill {
             return;
@@ -224,6 +229,10 @@ pub(crate) mod dmo_stream {
             };
             if !fill {
                 debug!("DMO_STREAM_CHANGE {d:?}");
+                // A moved prop going away is the "cleaned up" a player sees: say where it was (ask 394, logs must diagnose).
+                if let Some(at) = stream.live_at.get(&id) {
+                    info!("DMO_STREAM_MOVED {d:?} at [{:.1}, {:.1}, {:.1}]", at[0], at[1], at[2]);
+                }
             }
             pass.push((id, out, s.respawn_authored));
         }
@@ -284,6 +293,12 @@ pub struct LivingWorldSettings {
     pub ped_obstacles: skate_core::living_world::peds::ObstacleParams,
     /// Traffic cars touching peds (retail: the ped is pushed out of the car and walks on).
     pub ped_vehicle_contact: skate_core::living_world::peds::VehicleContactParams,
+    /// Traffic cars are ground for the on-foot skater's landing and ground queries (retail: the on-foot arc sweeps
+    /// the dynamic island pools, `82764CF8` mask 7, b648).
+    pub on_foot_vehicle_ground: bool,
+    /// NPC skater grind board-to-CoG height (`DISTTOCOG`); `None` = retail's rest, the setup data's
+    /// `anim_motion/grind_height` `max_grind_disttocog`.
+    pub npc_grind_disttocog: Option<f32>,
     /// Peds as solid bodies in the skater's contact solve (retail group 11).
     pub ped_body: ped_body::PedBodySettings,
     /// The ped behaviour runtime (doc 26 "Ped behaviour runtime"); retail values.
@@ -325,15 +340,25 @@ pub struct PedBrainSettings {
     pub flee: skate_core::living_world::peds::flee::FleeParams,
     /// RunFromHonker's goal and speeds (`826A1358`).
     pub run_from_honker: skate_core::living_world::peds::honk::RunFromHonkerParams,
+    /// A prop moving at a ped makes it flee (`82E2EDC0`, retail values).
+    pub object_flee: skate_core::living_world::peds::object_flee::ObjectFleeParams,
+    /// A car near the ped moving along the line between them (upstream's opt-in Ped Vehicle Flee, W8; off here).
+    pub vehicle_flee: skate_core::living_world::peds::object_flee::VehicleFleeParams,
     pub values: skate_core::living_world::peds::brain::BrainSettings,
     /// The world-prop plugins' values (offer scan, refusals, the seats-in-water rule); copied into the plugin props
     /// every think, so a mod's change is in effect at once.
     pub plugins: skate_core::living_world::peds::plugins::PluginSettings,
+    /// A mod holds the scatter alarm raised (upstream `ped_brain.scatter_hold`); released, retail's timer runs out.
+    pub scatter_hold: bool,
+    /// The speed bump before the speed row pick (`sub_82E29D98`, b682).
+    pub speed_bump: skate_core::living_world::peds::anim::SpeedBump,
+    /// The strafe poster's edges (`sub_82E2AFC0`, b686).
+    pub strafe: skate_core::living_world::peds::anim::StrafeRules,
 }
 
 impl Default for PedBrainSettings {
     fn default() -> Self {
-        Self { enabled: true, mood: true, flee: Default::default(), run_from_honker: Default::default(), values: Default::default(), plugins: Default::default() }
+        Self { enabled: true, mood: true, flee: Default::default(), run_from_honker: Default::default(), object_flee: Default::default(), vehicle_flee: Default::default(), values: Default::default(), plugins: Default::default(), scatter_hold: false, speed_bump: Default::default(), strafe: Default::default() }
     }
 }
 
@@ -353,6 +378,8 @@ impl Default for LivingWorldSettings {
             ped_fade: Default::default(),
             ped_obstacles: Default::default(),
             ped_vehicle_contact: Default::default(),
+            on_foot_vehicle_ground: true,
+            npc_grind_disttocog: None,
             ped_body: Default::default(),
             ped_brain: Default::default(),
             skater_clips: Default::default(),
@@ -670,8 +697,9 @@ impl LivingWorldState {
         }
         crate::physics::network::prepare(physics);
         vehicles::push_vehicle_proxies(&self.traffic, physics, skater);
+        vehicles::publish_on_foot_solids(physics, &self.settings);
         let observers: Vec<_> = local_observer(physics, skater).into_iter().collect();
-        ped_body::push_ped_proxies(&self.peds, &self.settings, &observers, physics, skater);
+        ped_body::push_ped_proxies(&mut self.peds, &self.settings, &observers, physics, skater);
         ped_hand_props::push_hand_prop_proxies(&self.peds, &self.settings, physics, skater);
         npc_skaters::push_proxies(&self.npcs, physics, skater, &self.settings);
         vehicles::push_vehicle_grab_splines(&self.traffic, physics);
@@ -693,7 +721,17 @@ impl LivingWorldState {
 
     pub(crate) fn after_physics(&mut self, physics: &mut crate::physics::GamePhysics, skater: &mut crate::physics::SkaterRuntime, seconds: f64, camera: Option<glam::Vec3>) {
         let observers: Vec<_> = local_observer(physics, skater).into_iter().collect();
+        // A slow step names its part (always on, with `SLOW_TICK`): ms since the last lap.
+        let mut mark = std::time::Instant::now();
+        let started = mark;
+        let mut laps = [0.0f32; 10];
+        let mut lap = |slot: usize| {
+            let now = std::time::Instant::now();
+            laps[slot] = (now - mark).as_secs_f32() * 1000.0;
+            mark = now;
+        };
         let mut decisions = self.step_population(&observers, seconds);
+        lap(0);
         let props = physics.prop_dynamics().map(peds::prop_obstacle_inputs).unwrap_or_default();
         // The peds' chain in upstream's order (`apply_ped_records`, `release_rejected`,
         // `update_ped_obstacles`, `think_peds`, `sync_hand_props`, `apply_skater_takedowns`, `advance_peds`).
@@ -713,12 +751,16 @@ impl LivingWorldState {
             // The behaviour runtime. The traffic events are the last step's (horns at peds).
             let wiping = [skater.player_input.processed.flags_2468 & npc_sim::WIPEOUT_BIT != 0];
             let cars: Vec<(u64, [f32; 3], [f32; 3])> = self.traffic.index.values().map(|(e, _)| (e.meta.id.to_u64(), e.motion.curr.translation.to_array(), (e.motion.curr.rotation * glam::Vec3::Z).to_array())).collect();
-            peds::think_peds(&self.population, &mut self.peds, &self.settings, &observers, &wiping, &self.traffic.events, &cars, Some(&*physics));
+            lap(1);
+            peds::think_peds(&self.population, &mut self.peds, &self.settings, &observers, &wiping, &self.traffic.events, &cars, &self.traffic, Some(&*skater), Some(&*physics));
+            lap(2);
             ped_hand_props::sync_hand_props(&mut self.peds, &self.settings, &observers, physics, &self.asset_root, self.population.world.tick());
             peds::apply_skater_takedowns(&mut self.peds.takedowns, skater, physics);
             let npc_actors: Vec<(u64, [f32; 3], [f32; 3])> = self.npcs.index.values().filter_map(|n| n.replay.last.as_ref().map(|s| (n.npc.id.to_u64(), s.position, s.velocity))).collect();
+            lap(3);
             peds::advance_peds(&mut self.population, &mut self.peds, self.traffic.clock.as_ref(), physics, &self.obstacles, &observers, Some(&*skater), npc_actors, &self.settings);
         }
+        lap(4);
         let ped_list: Vec<(u64, [f32; 3])> = {
             let mut l: Vec<_> = self.peds.index.values().map(|e| (e.ped.id.to_u64(), e.body.position.to_array())).collect();
             l.sort_by_key(|x| x.0);
@@ -737,8 +779,11 @@ impl LivingWorldState {
             let mut list: Vec<&mut npc_skaters::NpcEntity> = index.values_mut().collect();
             npc_avoid::avoid(&self.settings, &observers, &self.population, track, seconds as f32, &ped_list, ped_agent, &cars, &props, &mut list, &mut events);
             self.npcs.events = events;
+            lap(5);
             npc_skaters::advance(&self.settings, &observers, &mut self.population, &mut self.npcs);
+            lap(6);
             npc_skaters::stance_and_pose(&self.settings, skater, &self.population, &mut self.npcs);
+            lap(7);
         }
         self.traffic.events.clear();
         vehicles::apply_vehicle_records(&decisions, &self.population, &self.overrides, &mut self.traffic);
@@ -749,7 +794,19 @@ impl LivingWorldState {
         vehicles::drive_traffic(&self.overrides, &mut self.population, &mut self.traffic, &observers, &ped_list, held, Some(&self.obstacles));
         // Cars push the peds they touch (after both stepped), then the peds' draw state.
         vehicle_contacts::ped_vehicle_contacts(&self.settings, &mut self.population, &mut self.peds, &self.traffic, &mut self.ped_cars_logged);
+        lap(8);
         peds::present_peds(&self.settings, &self.population, &mut self.peds, camera);
+        lap(9);
+        let total = (std::time::Instant::now() - started).as_secs_f32() * 1000.0;
+        if total > 30.0 {
+            static SLOW: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if SLOW.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 20 == 0 {
+                println!(
+                    "SLOW_LIVING {total:.1} ms: population {:.1}, ped prep {:.1}, think_peds {:.1}, hand props and takedowns {:.1}, advance_peds {:.1}, npc records and avoid {:.1}, npc advance {:.1}, npc stance and pose {:.1}, traffic and ped-car contacts {:.1}, present_peds {:.1}; {} peds, {} npcs, {} cars",
+                    laps[0], laps[1], laps[2], laps[3], laps[4], laps[5], laps[6], laps[7], laps[8], laps[9], self.peds.index.len(), self.npcs.index.len(), self.traffic.index.len()
+                );
+            }
+        }
         for e in &self.traffic.events {
             match e {
                 vehicles::TrafficEvent::Spawned { id, entity, model, .. } => debug!("TRAFFIC spawned #{} {entity} ({model})", id.serial),

@@ -1,17 +1,5 @@
-//! NPC skater reactions to other skaters' wipeouts (the reaction manager, research b166 / b168) [code]:
-//! - each simulation tick (`sub_8245A7E8`, tick mask bit 0) every skater's reaction bits are cleared first
-//!   (R+0x24 `clrlwi 7`, main-checked), then set from this tick's events, so a pulse lasts one tick;
-//! - a skater's wipeout start (`sub_82772748`: H+0xD1 = !prev && cur of the wipeout byte, Processed `+2468` bit 18) is
-//!   passed to every other skater within a strict 15.0 (`0x822F8F68` = 225.0 compared with the squared distance,
-//!   `sub_8245E950`, main-checked) as the slam bit with "by" = the sender's model (`sub_8245E6C8`, `sub_8245E740`;
-//!   0x61 = 97 when the sender has none); its wipeout end (H+0xD2) is passed the same way as slam_b (`sub_8245E848`);
-//! - the skaters are visited in index order, so the last sender in range names "by";
-//! - a skater's own crash bit is its wipeout byte itself, a level (`sub_827A1B78`, entry +148 bit 5).
-//! Trick seen (score > 50, `Hash_4BEEDCA4AD799796`) waits for the score's writer (b168 open).
-//!
-//! Ours: the skater order is the host's stable key order (players first, then NPC skaters by id), and players
-//! listen to nothing (only NPC skaters speak these lines). Multiplayer: a pure function of the skater list and the
-//! previous tick's wipeout states; the host runs it and sends the raised reactions.
+//! NPC skater reactions to other skaters' wipeouts (reaction manager 8245A7E8; b166 / b168).
+//! Retail rules and our order: docs/hails-additions/26e-living-world-skater-ai.md#npc-wipeout-reactions
 
 use std::collections::BTreeMap;
 
@@ -24,11 +12,14 @@ pub struct ReactionParams {
     pub enabled: bool,
     /// Broadcast radius, m (strict: distance < radius).
     pub radius: f32,
+    /// A skater's score above this raises trick seen (`Hash_4BEEDCA4AD799796` = 50, strict signed compare in
+    /// `8245EAA8`; b168).
+    pub trick_threshold: i32,
 }
 
 impl Default for ReactionParams {
     fn default() -> Self {
-        Self { enabled: true, radius: 15.0 }
+        Self { enabled: true, radius: 15.0, trick_threshold: 50 }
     }
 }
 
@@ -47,6 +38,9 @@ pub struct ReactionSkater {
     pub model: u32,
     /// Speaks reaction lines (NPC skaters).
     pub listens: bool,
+    /// The score the manager compares (`[P+0x3C]+0x88`, written by `82DA6630`: the larger of the last trick
+    /// sequence's reward and the sequence in progress, truncated). 0 for NPCs.
+    pub score: i32,
 }
 
 /// What one listener gets this tick.
@@ -55,6 +49,8 @@ pub struct Raised {
     /// `(by)` of the last slam / slam_b sender in range.
     pub slam: Option<u32>,
     pub slam_b: Option<u32>,
+    /// `(by)` of the last sender in range scoring above the threshold (a level: every tick while it stays above).
+    pub trick: Option<u32>,
     /// Its own wipeout (a level).
     pub crash: bool,
 }
@@ -78,22 +74,25 @@ impl ReactionState {
             return out;
         }
         let r2 = params.radius * params.radius;
+        let in_range = |a: &ReactionSkater, b: &ReactionSkater| (0..3).map(|i| (a.position[i] - b.position[i]).powi(2)).sum::<f32>() < r2;
+        for sender in skaters.iter().filter(|s| s.score > params.trick_threshold) {
+            for listener in skaters.iter().filter(|l| l.listens && l.key != sender.key && in_range(l, sender)) {
+                out.entry(listener.key).or_default().trick = Some(sender.model);
+            }
+        }
         for sender in skaters {
             let was = previous.get(&sender.key).copied().unwrap_or(sender.wiping);
             let (started, ended) = (!was && sender.wiping, was && !sender.wiping);
             if !started && !ended {
                 continue;
             }
-            for listener in skaters.iter().filter(|l| l.listens && l.key != sender.key) {
-                let d2: f32 = (0..3).map(|i| (listener.position[i] - sender.position[i]).powi(2)).sum();
-                if d2 < r2 {
-                    let entry = out.entry(listener.key).or_default();
-                    if started {
-                        entry.slam = Some(sender.model);
-                    }
-                    if ended {
-                        entry.slam_b = Some(sender.model);
-                    }
+            for listener in skaters.iter().filter(|l| l.listens && l.key != sender.key && in_range(l, sender)) {
+                let entry = out.entry(listener.key).or_default();
+                if started {
+                    entry.slam = Some(sender.model);
+                }
+                if ended {
+                    entry.slam_b = Some(sender.model);
                 }
             }
         }
@@ -109,7 +108,21 @@ mod tests {
     use super::*;
 
     fn skater(key: u64, x: f32, wiping: bool, model: u32, listens: bool) -> ReactionSkater {
-        ReactionSkater { key, position: [x, 0.0, 0.0], wiping, model, listens }
+        ReactionSkater { key, position: [x, 0.0, 0.0], wiping, model, listens, score: 0 }
+    }
+
+    #[test]
+    fn a_score_above_50_is_trick_seen_within_15_m_every_tick() {
+        let p = ReactionParams::default();
+        let mut s = ReactionState::default();
+        let player = |score| ReactionSkater { score, ..skater(0, 0.0, false, 0, false) };
+        let near = skater(10, 10.0, false, 89, true);
+        let far = skater(11, 16.0, false, 90, true);
+        assert!(s.step(&p, &[player(50), near, far]).is_empty(), "50 is not above the threshold");
+        let r = s.step(&p, &[player(51), near, far]);
+        assert_eq!(r.get(&10).and_then(|x| x.trick), Some(0));
+        assert_eq!(r.get(&11), None);
+        assert_eq!(s.step(&p, &[player(51), near, far]).get(&10).and_then(|x| x.trick), Some(0), "a level");
     }
 
     #[test]
@@ -121,13 +134,13 @@ mod tests {
         assert!(quiet.is_empty());
         // Tick 2: the player wipes out: the NPC 10 m away sees a slam by the player; the one at exactly 15 m does not.
         let start = s.step(&p, &[skater(0, 0.0, true, 0, false), skater(10, 10.0, false, 89, true), skater(11, 15.0, false, 90, true)]);
-        assert_eq!(start.get(&10), Some(&Raised { slam: Some(0), slam_b: None, crash: false }));
+        assert_eq!(start.get(&10), Some(&Raised { slam: Some(0), slam_b: None, trick: None, crash: false }));
         assert_eq!(start.get(&11), None, "15 m is not inside the strict radius");
         // Tick 3: still wiping out: nothing new (the pulse lasted one tick).
         assert!(s.step(&p, &[skater(0, 0.0, true, 0, false), skater(10, 10.0, false, 89, true)]).is_empty());
         // Tick 4: the wipeout ends: slam_b.
         let end = s.step(&p, &[skater(0, 0.0, false, 0, false), skater(10, 10.0, false, 89, true)]);
-        assert_eq!(end.get(&10), Some(&Raised { slam: None, slam_b: Some(0), crash: false }));
+        assert_eq!(end.get(&10), Some(&Raised { slam: None, slam_b: Some(0), trick: None, crash: false }));
     }
 
     #[test]
@@ -140,10 +153,10 @@ mod tests {
         let both = [skater(0, 0.0, false, 0, false), skater(10, 5.0, true, 89, true), skater(11, 8.0, true, 12, true), skater(12, 6.0, false, 91, true)];
         let r = s.step(&p, &both);
         assert_eq!(r.get(&12).and_then(|x| x.slam), Some(12));
-        assert_eq!(r.get(&10), Some(&Raised { slam: Some(12), slam_b: None, crash: true }), "own crash + 11's slam");
+        assert_eq!(r.get(&10), Some(&Raised { slam: Some(12), slam_b: None, trick: None, crash: true }), "own crash + 11's slam");
         // Next tick: still down: the crash level stays, no new slam.
         let r = s.step(&p, &both);
-        assert_eq!(r.get(&10), Some(&Raised { slam: None, slam_b: None, crash: true }));
+        assert_eq!(r.get(&10), Some(&Raised { slam: None, slam_b: None, trick: None, crash: true }));
         assert_eq!(r.get(&12), None);
         // Disabled (a mod): nothing.
         let off = ReactionParams { enabled: false, ..p };

@@ -80,6 +80,21 @@ impl Frames {
             Repr::Stock(keys) => keys.release(),
         }
     }
+    /// skate_vita: drops the decoded keys and the stock streams themselves (they are rebuilt from the bank on use);
+    /// returns the decoded bytes released. Whether anything was held is [`Self::is_warm`].
+    pub fn release_all(&self) -> usize {
+        match &self.0 {
+            Repr::Decoded(_) => 0,
+            Repr::Stock(keys) => keys.release_all(),
+        }
+    }
+    /// skate_vita: a stock clip whose streams are built (used since its last [`Self::release_all`]).
+    pub fn is_warm(&self) -> bool {
+        match &self.0 {
+            Repr::Decoded(_) => false,
+            Repr::Stock(keys) => keys.is_warm(),
+        }
+    }
     /// Every key, decoding the ones not yet used.
     pub fn to_vec(&self) -> Result<Vec<Vec<SampleWords>>, String> {
         (0..self.len())

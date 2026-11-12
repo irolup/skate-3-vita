@@ -65,6 +65,11 @@ impl RidingOutputs {
         //Original82C0D680 preserves query handles203C..2050. EndBoard
         //still consumes the batch submitted before this input-phase reset.
     }
+    /// Drop the started, unpublished wheel and probe batches (a tick that failed between start and publish).
+    pub(crate) fn abandon_queries(&mut self) {
+        self.pending_wheel_queries = None;
+        self.probes.abandon();
+    }
     pub fn load(
         data: &Collections,
         board: &BoardRuntime,

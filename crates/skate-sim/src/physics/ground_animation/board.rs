@@ -67,6 +67,20 @@ pub(super) fn advance(physics: &mut GamePhysics, skater: &mut SkaterRuntime) -> 
     );
     if skater.ground_animation.jump.active {
         let velocity = skater.ground_animation.jump.velocity;
+        // NPC_GROUND_JUMP (research b814): an NPC's launch speed against its body speed and the prepared jump velocity
+        // (Processed +704, which follows the body only while PrepareJump, 2468 bit 21, is set), so a slow take-off
+        // shows whether 82D93618 clamped it to a stale prepared velocity.
+        if crate::physics::log_actor() == "npc" {
+            let len = |a: [f32; 4]| (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt();
+            let current = p.vectors_400_416[0].map(f32::from_bits);
+            let prepared = p.prepared_jump_704.map(f32::from_bits);
+            let d = [current[0] - prepared[0], current[1] - prepared[1], current[2] - prepared[2], 0.0];
+            let cos = (current[0] * prepared[0] + current[1] * prepared[1] + current[2] * prepared[2]) / (len(current) * len(prepared)).max(1e-6);
+            tracing::info!(
+                "NPC_GROUND_JUMP launch_speed={:.2} body_speed={:.2} prepared_speed={:.2} angle_deg={:.0} diff_sq={:.2} prepare_jump_now={}",
+                len(velocity), len(current), len(prepared), cos.clamp(-1.0, 1.0).acos().to_degrees(), len(d) * len(d), p.flags_2468 & (1 << 21) != 0
+            );
+        }
         skater
             .ground_runtime
             .set_animated_velocity(&mut physics.board, velocity);

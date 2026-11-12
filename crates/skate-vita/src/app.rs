@@ -178,6 +178,7 @@ enum Action {
     Volume,
     DebugHud,
     Audio,
+    PropSounds,
     ManualMeter,
     TrickAnalyzer,
     MenuStyle,
@@ -335,6 +336,7 @@ pub fn run() -> ! {
         settings.retail_audio = true;
     }
     crate::audio::start(settings.retail_audio);
+    game_audio::set_prop_sounds(settings.prop_sounds);
     println!("renderer ready in {:.1} s", started.elapsed().as_secs_f32());
     crate::alloc::stage("renderer ready, audio started");
 
@@ -385,6 +387,8 @@ pub fn run() -> ! {
     let mut park_to_delete: Option<usize> = None;
     let park_writes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut save_tag_until: Option<Instant> = None;
+    // A park is being written (last frame's): the pad reads neutral for the game and the menus while the wheel spins.
+    let mut saving = false;
     let (mut catalog_instances, mut hidden_spans) = (Vec::new(), Vec::new());
     let mut dropper_frame: Option<skate_sim::object_dropper::world::DropperFrame> = None;
     // The traffic cars of the shown tick and what the scene draws.
@@ -614,7 +618,7 @@ pub fn run() -> ! {
                 let sample = input.poll();
                 let mut mapping = settings.controls;
                 (mapping.rear_touch_bumpers, mapping.front_touch_thumbs, mapping.dpad_bumpers) = (true, true, false);
-                let values = skate_core::input::xbox::convert(&input.xbox(&sample, &mapping), 0);
+                let values = if saving { [0.0; 24] } else { skate_core::input::xbox::convert(&input.xbox(&sample, &mapping), 0) };
                 let update = fe_menus.update(&values, frame_dt, &mut settings, &s.called_skaters);
                 changed |= update.settings_changed;
                 s.skater_calls.extend(update.skater_calls);
@@ -934,7 +938,9 @@ pub fn run() -> ! {
             if save_tag_until.is_some_and(|t| Instant::now() >= t) {
                 save_tag_until = None;
             }
-            fe_menus.set_saving(writing || save_tag_until.is_some());
+            saving = writing || save_tag_until.is_some();
+            fe_menus.set_saving(saving);
+            s.input_frozen = saving;
             // Retail teleporters (teleporters.rs): inside a volume the action overlay prompts, D-pad Up (not with LB, the
             // session marker's) asks to confirm, Yes moves the skater (here, or once its world has loaded).
             if !teleporters_loaded && crate::packs::UI.load(std::sync::atomic::Ordering::Relaxed) {
@@ -956,7 +962,7 @@ pub fn run() -> ! {
                 let input = fe_input.get_or_insert_with(vita::Input::new);
                 let sample = input.poll();
                 let x = input.xbox(&sample, &settings.controls);
-                let values = skate_core::input::xbox::convert(&x, 0);
+                let values = if saving { [0.0; 24] } else { skate_core::input::xbox::convert(&x, 0) };
                 use vita_platform::controls::xbox;
                 let up = x.buttons & !teleporter_buttons & xbox::DPAD_UP != 0 && x.buttons & xbox::LEFT_SHOULDER == 0;
                 teleporter_buttons = x.buttons;
@@ -1068,6 +1074,7 @@ pub fn run() -> ! {
                 }
                 crate::audio::FEED.lock().unwrap().params.volume = volume(&settings);
                 crate::audio::set_retail(settings.retail_audio);
+                game_audio::set_prop_sounds(settings.prop_sounds);
                 settings.save();
             }
             retail.frame(&mut apt, &mut s, screen == Screen::Playing);
@@ -2004,6 +2011,10 @@ fn handle_input(
                     toggle(&mut settings.retail_audio);
                     return true;
                 }
+                Action::PropSounds => {
+                    toggle(&mut settings.prop_sounds);
+                    return true;
+                }
                 Action::ManualMeter => {
                     toggle(&mut settings.manual_meter);
                     return true;
@@ -2178,6 +2189,7 @@ fn build_menu(screen: Screen, s: &Shared, settings: &Settings, world: usize) -> 
                 (Row::choice("Trick analyzer", on(settings.trick_analyzer)), Action::TrickAnalyzer),
                 (Row::choice("Manual meter", on(settings.manual_meter)), Action::ManualMeter),
                 (Row::choice("Audio", if settings.retail_audio { "Retail" } else { "Synth" }), Action::Audio),
+                (Row::choice("Prop sounds", on(settings.prop_sounds)), Action::PropSounds),
                 (Row::choice("Debug overlay", on(settings.debug_hud)), Action::DebugHud),
                 (Row::choice("Menu style", if settings.retail_menus { "Retail" } else { "Plain" }), Action::MenuStyle),
                 (Row::action("Back"), Action::Back),

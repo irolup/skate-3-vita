@@ -1,8 +1,5 @@
-//! Board path `82C05EC0` in the ground states' post-physics (`82D387A8`): the external (AI)
-//! physics record pulls the deck toward its target (`skate_core::riding::grounded::state::
-//! board_path`). Runs only while the record asks to steer (Processed `1776` bit 31); the player's
-//! record is never set, so the player's physics is unchanged. NPC skaters with a physics body
-//! (living world, simulated tier) set it.
+//! Board path 82C05EC0 in the ground post-physics (82D387A8), only while the AI record steers (Processed 1776 bit 31).
+//! Details: docs/hails-additions/26e-living-world-skater-ai.md#board-path-game-side
 
 use skate_core::math::{Basis3, Vector3};
 use skate_core::physics::board::BodyId;
@@ -63,6 +60,17 @@ pub(super) fn post_physics(physics: &mut super::GamePhysics, skater: &super::Ska
     let ground = Basis3 { columns: [[g[0][0], g[0][1], g[0][2]], [g[1][0], g[1][1], g[1][2]], [g[2][0], g[2][1], g[2][2]]] };
     let tuning = physics.settings.physics_ai;
     let mut services = Services { board: &mut physics.board, ground };
-    board_path::update_board_path(&SteerTarget::from_words(&record.vectors, record.flags), &tuning, &mut services);
+    let target = SteerTarget::from_words(&record.vectors, record.flags);
+    let before = services.deck_velocity();
+    board_path::update_board_path(&target, &tuning, &mut services);
+    // NPC_BOARD_PULL (research b817): the velocity pull against its target while the deck is well off it; the next
+    // line's `before` shows how much of the pull the board solve kept.
+    if target.flags & board_path::flags::VELOCITY != 0 && super::log_actor() == "npc" {
+        let len = |v: Vector3| (v.x * v.x + v.y * v.y + v.z * v.z).sqrt();
+        let (before, after, goal) = (len(before), len(services.deck_velocity()), len(target.velocity));
+        if (before - goal).abs() > 1.5 {
+            tracing::info!("NPC_BOARD_PULL flags {:08X} target {goal:.2} before {before:.2} after {after:.2} m/s", record.flags);
+        }
+    }
     true
 }

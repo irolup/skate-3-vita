@@ -182,6 +182,51 @@ fn valid_contact(mut c: SolidContact) -> Option<SolidContact> {
     Some(c)
 }
 
+/// Sweep a sphere against an immutable solid body set. Zero-radius lines use
+/// a 0.1 mm sphere, including inside-solid starts. No triangle sidedness.
+/// (Upstream `skate_dynamics::solid::sweep_sphere`, PR #52 `3d14a7bb`, the on-foot cars' line query.)
+pub fn sweep_sphere(bodies: &[SolidBody], start: [f32; 3], end: [f32; 3], radius: f32) -> Option<(u64, SolidContact)> {
+    let start = Vector::from_array(start);
+    let delta = Vector::from_array(end) - start;
+    if !start.is_finite() || !delta.is_finite() || !radius.is_finite() || radius < 0. { return None; }
+    let shape = SharedShape::ball(radius.max(0.0001));
+    let pose = Pose::from_translation(start);
+    let mut nearest: Option<(u64, SolidContact)> = None;
+    for body in bodies {
+        for collider in &body.colliders {
+            let options = query::ShapeCastOptions {
+                max_time_of_impact: 1., target_distance: 0., stop_at_penetration: true,
+                compute_impact_geometry_on_penetration: true,
+            };
+            let Ok(Some(hit)) = query::cast_shapes(&pose, delta, &*shape, &collider.pose, Vector::ZERO, &*collider.shape, options) else { continue };
+            let normal = collider.pose.rotation * hit.normal2;
+            let point_b = collider.pose * hit.witness2;
+            let Some(c) = valid_contact(SolidContact {
+                point_a: start + delta * hit.time_of_impact - normal * radius,
+                point_b, normal, distance: 0., time_of_impact: hit.time_of_impact,
+            }) else { continue };
+            if nearest.as_ref().is_none_or(|(_, old)| c.time_of_impact < old.time_of_impact) {
+                nearest = Some((body.id, c));
+            }
+        }
+    }
+    nearest
+}
+
+/// Exact collider surface triangulation for diagnostics/query normal refinement.
+/// It does not feed the rigid-body narrow phase and never substitutes an AABB.
+pub fn collider_triangles(collider: &SolidCollider) -> Vec<[[f32; 3]; 3]> {
+    use rapier3d::parry::shape::TypedShape;
+    let (vertices, indices) = match collider.shape.as_typed_shape() {
+        TypedShape::Cuboid(s) => s.to_trimesh(),
+        TypedShape::Ball(s) => s.to_trimesh(20, 12),
+        TypedShape::Capsule(s) => s.to_trimesh(20, 12),
+        TypedShape::ConvexPolyhedron(s) => s.to_trimesh(),
+        _ => return Vec::new(),
+    };
+    indices.into_iter().map(|triangle| triangle.map(|i| (collider.pose * vertices[i as usize]).to_array())).collect()
+}
+
 #[cfg(test)]
 mod sweep_bench {
     use super::rapier3d::prelude::{Pose, Rotation, SharedShape, Vector};

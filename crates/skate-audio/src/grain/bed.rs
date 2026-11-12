@@ -52,7 +52,6 @@ pub struct ChainValues {
     /// Graph-2 environment send: level(13)/32767.
     pub env_send: f32,
     /// Graph-2 first send (→ FlangeSub return A): level(21)/32767 (A) or level(22)/32767 (B).
-    /// Kept, not rendered.
     pub flange_send: f32,
 }
 
@@ -88,7 +87,8 @@ struct Chain {
     shelf: HighShelfIir2,
     from_graph1: Level,
     from_graph3: Level,
-    /// Graph 2's env Send.
+    /// Graph 2's FlangeSub Send (Sen0 #1) and env Send (Sen0 #2).
+    flange: Level,
     env: Level,
 }
 
@@ -108,6 +108,7 @@ impl Chain {
             shelf: HighShelfIir2::new(96_000.0, 1.0),
             from_graph1: Level::new(1.0),
             from_graph3: Level::new(1.0),
+            flange: Level::new(0.0),
             env: Level::new(0.0),
         }
     }
@@ -128,10 +129,11 @@ impl Chain {
         }
     }
 
-    /// The full chain (graphs 1, 3, 2); the env send adds into `env` (mono, × `user`). Returns
-    /// whether the env send contributed. `graph3`: graph 3 exists (`sub_824C8878` builds it for the
+    /// The full chain (graphs 1, 3, 2); the FlangeSub and env sends add into `flange` / `env` (mono,
+    /// × `user`). Returns whether each send contributed (flange, env). `graph3`: graph 3 exists (`sub_824C8878` builds it for the
     /// local player only); without it graph 1's send to it and its return are absent.
-    fn process_full(&mut self, out: &mut [[f32; BLOCK]; 6], env: &mut [f32; BLOCK], tuning: &ChainTuning, user: f32, graph3: bool) -> bool {
+    fn process_full(&mut self, out: &mut [[f32; BLOCK]; 6], sends: (&mut [f32; BLOCK], &mut [f32; BLOCK]), tuning: &ChainTuning, user: f32, graph3: bool) -> (bool, bool) {
+        let (flange, env) = sends;
         let rate = crate::MIX_RATE as f32;
         let v = self.values;
         let mut mono = self.bus[0];
@@ -161,17 +163,22 @@ impl Chain {
             self.shelf.process(&mut [&mut g3[..]], rate);
             self.from_graph3.add(&g3, &mut g2);
         }
-        // Graph 2: the FlangeSub send has no bus here; the env send is mono, before the panner.
+        // Graph 2: both sends are mono, before the panner.
+        self.flange.target = v.flange_send * user;
+        let to_flange = !self.flange.silent();
+        if to_flange {
+            self.flange.add(&g2, flange);
+        }
         self.env.target = v.env_send * user;
-        let sends = !self.env.silent();
-        if sends {
+        let to_env = !self.env.silent();
+        if to_env {
             self.env.add(&g2, env);
         }
         self.pan_and_send(&g2, out);
         for ch in &mut self.bus {
             *ch = [0.0; BLOCK];
         }
-        sends
+        (to_flange, to_env)
     }
 
     fn pan_and_send(&mut self, mono: &[f32; BLOCK], out: &mut [[f32; BLOCK]; 6]) {
@@ -221,8 +228,10 @@ pub struct GrainBed {
     /// (`sub_824C8878` builds it only for the local player). An NPC skater's bed (instance 1,
     /// [`crate::runtime::Runtime::npc_grains`]) has graphs 1 and 2 only.
     pub local: bool,
-    /// This block's dry 6-channel mix (before [`GrainBed::gain`]) and the chains' env sends.
+    /// This block's dry 6-channel mix (before [`GrainBed::gain`]) and the chains' FlangeSub and env sends.
     mix: Box<[[f32; BLOCK]; 6]>,
+    flange: Box<[f32; BLOCK]>,
+    flange_active: bool,
     env: Box<[f32; BLOCK]>,
     env_active: bool,
 }
@@ -250,6 +259,8 @@ impl GrainBed {
             chain_tuning: ChainTuning::default(),
             local: true,
             mix: Box::new([[0.0; BLOCK]; 6]),
+            flange: Box::new([0.0; BLOCK]),
+            flange_active: false,
             env: Box::new([0.0; BLOCK]),
             env_active: false,
         }
@@ -329,6 +340,7 @@ impl GrainBed {
     /// sends reach this block's environment network.
     pub fn render_block(&mut self) -> bool {
         self.env_active = false;
+        self.flange_active = false;
         let pending = self.trucks.iter().flat_map(|t| &t.players).chain([&self.rocket]).any(GrainPlayer::pending);
         let idle = self.voices() == 0 && !pending && self.fold.iter().all(|&f| f == 0.0);
         if idle {
@@ -339,6 +351,7 @@ impl GrainBed {
         fold_release(mix, &self.fold);
         self.fold = [0.0; 6];
         if self.chain_extras {
+            self.flange.fill(0.0);
             self.env.fill(0.0);
         }
         for t in &mut self.trucks {
@@ -348,7 +361,9 @@ impl GrainBed {
                 if self.chain_extras && !t.built {
                     c.bus = [[0.0; BLOCK]; 6];
                 } else if self.chain_extras {
-                    self.env_active |= c.process_full(mix, &mut self.env, &self.chain_tuning, self.gain, self.local);
+                    let (flange, env) = c.process_full(mix, (&mut self.flange, &mut self.env), &self.chain_tuning, self.gain, self.local);
+                    self.flange_active |= flange;
+                    self.env_active |= env;
                 } else {
                     c.process(mix);
                 }
@@ -376,6 +391,12 @@ impl GrainBed {
     /// user gain), or None when no chain sends.
     pub fn env_send(&self) -> Option<&[f32; BLOCK]> {
         self.env_active.then_some(&*self.env)
+    }
+
+    /// The last block's mono input to FlangeSub return A (graph 2's first sends, already × the
+    /// user gain), or None when no chain sends.
+    pub fn flange_send(&self) -> Option<&[f32; BLOCK]> {
+        self.flange_active.then_some(&*self.flange)
     }
 }
 
@@ -482,6 +503,36 @@ mod tests {
         // The env tap is the pre-pan mono × 0.5: half the centre-panned dry signal, sample for sample.
         for (k, (&e, &d)) in env.iter().zip(&dry).enumerate().skip(BLOCK) {
             assert!((e - 0.5 * d).abs() <= 1e-6 * d.abs().max(1e-3), "{k}: {e} vs {d}");
+        }
+    }
+
+    /// Graph 2's first Send (Sen0 #1, FlangeSub return A) taps the same pre-pan mono as the env
+    /// Send, at its own level (spec `aems-grain-chain-spec.md` §1, §4).
+    #[test]
+    fn the_flange_send_is_mono_before_the_pan_and_apart_from_the_env_send() {
+        let a = GrainParams { attack: 0.1, sustain: 0.2, release: 0.1, window: 1.6, drift: 0.05 };
+        let rec = [Record { gain: 0.5, pitch: 1.0, position: 0.3 }, Record { gain: 0.0, pitch: 1.0, position: 0.2 }];
+        let run = |values: ChainValues| {
+            let mut bed = GrainBed::new();
+            bed.bind_truck(0, source(), [a, a], rec);
+            bed.set_chains(0, [values, ChainValues::default()]);
+            let (mut centre, mut flange, mut env) = (Vec::new(), Vec::new(), Vec::new());
+            for _ in 0..200 {
+                let mut out = [[0.0f32; BLOCK]; 6];
+                bed.render(&mut out);
+                centre.extend_from_slice(&out[1]);
+                flange.extend_from_slice(bed.flange_send().map_or(&[0.0; BLOCK], |e| e));
+                env.extend_from_slice(bed.env_send().map_or(&[0.0; BLOCK], |e| e));
+            }
+            (centre, flange, env)
+        };
+        let (dry, none, _) = run(ChainValues::default());
+        assert!(none.iter().all(|&v| v == 0.0), "level 0: no flange input");
+        let (_, flange, env) = run(ChainValues { flange_send: 0.25, pan_degrees: -90.0, ..ChainValues::default() });
+        assert!(env.iter().all(|&v| v == 0.0), "the env send keeps its own level 0");
+        assert!(flange.iter().any(|&v| v != 0.0));
+        for (k, (&f, &d)) in flange.iter().zip(&dry).enumerate().skip(BLOCK) {
+            assert!((f - 0.25 * d).abs() <= 1e-6 * d.abs().max(1e-3), "{k}: {f} vs {d}");
         }
     }
 

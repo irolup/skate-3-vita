@@ -603,9 +603,27 @@ pub fn gap_choice(gaps: &[[f32; 2]], me: &AvoidSelf, target: Option<&PathPoint>)
 
 /// `sub_82464E30` -> `sub_82454798`: the path point moved `lateral` path widths across the path
 /// (the left width for negative values, the right one otherwise).
+/// A zero width shifts `lateral` metres on the unit side, like retail.
 pub fn steer_point(p: &PathPoint, lateral: f32) -> Vec3 {
     let w = if lateral < 0.0 { p.width_left } else { p.width_right };
-    add(p.point, scale(right_of(p.direction), lateral * w))
+    add(p.point, scale(right_of(p.direction), lateral * if w > 0.0 { w } else { 1.0 }))
+}
+
+fn before(a: &PathPoint, b: &PathPoint) -> bool {
+    a.node < b.node || (a.node == b.node && a.t < b.t)
+}
+
+/// `sub_82464E30`: the ground steer's far aim moved into the gap. Before the obstacle's path point the far point
+/// shifts by `lateral`; past it the anchor is the obstacle's point (or `near` once that is past it too). Widths 0.
+pub fn avoid_aim(far: &PathPoint, near: &PathPoint, target: &PathPoint, lateral: f32) -> PathPoint {
+    let anchor = if before(far, target) {
+        far
+    } else if before(near, target) {
+        target
+    } else {
+        near
+    };
+    PathPoint { point: steer_point(anchor, lateral), width_left: 0.0, width_right: 0.0, ..*anchor }
 }
 
 /// `sub_82465578`.

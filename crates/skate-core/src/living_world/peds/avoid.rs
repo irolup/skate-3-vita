@@ -23,6 +23,8 @@ pub struct AvoidRules {
     pub sector_half_angle: f32,
     /// How often a ped tests the movers, s (the recomp re-tests about every 1/3 s; ours: the ped's own phase).
     pub period: f32,
+    /// Standing / walking peds dodge too (retail: every ped with SkaterAvoidance, b683); a mod may keep it seated only.
+    pub standing: bool,
 }
 
 impl AvoidRules {
@@ -35,6 +37,7 @@ impl AvoidRules {
         jump_speed: 5.0,
         sector_half_angle: 0.523_6,
         period: 1.0 / 3.0,
+        standing: true,
     };
 }
 
@@ -155,6 +158,8 @@ pub struct SeatedAvoid {
 }
 
 pub const SIT_AVOID_SPEECH: i32 = 4;
+/// AvoidComplete's PedestrianWandering value.
+pub const AVOID_COMPLETE_SPEECH: i32 = 1;
 
 /// The seated clips, for the anim set's logical names.
 pub const SEATED_CLIPS: [&str; 6] = ["SitAvoidFwd", "SitAvoidLeft", "SitAvoidBack", "SitAvoidSmallFront", "SitAvoidSmallLeft", "SitAvoidSmallBack"];
@@ -175,11 +180,79 @@ pub fn seated(kind: AvoidKind, dir: AvoidDir) -> SeatedAvoid {
     }
 }
 
+/// What a standing / walking ped plays for a decision (`motiongraph_avoid.xml` Jump / Step, template `avoid.xml`:
+/// blend 0.1, out at `WillExpire 0.01`; research b683) [data].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StandingAvoid {
+    pub kind: AvoidKind,
+    pub clip: &'static str,
+    pub mirror: bool,
+    /// PedestrianAvoidJump on entering Jump.
+    pub speech: Option<i32>,
+}
+
+impl StandingAvoid {
+    /// A Step waits for the locomotion clip's branch window (`WaitForBranch`); a Jump starts at once.
+    pub fn waits_for_branch(&self) -> bool {
+        self.kind == AvoidKind::Step
+    }
+}
+
+/// The standing clips, for the anim set's logical names.
+pub const STANDING_CLIPS: [&str; 6] = ["AvoidJumpForward", "AvoidJumpLeft", "AvoidJumpBack", "AvoidStepForward", "AvoidStepLeft", "AvoidStepBack"];
+
+pub fn standing(kind: AvoidKind, dir: AvoidDir) -> StandingAvoid {
+    let (clip, mirror) = match (kind, dir) {
+        (AvoidKind::Jump, AvoidDir::Forward) => ("AvoidJumpForward", false),
+        (AvoidKind::Jump, AvoidDir::Left) => ("AvoidJumpLeft", false),
+        (AvoidKind::Jump, AvoidDir::Right) => ("AvoidJumpLeft", true),
+        (AvoidKind::Jump, AvoidDir::Back) => ("AvoidJumpBack", false),
+        (AvoidKind::Step, AvoidDir::Forward) => ("AvoidStepForward", false),
+        (AvoidKind::Step, AvoidDir::Left) => ("AvoidStepLeft", false),
+        (AvoidKind::Step, AvoidDir::Right) => ("AvoidStepLeft", true),
+        (AvoidKind::Step, AvoidDir::Back) => ("AvoidStepBack", false),
+    };
+    StandingAvoid { kind, clip, mirror, speech: (kind == AvoidKind::Jump).then_some(SIT_AVOID_SPEECH) }
+}
+
+/// The graph's `Avoid` transitions leave from Walk and Idle (and their start / stop / turn sub-states), Converse,
+/// Shuffle and Strafe; not from ChaseRun (a running ped does not dodge) or a collision / plugin clip [data].
+pub fn may_dodge(state: super::anim::Locomotion) -> bool {
+    use super::anim::Locomotion::*;
+    matches!(state, Idle | Start | Walk | Stop | TurnLeft | TurnRight | WalkTurnLeft | WalkTurnRight | ShuffleStart | Shuffle | ShuffleTurnLeft | ShuffleTurnRight | StrafeIdle | StrafeMove)
+}
+
+/// A pending Step gives way to a Jump; a pending Jump blocks every new decision (b683 2.4) [code + trace].
+pub fn replaces(pending: Option<StandingAvoid>, next: AvoidKind) -> bool {
+    match pending {
+        None => true,
+        Some(p) => p.kind == AvoidKind::Step && next == AvoidKind::Jump,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const R: AvoidRules = AvoidRules::RETAIL;
+
+    /// `motiongraph_avoid.xml` Jump / Step from Walk / Idle (b683): Right is Left mirrored, only a Jump speaks, a Step
+    /// waits for the branch window, a running ped never dodges, a pending Step gives way to a Jump only.
+    #[test]
+    fn a_standing_ped_jumps_or_steps_from_walk_and_idle_only() {
+        use super::super::anim::Locomotion;
+        let right = standing(AvoidKind::Jump, AvoidDir::Right);
+        assert_eq!((right.clip, right.mirror, right.speech, right.waits_for_branch()), ("AvoidJumpLeft", true, Some(4), false));
+        let step = standing(AvoidKind::Step, AvoidDir::Back);
+        assert_eq!((step.clip, step.mirror, step.speech, step.waits_for_branch()), ("AvoidStepBack", false, None, true));
+        assert!(may_dodge(Locomotion::Walk) && may_dodge(Locomotion::Idle) && may_dodge(Locomotion::WalkTurnLeft));
+        assert!(!may_dodge(Locomotion::Run) && !may_dodge(Locomotion::Reaction));
+        assert!(replaces(None, AvoidKind::Step) && replaces(Some(step), AvoidKind::Jump));
+        assert!(!replaces(Some(step), AvoidKind::Step) && !replaces(Some(right), AvoidKind::Jump));
+        // A skater straight at a walking ped from 4 m at 8 m/s, 0.3 m off its line: a Jump.
+        let d = decide([0.0, 0.0, 0.0], [0.0, 1.0], [-4.0, 0.0, 0.3], [8.0, 0.0, 0.0], &R).unwrap();
+        assert_eq!(d.kind, AvoidKind::Jump);
+    }
 
     #[test]
     fn the_traced_step_and_jump() {

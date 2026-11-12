@@ -1,15 +1,5 @@
-//! Readers for the living-world export the population core needs (setup group `livingworld`,
-//! formats in `docs/hails-additions/living-world/{peds-data,skaters-data}.md`). Bytes in, core
-//! types out; no file I/O.
-//!
-//! - `<District>.census.bin` → [`CensusGrid`] (`tools/asset_pipeline/living_world.py`,
-//!   `write_census_grid`);
-//! - `tables.json` → [`LivingWorldTables`]: `livingworld_census` records resolved through their
-//!   category group, and the `livingworld_census_ranges` circles;
-//! - `skater_profiles.json` → [`SkaterCharacter`]s of the free-roam pool and the AI profiles'
-//!   trick tables ([`skater_trick_profiles`]);
-//! - decoded AIPATH lines (`aipath`) → [`SkaterLine`]s (population) and [`ReplayLine`]s (the
-//!   replay-tier cursor, milestone 3).
+//! Readers for the living-world export the population core needs (census grid, tables, profiles, lines).
+//! Formats: docs/hails-additions/living-world/peds-data.md, skaters-data.md; list: docs/hails-additions/26b-living-world-population.md#living-world-readers
 
 use crate::aipath::AiPath;
 use serde_json::Value;
@@ -182,10 +172,14 @@ pub fn skater_characters(json: &[u8], bound: &[&str]) -> Result<Vec<SkaterCharac
         if c["needs"].as_str() == Some("recruited_save_slot") && !bound.contains(&key) {
             continue;
         }
+        // The runtime AI profile's line capability bytes +0x31 / +0x30 / +0x32 (`sub_8245FFD8`, b675), against line
+        // flag bits 0 / 1 / 2; a missing field reads false.
+        let fields = &doc["ai_skater_profiles"][c["aiprofile"].as_str().unwrap_or(key)]["fields"];
+        let capability = |h: &str| fields[h].as_bool().unwrap_or(false);
         out.push(SkaterCharacter {
             key: key.to_string(),
             pro_index: c["pro_index"].as_u64().map(|p| p as u32),
-            capabilities: [false; 3],
+            capabilities: [capability("Hash_E01079D1A094B0C0"), capability("Hash_AACEBDA7CA734319"), capability("Hash_C36E34B4C619E868")],
             community: c["community"].as_bool().unwrap_or(false),
         });
     }

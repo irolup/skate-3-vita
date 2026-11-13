@@ -293,4 +293,39 @@ mod tests {
         assert!(rails(&physics).is_empty());
         assert!(physics.prop_dynamics().unwrap().pose(body).is_none());
     }
+
+    /// A piece dropped in the world is under the board's deck probe too (owner, device: at speed the board went through
+    /// the mega ramps and quarter pipes placed with the dropper): the probe saw only the map's ground far below.
+    /// Data-gated like the test above.
+    #[test]
+    #[ignore = "needs the private install data and a baked catalogue"]
+    fn the_deck_probe_sees_a_dropped_ramp() {
+        use skate_core::math::{Basis3, Vector3};
+        use skate_core::physics::drive_frames::RetailAffineTransform;
+        let assets = std::path::PathBuf::from(std::env::var_os("SKATE3_ASSET_ROOT").expect("SKATE3_ASSET_ROOT"));
+        let pak = std::path::PathBuf::from(std::env::var_os("SKATE3_CATALOG_PAK").expect("SKATE3_CATALOG_PAK"));
+        mount_catalog(&pak, &assets);
+        let mut map = skate_data::skate_map::SkateMap::load(&assets.join("../maps/DownTownSkatePark.skate")).unwrap();
+        map.extensions.push(crate::park_bake::bake(&assets, "Downtown_Fullpark").unwrap().0);
+        let mut physics = GamePhysics::load_with_difficulty(&assets, Some(&map), crate::difficulty::Difficulty::parse("Normal").unwrap()).unwrap();
+        // The quarter pipe terrain piece, high over the park's ground at a spot far from its own pieces.
+        let terrain = load_item(&assets, false, "2C70170300030297").unwrap();
+        let pose = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 400.0, 60.0, 400.0];
+        assert!(physics.drop_item(0x6000_0001, &terrain, &pose));
+        let layer = physics.prop_layer.as_ref().unwrap();
+        let range = match physics.dropped[&0x6000_0001] { Dropped::Terrain { instance, .. } => layer.instances()[instance].range.clone(), _ => panic!() };
+        let top = layer.world().triangles()[range].iter().flat_map(|t| t.triangle.vertices).fold(Vector3::new(0.0, f32::MIN, 0.0), |a, v| if v.y > a.y { v } else { a });
+        // The board straight above the highest point of the piece.
+        let board = RetailAffineTransform {
+            basis: Basis3 { columns: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]] },
+            translation: Vector3::new(top.x, top.y + 1.0, top.z),
+        };
+        physics.board.set_transform(board);
+        let props = physics.prop_layer.as_ref().map(crate::skate_world::PropCollisionLayer::world);
+        physics.riding.start_wheel_queries(&physics.board, &physics.world, props).unwrap();
+        physics.riding.finish_wheel_queries().unwrap();
+        let deck = physics.riding.probes.deck;
+        assert!(deck.hit, "the deck probe finds the dropped piece");
+        assert!((deck.point.y - top.y).abs() < 0.5, "it is the piece ({}), not the ground below ({})", top.y, deck.point.y);
+    }
 }

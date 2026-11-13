@@ -302,7 +302,7 @@ pub fn run() -> ! {
     let mut cac_pending: Option<(skate_core::skater_record::SkaterRecord, skate_core::cac::LookChange)> = None;
     let mut cac_built = Instant::now();
     let loaded = match look {
-        Some((look, record, builder)) => {
+        Some((look, record, builder, npc_looks)) => {
             match builder.screen_data(&crate::cas_look::read) {
                 Ok(data) => cac_data = Some(std::sync::Arc::new(data)),
                 Err(e) => println!("CAC screen data not loaded: {e}; Back Alley Pete's stays shut"),
@@ -313,6 +313,8 @@ pub fn run() -> ! {
             look_builder = Some(builder);
             scene.load_look(&look.skater, &look.uv1, &look.opacity, &look.lighting, &look.decals);
             scene.set_decal_rows(skate_core::cac::decal_rows_of(&record));
+            // The NPC skaters' looks (the disc's saved characters), so they do not wear the player's.
+            scene.load_npc_looks(&npc_looks);
             let mut s = shared.lock().unwrap();
             s.skater_profile = Some(crate::skaters::sim_profile(&record));
             s.skater_profile_new = true;
@@ -402,7 +404,7 @@ pub fn run() -> ! {
     // A world load was showing last frame (the retail loading screen starts on a load's first frame only).
     let mut was_loading = false;
     let (mut called_serials, mut trail_instances, mut trail_dt) = (Vec::<u32>::new(), Vec::<vita_render::scene::TrailInstance>::new(), 0.0);
-    let mut npc_palettes: Vec<(Vec<Mat4>, f32, Vec3)> = Vec::new();
+    let mut npc_palettes: Vec<(Vec<Mat4>, f32, Vec3, Option<u8>)> = Vec::new();
     // The peds of the shown tick, each model's binding to the ped rig, their palettes.
     let mut ped_poses: Vec<skate_sim::PedPose> = Vec::new();
     let mut ped_bindings: Vec<Option<skin::PedBinding>> = Vec::new();
@@ -1268,6 +1270,7 @@ pub fn run() -> ! {
                         Some(d) => {
                             d.serial = n.serial;
                             d.alpha = n.alpha;
+                            d.look = n.look;
                             lab::copy_snapshot(&mut d.previous, &n.previous);
                             lab::copy_snapshot(&mut d.current, &n.current);
                         }
@@ -1583,17 +1586,20 @@ pub fn run() -> ! {
             if let (Some(alpha), Some(binding)) = (view, binding.as_mut()) {
                 for (i, n) in npc_poses.iter().enumerate() {
                     if npc_palettes.len() <= i {
-                        npc_palettes.push((Vec::new(), 1.0, Vec3::ZERO));
+                        npc_palettes.push((Vec::new(), 1.0, Vec3::ZERO, None));
                     }
                     let slot = &mut npc_palettes[i];
                     binding.palette(&n.previous, &n.current, alpha, &mut slot.0);
                     slot.1 = n.alpha;
                     slot.2 = n.previous.root.translation.lerp(n.current.root.translation, alpha);
+                    // Its look among the NPC looks (none loaded: the player's mesh, as before).
+                    let looks = scene.npc_looks();
+                    slot.3 = (looks > 0).then(|| (n.look % looks as u32) as u8);
                 }
             } else {
                 npc_palettes.clear();
             }
-            let npcs: Vec<vita_render::scene::SkinInstance> = npc_palettes.iter().map(|(p, a, c)| vita_render::scene::SkinInstance { palette: p, alpha: *a, center: *c }).collect();
+            let npcs: Vec<vita_render::scene::SkinInstance> = npc_palettes.iter().map(|(p, a, c, l)| vita_render::scene::SkinInstance { palette: p, alpha: *a, center: *c, look: *l }).collect();
             // Each ped's palette from its model's binding and its two step poses.
             ped_palettes.resize_with(ped_poses.len(), Vec::new);
             let mut peds: Vec<vita_render::scene::PedInstance> = Vec::with_capacity(ped_poses.len());

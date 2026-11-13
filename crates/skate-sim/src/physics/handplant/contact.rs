@@ -13,6 +13,11 @@ pub(super) struct Candidate {
     pub side: i32,
 }
 
+/// The box about the centre of mass the broadphase keeps edges from (82C1EAD8).
+pub(super) const REACH: [f32; 3] = [2.0, 4.0, 2.0];
+
+/// `nearby`: the indices into `edges` of every primitive whose bounds reach into the box [`REACH`] about `com`, in
+/// world order (a superset is fine; `StaticProvider::near`). Each is tested here as the scan over all of them was.
 pub(super) fn select(
     settings: &Settings,
     com: V,
@@ -20,6 +25,7 @@ pub(super) fn select(
     normal: V,
     hint: i32,
     edges: &[Primitive],
+    nearby: &dyn Fn() -> Vec<usize>,
 ) -> Option<Candidate> {
     //82D61D88: ascending, above minimum speed, slope over45deg and |Ny|<=.95.
     if !(length(velocity) > settings.minimum_speed
@@ -82,11 +88,12 @@ pub(super) fn select(
     };
     //82C1EAD8 preserves world order and caps the broadphase result at40.
     let mut candidates = Vec::new();
-    for edge in edges
-        .iter()
+    for edge in nearby()
+        .into_iter()
+        .map(|i| &edges[i])
         .filter(|e| {
             (0..3).all(|i| {
-                let extent = [2.0, 4.0, 2.0][i];
+                let extent = REACH[i];
                 e.start[i].min(e.end[i]) <= com[i] + extent
                     && e.start[i].max(e.end[i]) >= com[i] - extent
             })

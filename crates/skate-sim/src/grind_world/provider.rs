@@ -39,6 +39,49 @@ pub(crate) struct StaticProvider {
     source_rail_indices: Vec<u64>,
     /// skate_vita: each park piece's asset (`with_pieces`), for the Object Dropper's re-pose.
     piece_assets: Vec<(u32, usize)>,
+    /// skate_vita: the primitives by [`CELL`] m square on the ground plane ([`Self::near`]), built on first use and
+    /// dropped when the primitives change.
+    cells: std::sync::OnceLock<HashMap<(i32, i32), Vec<u32>>>,
+}
+
+/// The side of a [`StaticProvider::near`] cell, metres.
+const CELL: f32 = 8.0;
+
+impl StaticProvider {
+    fn cell(v: f32) -> i32 {
+        (v / CELL).floor() as i32
+    }
+
+    /// The primitives whose bounds reach into the box `min`..`max` on the ground plane (x and z; a superset, each
+    /// index once, in world order), for a search that then tests each one. The handplant candidate search
+    /// (`physics::handplant::contact::select`) ran over every primitive on each tick the grab was held: DownTown's
+    /// collision window carries about 29,000, a megabyte read each tick on the device.
+    pub(crate) fn near(&self, min: [f32; 3], max: [f32; 3]) -> Vec<usize> {
+        let cells = self.cells.get_or_init(|| {
+            let mut cells: HashMap<(i32, i32), Vec<u32>> = HashMap::new();
+            for (i, p) in self.primitives.iter().enumerate() {
+                let (x0, x1) = (Self::cell(p.start[0].min(p.end[0])), Self::cell(p.start[0].max(p.end[0])));
+                let (z0, z1) = (Self::cell(p.start[2].min(p.end[2])), Self::cell(p.start[2].max(p.end[2])));
+                for x in x0..=x1 {
+                    for z in z0..=z1 {
+                        cells.entry((x, z)).or_default().push(i as u32);
+                    }
+                }
+            }
+            cells
+        });
+        let mut out: Vec<usize> = Vec::new();
+        for x in Self::cell(min[0])..=Self::cell(max[0]) {
+            for z in Self::cell(min[2])..=Self::cell(max[2]) {
+                if let Some(c) = cells.get(&(x, z)) {
+                    out.extend(c.iter().map(|&i| i as usize));
+                }
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
 }
 
 impl StaticProvider {
@@ -46,10 +89,10 @@ impl StaticProvider {
     /// Missing provenance is an explicit conversion prerequisite, not a ray miss.
     pub fn new(map: Option<&SkateMap>) -> Result<Self, String> {
         let Some(map) = map else {
-            return Ok(Self { primitives: vec![], metadata: vec![], #[cfg(test)] rail_guids: vec![], assets: vec![], #[cfg(test)] source_for_primitive: vec![], #[cfg(test)] source_rail_indices: vec![], piece_assets: vec![] });
+            return Ok(Self { primitives: vec![], metadata: vec![], #[cfg(test)] rail_guids: vec![], assets: vec![], #[cfg(test)] source_for_primitive: vec![], #[cfg(test)] source_rail_indices: vec![], piece_assets: vec![], cells: Default::default() });
         };
         if map.rails.is_empty() {
-            return Ok(Self { primitives: vec![], metadata: vec![], #[cfg(test)] rail_guids: vec![], assets: vec![], #[cfg(test)] source_for_primitive: vec![], #[cfg(test)] source_rail_indices: vec![], piece_assets: vec![] });
+            return Ok(Self { primitives: vec![], metadata: vec![], #[cfg(test)] rail_guids: vec![], assets: vec![], #[cfg(test)] source_for_primitive: vec![], #[cfg(test)] source_rail_indices: vec![], piece_assets: vec![], cells: Default::default() });
         }
         if map.rails.iter().all(|rail| rail.native.is_none()) { return Self::authored(&map.rails); }
         let mut metadata = map.extensions.iter().filter(|e| e.tag == *b"WMET");
@@ -122,7 +165,7 @@ impl StaticProvider {
             let tree = Octree::new(bounds, indices.iter().map(|&i| spatial_bounds[i]).collect())?;
             Ok(Asset { #[cfg(test)] source: _source, bounds, indices, tree })
         }).collect::<Result<_, String>>()?;
-        Ok(Self { primitives, metadata, #[cfg(test)] rail_guids, assets, #[cfg(test)] source_for_primitive, #[cfg(test)] source_rail_indices, piece_assets: Vec::new() })
+        Ok(Self { primitives, metadata, #[cfg(test)] rail_guids, assets, #[cfg(test)] source_for_primitive, #[cfg(test)] source_rail_indices, piece_assets: Vec::new(), cells: Default::default() })
     }
 
     /// Explicit host-authored polylines have no retail source section identity.
@@ -150,7 +193,7 @@ impl StaticProvider {
         } else { vec![] };
         #[cfg(test)]
         let source_rail_indices = primitives.iter().map(|p| p.owner - 1).collect();
-        Ok(Self { #[cfg(test)] source_for_primitive: vec![0; primitives.len()], primitives, metadata, #[cfg(test)] rail_guids, assets, #[cfg(test)] source_rail_indices, piece_assets: Vec::new() })
+        Ok(Self { #[cfg(test)] source_for_primitive: vec![0; primitives.len()], primitives, metadata, #[cfg(test)] rail_guids, assets, #[cfg(test)] source_rail_indices, piece_assets: Vec::new(), cells: Default::default() })
     }
 
     /// The placed skate.Park pieces' rails (crate::park_layout::pose_rails), one asset per piece after the map's
@@ -158,6 +201,7 @@ impl StaticProvider {
     /// (b431: 82858290 -> 82868860 -> 82C1F098, piece AABB first, then each segment's posed bounds); here they join
     /// the static pass, so under the 40-record cap they come before the props (NOT RETAIL order; parks have few props).
     pub fn with_pieces(mut self, pieces: &[crate::park_layout::PieceRails]) -> Result<Self, String> {
+        self.cells = Default::default();
         for piece in pieces.iter().filter(|p| !p.segments.is_empty()) {
             let first = self.primitives.len();
             let bounds: Vec<Bounds> = piece.segments.iter().map(|(_, _, [min, max])| Bounds { min: *min, max: *max }).collect();
@@ -192,6 +236,7 @@ impl StaticProvider {
         if indices.len() != segments.len() {
             return Ok(false);
         }
+        self.cells = Default::default();
         for (&i, (primitive, metadata, _)) in indices.iter().zip(segments) {
             self.primitives[i] = *primitive;
             self.metadata[i] = *metadata;
@@ -352,4 +397,39 @@ fn parse_id(value: &Value, key: &str) -> Result<u64, String> {
     let value = string(value, key)?;
     u64::from_str_radix(value.strip_prefix("0x").unwrap_or(&value), 16)
         .map_err(|_| format!("Invalid WMET {key}"))
+}
+
+#[cfg(test)]
+mod near_tests {
+    use super::*;
+
+    /// `near` returns a superset, in world order and once each, of the primitives whose box reaches the query's.
+    #[test]
+    fn near_finds_every_primitive_in_reach_in_world_order() {
+        let mut provider = StaticProvider::new(None).unwrap();
+        let mut state = 12345u32;
+        let mut next = move || {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            (state >> 8) as f32 / (1u32 << 24) as f32
+        };
+        for i in 0..3000u64 {
+            let (x, y, z) = (next() * 400.0 - 200.0, next() * 20.0, next() * 400.0 - 200.0);
+            let (dx, dy, dz) = (next() * 30.0 - 15.0, next() * 5.0, next() * 30.0 - 15.0);
+            provider.primitives.push(Primitive { start: [x, y, z, 0.0], end: [x + dx, y + dy, z + dz, 0.0], owner: i + 1 });
+        }
+        for _ in 0..200 {
+            let c = [next() * 400.0 - 200.0, next() * 20.0, next() * 400.0 - 200.0];
+            let (min, max) = ([c[0] - 2.0, c[1] - 4.0, c[2] - 2.0], [c[0] + 2.0, c[1] + 4.0, c[2] + 2.0]);
+            let brute: Vec<usize> = provider
+                .primitives
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| (0..3).all(|i| e.start[i].min(e.end[i]) <= max[i] && e.start[i].max(e.end[i]) >= min[i]))
+                .map(|(i, _)| i)
+                .collect();
+            let near = provider.near(min, max);
+            assert!(near.windows(2).all(|w| w[0] < w[1]), "world order, once each");
+            assert!(brute.iter().all(|i| near.contains(i)), "every primitive in reach is returned");
+        }
+    }
 }

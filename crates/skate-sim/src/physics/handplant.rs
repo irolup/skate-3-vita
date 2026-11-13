@@ -228,6 +228,10 @@ pub(super) fn ground_query(physics: &GamePhysics, skater: &mut SkaterRuntime) {
         h.direction_hint = 0;
         h.direction_count = 0;
     }
+    let near = || {
+        let r = contact::REACH;
+        physics.grind_world.near([com[0] - r[0], com[1] - r[1], com[2] - r[2]], [com[0] + r[0], com[1] + r[1], com[2] + r[2]])
+    };
     let candidate = contact::select(
         &h.settings,
         com,
@@ -235,6 +239,7 @@ pub(super) fn ground_query(physics: &GamePhysics, skater: &mut SkaterRuntime) {
         normal,
         h.direction_hint,
         physics.grind_world.primitives(),
+        &near,
     );
     if candidate.is_some() || physics.ticks % 30 == 0 {
         tracing::info!("HANDPLANT_QUERY tick={} speed={} vy={} normal={:?} minimum_speed={} minimum_slope={} edges={} candidate={:?} prior_flags={:08x} phase={} processed={:08x}/{:08x}",

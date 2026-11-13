@@ -310,7 +310,7 @@ impl RidingOutputs {
                 surface_tag: hit.tag,
             });
         }
-        self.probes.start(board, world)?;
+        self.probes.start(board, world, props)?;
         self.pending_wheel_queries = Some(results);
         Ok(())
     }

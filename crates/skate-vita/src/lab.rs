@@ -985,6 +985,7 @@ pub(crate) fn publish(
                 Some(d) => {
                     d.serial = n.serial;
                     d.alpha = n.alpha;
+                    d.look = n.look;
                     copy_snapshot(&mut d.previous, &n.previous);
                     copy_snapshot(&mut d.current, &n.current);
                 }

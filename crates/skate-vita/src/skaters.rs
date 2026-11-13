@@ -22,7 +22,10 @@ pub fn in_use(r: &SkaterRecord) -> bool {
 /// A record's Edit Skater values in the profile `skate_sim` reads (`customiser::apply_preferences`).
 pub fn sim_profile(r: &SkaterRecord) -> Value {
     let gestures: serde_json::Map<String, Value> = r.gestures.iter().enumerate().map(|(i, g)| (i.to_string(), json!(g))).collect();
-    json!({ "truck": r.trucks, "wheel": r.wheels, "stance": r.stance, "style": r.style, "posture": r.posture, "gestures": gestures })
+    // The record keeps the stance as retail does (+0x2010: 0 goofy, else regular); the simulation's natural stance is
+    // retail's character +228 (0 regular, 1 goofy: the actor ctor 82590DC0 passes `goofy = (byte == 0)` to 82B97E38), so
+    // the value turns over here. Passing it through made a goofy record ride regular and the other way round.
+    json!({ "truck": r.trucks, "wheel": r.wheels, "stance": u32::from(r.stance == 0), "style": r.style, "posture": r.posture, "gestures": gestures })
 }
 
 fn item(i: &Item) -> Value {
@@ -209,8 +212,11 @@ mod tests {
         (r.trucks, r.wheels, r.stance, r.style, r.posture, r.gestures) = (0.5, 0.25, 1, 2, 3, [9, 8, 7, 6]);
         let p = sim_profile(&r);
         assert_eq!((p["truck"].as_f64(), p["wheel"].as_f64()), (Some(0.5), Some(0.25)));
-        assert_eq!((p["stance"].as_u64(), p["style"].as_u64(), p["posture"].as_u64()), (Some(1), Some(2), Some(3)));
+        // The record's regular (1) is the simulation's natural stance 0; its goofy (0) is 1.
+        assert_eq!((p["stance"].as_u64(), p["style"].as_u64(), p["posture"].as_u64()), (Some(0), Some(2), Some(3)));
         assert_eq!((p["gestures"]["0"].as_u64(), p["gestures"]["3"].as_u64()), (Some(9), Some(6)));
+        r.stance = 0;
+        assert_eq!(sim_profile(&r)["stance"].as_u64(), Some(1), "a goofy record rides goofy");
     }
 
     #[test]

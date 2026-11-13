@@ -111,7 +111,8 @@ impl Builder {
             let part = match self.parts.get(&path) {
                 Some(p) => p.clone(),
                 None => {
-                    let p = Part::from_pack(&read(&path)?).map_err(|e| format!("{path}: {e}"))?;
+                    let mut p = Part::from_pack(&read(&path)?).map_err(|e| format!("{path}: {e}"))?;
+                    follow_the_hands(&mut p);
                     self.parts.insert(path.clone(), p.clone());
                     p
                 }
@@ -126,7 +127,12 @@ impl Builder {
                 }
             };
             let layer = record.colours.iter().find(|c| c.part == item).map(|c| c.index);
-            let tint = colour_of(record, slot, item).or_else(|| {
+            // A material of a `default_` family (default_cloth, default_skin, default_skateboard: retail's shaders
+            // without a modulate colour, the ones the catalog never marks IsColourizable) takes no colour layer: the
+            // eyes and the deck are chosen by their colour (`eyes_of_colour`, `deck_of_colour`), their layer's colour is
+            // not a tint. Tinting the eyes by their layer (a dark brown) drew them black.
+            let colourizable = !entry["shader"].as_str().is_some_and(|f| f.starts_with("character.default_"));
+            let tint = colour_of(record, slot, item).filter(|_| colourizable).or_else(|| {
                 let t = entry["tint"].as_array()?;
                 Some([t.first()?.as_f64()? as f32, t.get(1)?.as_f64()? as f32, t.get(2)?.as_f64()? as f32])
             });
@@ -184,6 +190,41 @@ impl Builder {
 /// shaders' linear `i_modulateColor1` (cacstamp_shift / cac_cloth / cacstamp_cloth `defaultPS`: the squared diffuse
 /// times it, the decals over it). [code]
 const CLOTH_LAYERS: [u8; 4] = [0, 9, 10, 12];
+
+/// A part's vertices skinned to a helper bone (`*_REPARENTED`: the rings use `RIGHTHAND_REPARENTED`, retail's hand target
+/// under the board root) follow the real bone the helper is bound on instead: the simulation poses the helpers as the
+/// animation's targets, not as the solved hand, so a ring on the helper floated beside the hand. The bone is the one
+/// whose bind pose is the helper's (its inverse bind nearest), not the one its name says: `RIGHTHAND_REPARENTED` is bound
+/// at the LEFT hand (the GLBs' inverse binds; the rings are modelled there), and following `RIGHTHAND` swung the ring a
+/// body's width away (owner, device). With the same bind the skinning keeps every vertex in place at rest.
+fn follow_the_hands(part: &mut Part) {
+    use vita_pack::skater::{JOINTS, STRIDE};
+    let joints = &part.mesh.joints;
+    let distance = |a: &[f32; 16], b: &[f32; 16]| a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum::<f32>();
+    let base: Vec<u8> = joints
+        .iter()
+        .enumerate()
+        .map(|(i, j)| {
+            if !j.name.ends_with("_REPARENTED") {
+                return i as u8;
+            }
+            joints
+                .iter()
+                .enumerate()
+                .filter(|(_, k)| !k.name.ends_with("_REPARENTED"))
+                .min_by(|a, b| distance(&a.1.inverse_bind, &j.inverse_bind).total_cmp(&distance(&b.1.inverse_bind, &j.inverse_bind)))
+                .map_or(i as u8, |(k, _)| k as u8)
+        })
+        .collect();
+    if base.iter().enumerate().all(|(i, &b)| usize::from(b) == i) {
+        return;
+    }
+    for v in part.mesh.vertex_data.chunks_exact_mut(STRIDE) {
+        for j in &mut v[JOINTS..JOINTS + 4] {
+            *j = base.get(usize::from(*j)).copied().unwrap_or(*j);
+        }
+    }
+}
 
 /// The colour layer of a drawn item: the layer naming it, else its slot's (hair 1, arm 2, leg 3, head 4). The
 /// composition swaps the head for the material of the hair colour (the brows are in its texture) and the skin tone, so
@@ -309,9 +350,39 @@ pub fn player_record(read: Read, skaters: &crate::skaters::Skaters) -> Result<Sk
     }
 }
 
-/// The player's mesh from `cas.pak`, for the renderer.
+/// How many looks the NPC skaters share (each about 0.7 MB on the GPU, a second or so of the boot on the device).
+pub const NPC_LOOKS: usize = 3;
+/// The disc's saved characters (`SavedRecipe0` to `SavedRecipe10`).
+const SAVED_RECIPES: usize = 11;
+
+/// The NPC skaters' looks: the disc's saved characters (retail's characters other than the player come from the
+/// `SavedRecipe%s` pool, 8257E3E0 with the vault's count), the first `count` that assemble, in order. An NPC wears one by
+/// its character (`NpcPose::look`). Empty when the pack lacks them; the NPCs then wear the player's mesh, as before.
+pub fn npc_looks(builder: &mut Builder, read: Read, count: usize) -> Vec<Look> {
+    let mut out = Vec::new();
+    for i in 0..SAVED_RECIPES {
+        if out.len() >= count {
+            break;
+        }
+        let name = format!("cas/recipes/SavedRecipe{i}.bin");
+        let record = match read(&name).and_then(|b| SkaterRecord::from_retail(&b).map_err(|e| e.to_string())) {
+            Ok(r) => r,
+            Err(e) => {
+                println!("CAC NPC look {name}: {e}");
+                continue;
+            }
+        };
+        match builder.assemble(read, &record, true) {
+            Ok(look) => out.push(look),
+            Err(e) => println!("CAC NPC look {name}: {e}"),
+        }
+    }
+    out
+}
+
+/// The player's mesh from `cas.pak`, for the renderer, and the NPC skaters' looks.
 #[cfg(target_os = "vita")]
-pub fn load(skaters: &crate::skaters::Skaters) -> Result<(Look, SkaterRecord, Builder), String> {
+pub fn load(skaters: &crate::skaters::Skaters) -> Result<(Look, SkaterRecord, Builder, Vec<Look>), String> {
     let started = std::time::Instant::now();
     crate::packs::mount_on_card(&format!("{}/cas.pak", crate::packs::DIR), crate::packs::ROOT)?;
     let record = player_record(&read, skaters)?;
@@ -326,7 +397,10 @@ pub fn load(skaters: &crate::skaters::Skaters) -> Result<(Look, SkaterRecord, Bu
         skater.textures.iter().map(vita_pack::texture::Texture::bytes).sum::<usize>() / 1024,
         started.elapsed().as_millis()
     );
-    Ok((look, record, builder))
+    let started = std::time::Instant::now();
+    let npcs = npc_looks(&mut builder, &read, NPC_LOOKS);
+    println!("CAC NPC looks: {} ({} vertices) in {} ms", npcs.len(), npcs.iter().map(|l| l.skater.vertex_count()).sum::<usize>(), started.elapsed().as_millis());
+    Ok((look, record, builder, npcs))
 }
 
 /// Reads from the mounted `cas.pak`.
@@ -576,6 +650,48 @@ mod tests {
             assert_eq!(s.joints.len(), 35);
             assert!(s.primitives.len() >= 10);
         }
+    }
+
+    /// `SKATEVITA` at the folder holding the real `cas.pak`: a ring follows the hand bone, the eyes keep their own colour
+    /// whatever their layer says, and the NPC looks assemble from the disc's saved characters.
+    #[test]
+    #[ignore = "requires a baked cas.pak (SKATEVITA)"]
+    fn rings_follow_the_hand_eyes_stay_clear_and_npcs_get_looks() {
+        let dir = std::env::var("SKATEVITA").expect("SKATEVITA");
+        let pack = std::fs::read(format!("{dir}/cas.pak")).unwrap();
+        let index = vita_pack::files::index_of(&pack).unwrap();
+        let read = |p: &str| {
+            let (_, at, len) = index.iter().find(|e| e.0 == p).ok_or_else(|| format!("{p}: missing"))?;
+            Ok(pack[*at as usize..*at as usize + len].to_vec())
+        };
+        let mut builder = Builder::new(&read).unwrap();
+        let mut record = fallback(&read, Gender::Male).unwrap();
+        // A ring (the library's first male one) and a dark layer over the eyes.
+        let ring = builder.library["models"].as_object().unwrap().iter().find(|(_, m)| m["slot"] == "Accessory" && m["flags"]["Gender"] == "male").map(|(k, m)| (u64::from_str_radix(k, 16).unwrap(), u64::from_str_radix(m["materials"][0].as_str().unwrap(), 16).unwrap())).unwrap();
+        record.worn[Slot::Accessory as usize] = Item { model: ring.0, material: ring.1 };
+        let eyes = record.worn[Slot::Organ as usize];
+        record.colours.push(ColourLayer { index: 6, primary: [0.05, 0.03, 0.02], secondary: [0.0; 3], part: eyes });
+        let look = builder.assemble(&read, &record, true).unwrap();
+        let eye = look.skater.materials.iter().find(|m| m.name.starts_with("Organ_")).expect("eyes drawn");
+        assert_eq!(&eye.base_color[..3], &[1.0, 1.0, 1.0], "the eyes are not tinted by their colour layer");
+        let ring_material = look.skater.materials.iter().position(|m| m.name.starts_with("Accessory_")).expect("ring drawn");
+        let joints = &look.skater.joints;
+        let helper = joints.iter().find(|j| j.name == "RIGHTHAND_REPARENTED").unwrap();
+        let mut bones = std::collections::BTreeSet::new();
+        for p in look.skater.primitives.iter().filter(|p| usize::from(p.material) == ring_material) {
+            for &i in &look.skater.indices[p.first_index as usize..(p.first_index + p.index_count) as usize] {
+                let v = vita_pack::skater::Vertex::decode(&look.skater.vertex_data[usize::from(i) * vita_pack::skater::STRIDE..]);
+                bones.extend(v.joints.iter().zip(v.weights).filter(|(_, w)| *w > 0).map(|(j, _)| joints[usize::from(*j)].name.clone()));
+            }
+        }
+        // The helper is bound at the left hand: the ring follows LEFTHAND, whose bind is the helper's (so it rests in place).
+        assert_eq!(bones.into_iter().collect::<Vec<_>>(), ["LEFTHAND"]);
+        let left = joints.iter().find(|j| j.name == "LEFTHAND").unwrap();
+        assert!(left.inverse_bind.iter().zip(&helper.inverse_bind).all(|(a, b)| (a - b).abs() < 0.01));
+        let looks = npc_looks(&mut builder, &read, NPC_LOOKS);
+        assert_eq!(looks.len(), NPC_LOOKS);
+        let player = builder.assemble(&read, &fallback(&read, Gender::Male).unwrap(), true).unwrap();
+        assert!(looks.iter().all(|l| l.skater.vertex_data != player.skater.vertex_data), "the NPCs do not wear the player's outfit");
     }
 
     /// `SKATEVITA` at the folder holding the real `cas.pak`: every Slappy's page of both fallback characters lists

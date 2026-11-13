@@ -1847,4 +1847,11 @@ pub struct NpcPose {
     pub previous: crate::presentation::Snapshot,
     pub current: crate::presentation::Snapshot,
     pub alpha: f32,
+    /// Which look the renderer dresses it in ([`look_of`] its character): the same character wears the same one.
+    pub look: u32,
+}
+
+/// A character's look number (FNV-1a of its key): the renderer takes it modulo the looks it has.
+pub fn look_of(character: &str) -> u32 {
+    character.bytes().fold(0x811C_9DC5u32, |h, b| (h ^ u32::from(b)).wrapping_mul(0x0100_0193))
 }

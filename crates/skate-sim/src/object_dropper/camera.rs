@@ -294,6 +294,8 @@ pub(super) const UNDER: f32 = 0.05;
 const RAMP_REST: f32 = 0.3;
 const RAMP_STEP: f32 = 0.15;
 const RAMP_MAX: f32 = 3.0;
+/// How far under the ground Down takes the cursor in the open world (metres; retail's elevate limit is not read).
+const LOWEST_UNDER_GROUND: f32 = 20.0;
 
 impl Cursor {
     pub fn new(position: Vec3) -> Self {
@@ -309,6 +311,10 @@ impl Cursor {
     ///
     /// Returns what of the d-pad's move the cursor did not make, for the camera: Down with nothing lower (negative), and Up
     /// while the camera is lowered (positive; it goes back first and the cursor stays).
+    ///
+    /// `open_world`: the open world's dropper (owner, on retail): Down goes on through the ground, and the cursor does not
+    /// go where no ground is loaded (the district's collision ends about 60 m out; past it the cursor kept its height and
+    /// sank into the hills, and what was placed there stood in the ground).
     pub fn update(
         &mut self,
         tuning: &Tuning,
@@ -317,6 +323,7 @@ impl Cursor {
         input: &EditorInput,
         speed: f32,
         locks: [bool; 3],
+        open_world: bool,
         ground: &dyn Ground,
     ) -> f32 {
         let s = mode.speed_curve.at(camera.zoom_fraction(tuning)) * speed;
@@ -335,7 +342,11 @@ impl Cursor {
             // the d-pad lifts above it.
             let at = self.position.y;
             let floor = at - self.lift;
-            let floor = ground.below(moved.x, moved.z, floor + tuning.ground_step).unwrap_or(floor);
+            let floor = match ground.below(moved.x, moved.z, floor + tuning.ground_step) {
+                Some(h) => h,
+                None if open_world && (moved - self.position).length_squared() > 0.0 => return 0.0,
+                None => floor,
+            };
             // Below the surface it followed (Down, through a piece) it keeps its height when that surface changes: the old
             // lift from a lower surface would put it under the ground.
             if self.lift < 0.0 {
@@ -344,7 +355,11 @@ impl Cursor {
             // Down goes on to what stops it under that surface (`Ground::floor_below`), never past it, also when the ground
             // rises under it (owner, device: a piece snapped onto a higher one could not be lowered again; NOT RETAIL YET,
             // retail's elevate limit is not read). Nothing under it: no lower.
-            let lowest = ground.floor_below(moved.x, moved.z, floor).map_or(self.lift.min(0.0), |h| (h - floor).min(0.0));
+            let lowest = if open_world {
+                -LOWEST_UNDER_GROUND
+            } else {
+                ground.floor_below(moved.x, moved.z, floor).map_or(self.lift.min(0.0), |h| (h - floor).min(0.0))
+            };
             self.lift = self.lift.max(lowest);
             let (lift, rest) = if y > 0.0 && camera.lowered_from > 0.0 {
                 (self.lift, y)

@@ -908,7 +908,7 @@ impl LivingWorldState {
     pub(crate) fn npc_poses(&self, out: &mut Vec<npc_skaters::NpcPose>) {
         out.clear();
         out.extend(self.npcs.index.values().filter_map(|n| {
-            Some(npc_skaters::NpcPose { serial: n.npc.id.serial, previous: n.previous_pose.clone()?, current: n.pose.clone()?, alpha: n.fade.alpha })
+            Some(npc_skaters::NpcPose { serial: n.npc.id.serial, previous: n.previous_pose.clone()?, current: n.pose.clone()?, alpha: n.fade.alpha, look: npc_skaters::look_of(&n.npc.character) })
         }));
     }
 

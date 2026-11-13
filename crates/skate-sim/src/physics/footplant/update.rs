@@ -23,6 +23,9 @@ pub(crate) struct FootplantFrame<'a> {
     pub gravity: V,
     pub world: &'a BoardWorld,
     pub edges: &'a [skate_core::physics::grind_contact::Primitive],
+    /// The provider of `edges`, for its cell index (skate_vita: the scan over all of them, about 29,000 in DownTown,
+    /// ran on each footplant tick).
+    pub grind: &'a crate::grind_world::StaticProvider,
 }
 impl Footplant {
     pub fn update_candidate(&mut self, input: &KnownAirFootplantInput, frame: &FootplantFrame<'_>) {
@@ -165,7 +168,9 @@ impl Footplant {
         use skate_core::{math::Vector3, player::offboard::{air_selector::ledge::filter_edges as visible_edges, ground_query::Edge}};
         let xyz = |v: V| Vector3::new(v[0], v[1], v[2]);
         let lanes = |v: Vector3| [v.x, v.y, v.z, 0.0];
-        let edges: Vec<_> = frame.edges.iter().filter(|e| (0..3).all(|i|
+        let c = self.contact;
+        let near = frame.grind.near([c[0] - 2.0, c[1] - 2.0, c[2] - 2.0], [c[0] + 2.0, c[1] + 2.0, c[2] + 2.0]);
+        let edges: Vec<_> = near.into_iter().map(|i| &frame.edges[i]).filter(|e| (0..3).all(|i|
             e.start[i].min(e.end[i]) <= self.contact[i] + 2.0 && e.start[i].max(e.end[i]) >= self.contact[i] - 2.0
         )).map(|e| Edge { start: xyz(e.start), end: xyz(e.end) }).collect();
         let original_height = self.contact[1];

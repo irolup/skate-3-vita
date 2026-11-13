@@ -252,6 +252,18 @@ struct SkaterGpu {
     decal_rows: [[[f32; 3]; 2]; 5],
 }
 
+/// Frees a skater mesh's buffers and textures.
+fn free_skater(g: SkaterGpu) {
+    unsafe {
+        glDeleteBuffers(1, &g.vbo);
+        glDeleteBuffers(1, &g.ibo);
+        if let Some(b) = g.uv1_vbo {
+            glDeleteBuffers(1, &b);
+        }
+        glDeleteTextures(g.textures.len() as GLsizei, g.textures.as_ptr());
+    }
+}
+
 pub struct Scene {
     world: WorldProgram,
     skin: SkinProgram,
@@ -265,6 +277,8 @@ pub struct Scene {
     course_vertices: GLsizei,
     white: GLuint,
     skater: Option<SkaterGpu>,
+    /// The NPC skaters' looks (`load_npc_looks`), each a mesh of its own on the same rig.
+    npc_skaters: Vec<SkaterGpu>,
     /// The loaded retail park; the Course is drawn when there is none.
     park_gpu: Option<ParkGpu>,
     /// R2: the Trick Guide's demo set (drawn instead of the world by `draw_demo` while the guide is open).
@@ -432,6 +446,8 @@ pub struct SkinInstance<'a> {
     pub alpha: f32,
     /// Its root in the world: the skater is culled as a 2 m sphere around it.
     pub center: Vec3,
+    /// Which of the NPC looks ([`Scene::load_npc_looks`]) it wears; None, or one not loaded: the player's mesh.
+    pub look: Option<u8>,
 }
 
 /// One traffic car to draw this frame.
@@ -608,6 +624,7 @@ impl Scene {
                 course_vertices: course.len() as GLsizei,
                 white,
                 skater: None,
+                npc_skaters: Vec::new(),
                 park_gpu: None,
                 demo_gpu: None,
                 district: None,
@@ -651,6 +668,24 @@ impl Scene {
     /// A loaded skater is replaced (the customisation rebuilds it at every change).
     pub fn load_look(&mut self, s: &Skater, uv1: &[[f32; 2]], opacity: &[Option<Texture>], lighting: &[Option<vita_pack::cas::Lighting>], decals: &vita_pack::cas::Decals) {
         self.unload_skater();
+        self.skater = Some(self.upload_look(s, uv1, opacity, lighting, decals));
+    }
+
+    /// The NPC skaters' looks, replacing any loaded: an NPC draws the one its `SkinInstance::look` names.
+    pub fn load_npc_looks(&mut self, looks: &[vita_pack::cas::Look]) {
+        for g in std::mem::take(&mut self.npc_skaters) {
+            free_skater(g);
+        }
+        self.npc_skaters = looks.iter().map(|l| self.upload_look(&l.skater, &l.uv1, &l.opacity, &l.lighting, &l.decals)).collect();
+    }
+
+    /// How many NPC looks are loaded.
+    pub fn npc_looks(&self) -> usize {
+        self.npc_skaters.len()
+    }
+
+    /// A skater mesh and its textures on the GPU.
+    fn upload_look(&self, s: &Skater, uv1: &[[f32; 2]], opacity: &[Option<Texture>], lighting: &[Option<vita_pack::cas::Lighting>], decals: &vita_pack::cas::Decals) -> SkaterGpu {
         unsafe {
             let vbo = buffer(GL_ARRAY_BUFFER, &s.vertex_data);
             let uv1_vbo = (opacity.iter().any(Option::is_some) || decals.target.iter().any(|&t| t != 0)).then(|| {
@@ -692,7 +727,7 @@ impl Scene {
             let decal_textures = [0, 1, 2, 3, 4].map(|i| decals.textures[i].as_ref().map(|t| upload_texture(t)));
             let owned = textures.iter().copied().chain(opacity.iter().flatten().copied()).chain(decal_textures.iter().flatten().copied()).collect();
             println!("CAC decals: {} draws, textures {:?}, uv1 {}", draws.iter().filter(|d| d.decal != 0).count(), decal_textures, uv1_vbo.is_some());
-            self.skater = Some(SkaterGpu { vbo, uv1_vbo, ibo, draws, textures: owned, decal_textures, decal_rows: [[[0.0; 3]; 2]; 5] });
+            SkaterGpu { vbo, uv1_vbo, ibo, draws, textures: owned, decal_textures, decal_rows: [[[0.0; 3]; 2]; 5] }
         }
     }
 
@@ -708,14 +743,7 @@ impl Scene {
 
     fn unload_skater(&mut self) {
         if let Some(g) = self.skater.take() {
-            unsafe {
-                glDeleteBuffers(1, &g.vbo);
-                glDeleteBuffers(1, &g.ibo);
-                if let Some(b) = g.uv1_vbo {
-                    glDeleteBuffers(1, &b);
-                }
-                glDeleteTextures(g.textures.len() as GLsizei, g.textures.as_ptr());
-            }
+            free_skater(g);
         }
     }
 
@@ -733,9 +761,9 @@ impl Scene {
             glFrontFace(GL_CCW);
             glCullFace(GL_BACK);
             let vp = frame.view_proj.to_cols_array();
-            if self.skater.is_some() {
+            if let Some(sk) = &self.skater {
                 self.skin_eye = frame.eye;
-                self.draw_skin(frame.palette, 1.0, &vp);
+                self.draw_skin(sk, frame.palette, 1.0, &vp);
             }
         }
     }
@@ -955,9 +983,9 @@ impl Scene {
             glCullFace(GL_BACK);
             let vp = frame.view_proj.to_cols_array();
             self.last_draws = draw_park(set, self.white, &self.park, &self.park_mask, frame, &vp);
-            if self.skater.is_some() {
+            if let Some(sk) = &self.skater {
                 self.skin_eye = frame.eye;
-                self.draw_skin(frame.palette, 1.0, &vp);
+                self.draw_skin(sk, frame.palette, 1.0, &vp);
             }
         }
     }
@@ -1431,15 +1459,16 @@ impl Scene {
             self.last_draws.1 += culled;
             mark(3, &mut at, &mut us, &mut draws, drawn + hand_drawn);
 
-            // Skater and board, then the NPC skaters (the same mesh, their own palettes).
-            if self.skater.is_some() {
+            // Skater and board, then the NPC skaters (their own looks, or the same mesh, and their own palettes).
+            if let Some(sk) = &self.skater {
                 self.skin_eye = frame.eye;
-                self.draw_skin(frame.palette, 1.0, &vp);
+                self.draw_skin(sk, frame.palette, 1.0, &vp);
                 let planes = frustum(&frame.view_proj);
                 for npc in frame.npcs {
                     let c = npc.center + Vec3::Y;
                     if planes.iter().all(|p| p.truncate().dot(c) + p.w >= -2.0 * p.truncate().length()) {
-                        self.draw_skin(npc.palette, npc.alpha, &vp);
+                        let look = npc.look.and_then(|l| self.npc_skaters.get(usize::from(l))).unwrap_or(sk);
+                        self.draw_skin(look, npc.palette, npc.alpha, &vp);
                         self.last_draws.0 += 1;
                     } else {
                         self.last_draws.1 += 1;
@@ -1474,8 +1503,7 @@ impl Scene {
         self.character_sh = sh;
     }
 
-    fn draw_skin(&self, skin_palette: &[Mat4], alpha: f32, vp: &[f32; 16]) {
-        let Some(sk) = &self.skater else { return };
+    fn draw_skin(&self, sk: &SkaterGpu, skin_palette: &[Mat4], alpha: f32, vp: &[f32; 16]) {
         if skin_palette.is_empty() || alpha <= 0.0 {
             return;
         }

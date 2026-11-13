@@ -1184,13 +1184,13 @@ impl Editor {
             (Shift::LockedAxis, Some(held)) => {
                 self.cursor.position += manipulate::locked_move(held, &self.tuning, &mode, &self.camera, &input, self.cursor_speed, &mut self.steps);
             }
-            // A fixed camera: the left stick moves nothing (the d-pad still lifts); the cursor goes where it looks.
+            // A fixed camera: the left stick moves the cursor over the ground and the d-pad lifts it straight up or down (the
+            // camera turns after it below); what the camera cannot do with its height is dropped, it stands.
             _ if self.fixed_eye.is_some() => {
-                let still = EditorInput { left: [0.0; 4], ..input };
-                self.cursor.update(&self.tuning, &mode, &self.camera, &still, self.cursor_speed, self.locks, ground);
+                self.cursor.update(&self.tuning, &mode, &self.camera, &input, self.cursor_speed, self.locks, self.variant == Variant::World, ground);
             }
             _ => {
-                let rest = self.cursor.update(&self.tuning, &mode, &self.camera, &input, self.cursor_speed, self.locks, ground);
+                let rest = self.cursor.update(&self.tuning, &mode, &self.camera, &input, self.cursor_speed, self.locks, self.variant == Variant::World, ground);
                 // With an item in hand the camera keeps its distance (retail's held camera orbits at the zoom).
                 if self.held.is_none() && rest != 0.0 {
                     // Straight up or down (owner, device: along its line to the cursor it also went forward): the eye keeps
@@ -1202,7 +1202,14 @@ impl Editor {
             }
         }
         if let Some(eye) = self.fixed_eye {
-            self.aim(eye, ground);
+            if (self.camera.yaw, self.camera.pitch) != turn {
+                // Turned: the cursor goes where it looks.
+                self.aim(eye, ground);
+            } else if self.cursor.position != before {
+                // Moved by the stick or lifted by the d-pad: the camera looks after it (owner, device: the d-pad brought
+                // the item along the look towards the camera instead of up, and the stick moved nothing).
+                self.look_at(eye);
+            }
         }
         // Snapping (`8288A5E0` / `82889F58`): solved on the updates the held piece moves (move or locked axis); LT
         // pressed while moving commits the snapped pose first. Still, the last snap stays.
@@ -1349,21 +1356,38 @@ impl Editor {
     }
 
     /// The cursor where the fixed camera at `eye` looks: the look down to the ground under it (lifted by the d-pad).
+    /// In the open world it stays where it is when no ground is loaded where the look lands.
     fn aim(&mut self, eye: Vec3, ground: &dyn Ground) {
         let forward = self.camera.ground_forward();
         let lift = self.cursor.lift;
         let mut floor = self.cursor.position.y - lift;
         let mut at = self.cursor.position;
+        let mut found = true;
         // The ground where the look lands moves where it lands: a few rounds settle it.
         for _ in 0..4 {
             at = eye + forward * self.camera.reach_from(&self.tuning, eye.y - (floor + lift));
             if self.tuning.follow_ground {
-                if let Some(h) = ground.below(at.x, at.z, eye.y) {
-                    floor = h;
+                match ground.below(at.x, at.z, eye.y) {
+                    Some(h) => floor = h,
+                    None => found = false,
                 }
             }
         }
+        if !found && self.variant == Variant::World {
+            return;
+        }
         self.cursor.position = Vec3::new(at.x, floor + lift, at.z);
+    }
+
+    /// The fixed camera at `eye` turns to look at the cursor (within its pitch limits).
+    fn look_at(&mut self, eye: Vec3) {
+        let to = self.cursor.position - eye;
+        let flat = Vec2::new(to.x, to.z).length();
+        if flat < 1e-4 && to.y.abs() < 1e-4 {
+            return;
+        }
+        self.camera.yaw = (-to.x).atan2(-to.z);
+        self.camera.pitch = to.y.atan2(flat).clamp(self.tuning.free_pitch[0], self.tuning.free_pitch[1]);
     }
 
     /// The world item under the cursor (free camera, group select).
@@ -1769,15 +1793,51 @@ mod tests {
             let (eye, target) = editor.view();
             (editor.cursor.position - eye).normalize().dot((target - eye).normalize()) > 0.9999
         };
-        editor.update(&slots(|s| s[16] = 1.0), &Flat(0.0));
         editor.update(&slots(|s| s[2] = 1.0), &Flat(0.0));
-        assert!((editor.view().0 - eye).length() < 1e-5, "the left stick and the zoom do not move it");
+        assert!((editor.view().0 - eye).length() < 1e-5, "the zoom does not move it");
         assert!(editor.cursor.position.length() < 1e-3, "the cursor stays where the camera looks");
         assert_eq!(editor.camera.target_distance, editor.tuning.start_distance);
         editor.update(&slots(|s| s[20] = 1.0), &Flat(0.0));
         editor.update(&slots(|s| s[23] = 1.0), &Flat(0.0));
         assert!((editor.view().0 - eye).length() < 1e-5, "it turns where it stands");
         assert!(centred(&editor) && editor.cursor.position.y.abs() < 1e-5, "the cursor is on the ground at the middle of the screen");
+        // The left stick moves the cursor over the ground, 0.3 m a poll; the camera stands and looks after it.
+        let before = editor.cursor.position;
+        editor.update(&slots(|s| s[16] = 1.0), &Flat(0.0));
+        assert!((editor.view().0 - eye).length() < 1e-5, "the left stick does not move it");
+        assert!(((editor.cursor.position - before).length() - 0.3).abs() < 1e-4 && editor.cursor.position.y.abs() < 1e-5, "{:?}", editor.cursor.position);
+        assert!(centred(&editor), "it looks at the cursor");
+        // D-pad Up lifts the cursor straight up (owner: not along the look towards the camera), Down brings it back and on
+        // through the ground; the camera looks after it and keeps its place.
+        let (x, z) = (editor.cursor.position.x, editor.cursor.position.z);
+        for _ in 0..10 {
+            editor.update(&slots(|s| s[0] = 1.0), &Flat(0.0));
+        }
+        assert!(editor.cursor.position.y > 0.5, "{:?}", editor.cursor.position);
+        assert!((editor.cursor.position.x - x).abs() < 1e-4 && (editor.cursor.position.z - z).abs() < 1e-4, "{:?}", editor.cursor.position);
+        assert!((editor.view().0 - eye).length() < 1e-5 && centred(&editor));
+        for _ in 0..40 {
+            editor.update(&slots(|s| s[1] = 1.0), &Flat(0.0));
+        }
+        assert!(editor.cursor.position.y < -0.5, "through the ground: {:?}", editor.cursor.position);
+        assert!((editor.cursor.position.x - x).abs() < 1e-4 && (editor.cursor.position.z - z).abs() < 1e-4);
+        assert!((editor.view().0 - eye).length() < 1e-5);
+        // Where no ground is loaded the cursor does not go (the look turned onto it stays put too).
+        let before = editor.cursor.position;
+        editor.update(&slots(|s| s[16] = 1.0), &Flat(50.0));
+        assert_eq!(editor.cursor.position, before);
+        editor.update(&slots(|s| s[20] = 1.0), &Flat(50.0));
+        assert_eq!(editor.cursor.position, before);
+    }
+
+    #[test]
+    fn the_park_editors_cursor_stops_at_the_maps_floor() {
+        // Unchanged from before the open world's rules: Down stops at the surface under the one the cursor is on.
+        let mut editor = Editor::open(tuning(), catalog(), Scene::default(), Vec3::ZERO, 0.0);
+        for _ in 0..40 {
+            editor.update(&slots(|s| s[1] = 1.0), &Flat(0.0));
+        }
+        assert!(editor.cursor.position.y.abs() < 1e-5, "{:?}", editor.cursor.position);
     }
 
     #[test]

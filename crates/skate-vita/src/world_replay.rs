@@ -40,7 +40,7 @@ const LOG_TICKS: u64 = 600;
 /// What an actor is drawn with besides its pose.
 #[derive(Clone, Copy, PartialEq)]
 enum Look {
-    Npc,
+    Npc { look: u32 },
     Ped { model: u16, tint_a: [f32; 4], tint_b: [f32; 4], hand: Option<(u16, Mat4)> },
     Car { model: u16, chassis: [f32; 4], secondary: [f32; 4], paint_gain: f32 },
     Prop { first_index: u32, index_count: u32 },
@@ -189,7 +189,7 @@ pub fn record(
     r.skeleton(SKATER, rooted(skater.root.translation, skater.root.rotation), &skater.bones, parents);
     for n in npcs {
         let c = &n.current;
-        r.look(NPC | u64::from(n.serial), Look::Npc);
+        r.look(NPC | u64::from(n.serial), Look::Npc { look: n.look });
         r.skeleton(NPC | u64::from(n.serial), rooted(c.root.translation, c.root.rotation), &c.bones, parents);
     }
     for p in peds {
@@ -283,14 +283,14 @@ pub fn fill(
         let root_t = Vec3::from_array(pose.root.translation);
         let root_q = Quat::from_array(pose.root.rotation);
         match *look {
-            Look::Npc => {
+            Look::Npc { look } => {
                 let snapshot = skate_sim::live::Snapshot {
                     root: skate_sim::live::Transform { translation: root_t, rotation: root_q, scale: Vec3::ONE },
                     bones: globals(&pose.joints, &r.skater_parents),
                     camera: skate_sim::live::Transform::IDENTITY,
                     fov: 1.0,
                 };
-                npcs.push(skate_sim::NpcPose { serial, previous: snapshot.clone(), current: snapshot, alpha: 1.0 });
+                npcs.push(skate_sim::NpcPose { serial, previous: snapshot.clone(), current: snapshot, alpha: 1.0, look });
             }
             Look::Ped { model, tint_a, tint_b, hand } => {
                 let (axis, angle) = root_q.to_axis_angle();

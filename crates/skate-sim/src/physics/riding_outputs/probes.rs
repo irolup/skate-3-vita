@@ -74,25 +74,43 @@ impl BoardProbes {
             time: input.time_on_ground_2752,
         });
     }
-    pub fn start(&mut self, board: &BoardRuntime, world: &BoardWorld) -> Result<(), String> {
+    /// skate_vita: `props`, the static prop instances' world (the map's props and the Object Dropper's terrain), is
+    /// probed too and the nearer hit kept, as the wheels do: retail has the one world. With the deck probe seeing only
+    /// the map, a placed ramp's rider was reckoned over the ground far below it, and at speed the board went through
+    /// the ramp (owner, device: mega ramps and quarter pipes placed with the dropper).
+    pub fn start(&mut self, board: &BoardRuntime, world: &BoardWorld, props: Option<&BoardWorld>) -> Result<(), String> {
         if self.pending.is_some() {
             return Err("Board probes submitted twice without publication".into());
         }
+        let nearer = |a: Option<WorldLineHit>, b: Option<WorldLineHit>| match (a, b) {
+            (Some(a), Some(b)) => Some(if b.geometry.fraction < a.geometry.fraction { b } else { a }),
+            (a, b) => a.or(b),
+        };
         let line =
             board_probes::deck_probe(board.part_transforms()[BodyId::Deck.index()].translation);
         self.deck.start(line.start);
-        let deck = world
+        let mut deck = world
             .query_swept_line(line.start, line.end, board_probes::DECK_PROBE_RADIUS)
-            .map_err(|e| format!("Stock deck ground probe: {e}"))?
-            .map(hit);
+            .map_err(|e| format!("Stock deck ground probe: {e}"))?;
+        if let Some(props) = props {
+            let prop = props
+                .query_swept_line(line.start, line.end, board_probes::DECK_PROBE_RADIUS)
+                .map_err(|e| format!("Prop deck ground probe: {e}"))?;
+            deck = nearer(deck, prop);
+        }
+        let deck = deck.map(hit);
         let wall = if let Some(line) = self.wall_line {
             self.wall.start(line.start);
-            Some(
-                world
+            let mut wall = world
+                .query_thin_line(line.start, line.end)
+                .map_err(|e| format!("Stock wall floor probe: {e}"))?;
+            if let Some(props) = props {
+                let prop = props
                     .query_thin_line(line.start, line.end)
-                    .map_err(|e| format!("Stock wall floor probe: {e}"))?
-                    .map(hit),
-            )
+                    .map_err(|e| format!("Prop wall floor probe: {e}"))?;
+                wall = nearer(wall, prop);
+            }
+            Some(wall.map(hit))
         } else {
             self.wall.disable();
             None
